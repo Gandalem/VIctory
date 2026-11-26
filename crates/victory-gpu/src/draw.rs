@@ -427,7 +427,7 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -435,7 +435,7 @@ impl State {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some(host.dsv(&texture, record.depth_desc().as_ref()))
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -1454,7 +1454,7 @@ impl State {
                 // SAFETY: an open list.
                 unsafe { list.list.ResourceBarrier(&[all]) };
                 crate::list::ensure_state(list, r as This, COPY_SOURCE);
-                let read = crate::capture::read_back(&host.device, &list.list, t);
+                let read = crate::capture::read_back(&host.device, &list.list, &t);
                 crate::list::ensure_state(list, r as This, UNORDERED);
                 let Some((buffer, f)) = read else { continue };
                 list.keep(&buffer);
@@ -1895,9 +1895,9 @@ fn readable_marked(list: &HostList, u: &UsedResource, view: &View, marked: bool)
                 crate::texture::alias_copy(list, a, *resource as This);
             }
             if let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && crate::texture::title_written(&t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload(list, *resource as This, &t);
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]

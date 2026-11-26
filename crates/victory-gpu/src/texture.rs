@@ -382,7 +382,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     // SAFETY: an open list; live resources in the states named.
     unsafe {
         for &(i, _) in &pairs {
-            l.CopyTextureRegion(&place(&buffer, fa[i]), 0, 0, 0, &sub(a, i as u32), None);
+            l.CopyTextureRegion(&place(&buffer, fa[i]), 0, 0, 0, &sub(&a, i as u32), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,
@@ -392,7 +392,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         for &(i, j) in &pairs {
             let mut footprint = fb[j];
             footprint.Offset = fa[i].Offset;
-            l.CopyTextureRegion(&sub(b, j as u32), 0, 0, 0, &place(&buffer, footprint), None);
+            l.CopyTextureRegion(&sub(&b, j as u32), 0, 0, 0, &place(&buffer, footprint), None);
         }
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -513,7 +513,7 @@ pub(crate) fn prepare_deferred_view(list: &HostList, resource: This,
         return true;
     }
     let Some(texture) = crate::resource::host_resource(resource) else { return false };
-    let Some(staging) = staging_with_admission(resource, texture, Some(admission), false)
+    let Some(staging) = staging_with_admission(resource, &texture, Some(admission), false)
         else { return false };
     staging.refresh_now_with(true);
     {
@@ -634,7 +634,7 @@ pub(crate) fn record_heap_upload_mips(list: &HostList, resource: This, staging: 
     if !selected.iter().any(|&dirty| dirty) {
         return false;
     }
-    record(list, resource, texture, staging, Some(&selected));
+    record(list, resource, &texture, staging, Some(&selected));
     // Recording and execution are serialized by the submission lock.
     // Only acknowledge copied levels. Hidden dirty levels survive clean
     // refreshes, descriptor rewrites and a later full-copy request.
@@ -1322,7 +1322,7 @@ mod tests {
                 std::ptr::null(), p as u64, &desc, 0, std::ptr::null(),
                 std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
             ), crate::object::S_OK);
-            let upload = staging(image, crate::resource::host_resource(image).unwrap()).unwrap();
+            let upload = staging(image, &crate::resource::host_resource(image).unwrap()).unwrap();
             assert!(upload.tracked.is_some());
             images.push((p, image));
             uploads.push(upload);
@@ -1359,7 +1359,7 @@ mod tests {
                 std::ptr::null(), source.as_ptr() as u64, &desc, 0, std::ptr::null(),
                 std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
             ), crate::object::S_OK);
-            let upload = staging(image, crate::resource::host_resource(image).unwrap()).unwrap();
+            let upload = staging(image, &crate::resource::host_resource(image).unwrap()).unwrap();
             assert!(upload.tracked.is_none());
             images.push(image);
             uploads.push(upload);
@@ -1492,7 +1492,7 @@ mod tests {
             std::ptr::null(), bytes.as_ptr() as u64, &desc, 0, std::ptr::null(),
             std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
         ), crate::object::S_OK);
-        let upload = staging(image, crate::resource::host_resource(image).unwrap()).unwrap();
+        let upload = staging(image, &crate::resource::host_resource(image).unwrap()).unwrap();
         {
             let mut last = upload.last.lock().unwrap();
             assert_eq!(upload.refresh_untracked_impl(&mut last, &bytes, true), (size, true));
@@ -1537,7 +1537,7 @@ mod tests {
             std::ptr::null(), p as u64, &desc, 0, std::ptr::null(),
             std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
         ), crate::object::S_OK);
-        let upload = staging(image, crate::resource::host_resource(image).unwrap()).unwrap();
+        let upload = staging(image, &crate::resource::host_resource(image).unwrap()).unwrap();
         assert!(upload.tracked.is_some());
         assert_eq!(upload.refresh_now(), (size, true));
         assert_eq!(upload.refresh_now(), (0, false));
@@ -1576,7 +1576,7 @@ mod tests {
             std::ptr::null(), bytes.as_ptr() as u64, &desc, 0, std::ptr::null(),
             std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
         ), crate::object::S_OK);
-        let upload = staging(image, crate::resource::host_resource(image).unwrap()).unwrap();
+        let upload = staging(image, &crate::resource::host_resource(image).unwrap()).unwrap();
         let drop = crate::resource::dropped(image);
         assert_eq!(upload.first_mip, drop);
         assert_eq!(upload.mips, 5 - drop);

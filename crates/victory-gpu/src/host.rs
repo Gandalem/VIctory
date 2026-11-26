@@ -1710,15 +1710,17 @@ impl HostList {
         &self,
         resource: crate::object::This,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
+    ) -> Option<(ID3D12Resource, u32)> {
+        // One host texture for the whole move (`crate::resource::evict` may
+        // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
+        let texture = copy.texture.clone();
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, &copy, twin, wanted)
         {
             return None;
         }
-        let wanted = legal_state(texture, wanted);
+        let wanted = legal_state(&texture, wanted);
         self.track(&copy, wanted).map(|before| (texture, before))
     }
 

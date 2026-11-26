@@ -752,14 +752,16 @@ struct Resource {
     heap_flags: u32,
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet. Once published, the host copy must remain stable for borrowed
-    /// pointers, recorded commands and descriptors.
+    /// yet. None: not made (yet, or given up); Some(None): host refused it.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    host: std::sync::Mutex<Option<Option<std::sync::Arc<HostTexture>>>>,
     /// Initial console state for an eligible deferred committed texture.
     /// None for eager resources, buffers, and resources with a clear value.
     #[cfg(windows)]
     host_lazy_state: Option<u32>,
+    /// Initial state and clear value, retained for recreating a host texture.
+    #[cfg(windows)]
+    made_with: (u32, Option<[u32; 5]>),
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1081,11 +1083,12 @@ pub(crate) fn test_lazy_host() -> This {
         .unwrap_or_else(|hr| panic!("test memory allocation failed: {hr:?}"));
     let mut r = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS), desc, heap: properties, heap_flags: 0,
-        backing: Backing::Committed(memory), host: std::sync::OnceLock::new(),
+        backing: Backing::Committed(memory), host: std::sync::Mutex::new(None),
         host_lazy_state: None,
+        made_with: (0, None),
     });
     r.initialize_host(0, std::ptr::null(), true);
-    assert!(r.host.get().is_none());
+    assert!(r.host.lock().unwrap_or_else(|e| e.into_inner()).is_none());
     let mut out = std::ptr::null();
     assert_eq!(object::hand_out(RESOURCE, r, &RESOURCE_IIDS[0], &RESOURCE_IIDS, &mut out),
         crate::object::S_OK);
@@ -1094,15 +1097,13 @@ pub(crate) fn test_lazy_host() -> This {
 
 /// The host GPU's copy of a title resource, if it has one.
 #[cfg(windows)]
-pub(crate) fn host_resource<'a>(
-    this: This,
-) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+pub(crate) fn host_resource(this: This) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     if this.is_null() {
         return None;
     }
     let copy = resource(this).host_ref()?;
     copy.residency.expose(&copy.texture, copy.bytes);
-    Some(&copy.texture)
+    Some(copy.texture.clone())
 }
 
 /// A title texture's host copy if it is made, without making it: for work
@@ -1112,7 +1113,7 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.get()?.clone()
+    made(resource(this))
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1121,7 +1122,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    let copy = resource(this).host_ref()?.clone();
+    let copy = resource(this).host_ref()?;
     copy.residency.expose(&copy.texture, copy.bytes);
     Some(copy)
 }
@@ -1622,13 +1623,13 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
 #[cfg(windows)]
 fn current(this: This) -> bool {
     let r = resource(this);
-    let (Some(h), Some(k)) = (r.host.get().and_then(Option::as_ref), memory_key(r.data() as u64, &r.desc)) else {
+    let (Some(h), Some(k)) = (made(r), memory_key(r.data() as u64, &r.desc)) else {
         return true;
     };
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
         .and_then(|m| m.get(&k)?.upgrade())
-        .is_none_or(|live| std::sync::Arc::ptr_eq(&live, h))
+        .is_none_or(|live| std::sync::Arc::ptr_eq(&live, &h))
 }
 
 /// A host texture of host description `d` in GPU memory, castable to
@@ -1872,27 +1873,32 @@ fn defer_host_texture(desc: &ResourceDesc, committed: bool, has_clear: bool, ena
 impl Resource {
     #[cfg(windows)]
     fn initialize_host(&mut self, state: u32, clear: *const c_void, allow_lazy: bool) {
+        // SAFETY: when non-null the title passed a clear value of five words.
+        let value = (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() });
+        self.made_with = (state, value);
         if defer_host_texture(&self.desc, matches!(&self.backing, Backing::Committed(_)),
             !clear.is_null(), allow_lazy)
         {
             self.host_lazy_state = Some(state);
         } else {
             let host = shared_texture(self.data() as u64, &self.desc, state, clear);
-            let _ = self.host.set(host);
+            *self.host.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(host);
         }
     }
 
-    /// The first real host access creates the texture. OnceLock gives
-    /// every concurrent accessor the same Arc and a stable address for
-    /// the older renderer's borrowed host-resource API. Match the eager
-    /// path's permanent None on creation failure; never silently swap a
-    /// published resource for a new allocation.
+    /// Make or remake the texture; return an owned reference as in upstream.
     #[cfg(windows)]
-    fn host_ref(&self) -> Option<&std::sync::Arc<HostTexture>> {
-        self.host.get_or_init(|| {
-            let state = self.host_lazy_state?;
-            shared_texture(self.data() as u64, &self.desc, state, std::ptr::null())
-        }).as_ref()
+    fn host_ref(&self) -> Option<std::sync::Arc<HostTexture>> {
+        if let Some(made) = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return made;
+        }
+        // Made without the lock held (`shared_texture` takes the memory
+        // maps, which `evict` holds while it takes this lock).
+        let (state, clear) = self.made_with;
+        let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
+        let made = shared_texture(self.data() as u64, &self.desc, state, clear);
+        // A texture made meanwhile by another thread is the memory's too.
+        self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
     }
 
     fn data(&self) -> *mut u8 {
@@ -1914,6 +1920,12 @@ impl Resource {
 fn resource<'a>(this: This) -> &'a Resource {
     // SAFETY: called from resource methods only.
     unsafe { &*this.cast::<Resource>() }
+}
+
+/// A title texture's host texture if it is made.
+#[cfg(windows)]
+fn made(r: &Resource) -> Option<std::sync::Arc<HostTexture>> {
+    r.host.lock().unwrap_or_else(|e| e.into_inner()).clone().flatten()
 }
 
 // The creation methods' own arguments, passed on.
@@ -1938,9 +1950,11 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: std::sync::OnceLock::new(),
+        host: std::sync::Mutex::new(None),
         #[cfg(windows)]
         host_lazy_state: None,
+        #[cfg(windows)]
+        made_with: (0, None),
     });
     #[cfg(windows)]
     {
@@ -1951,7 +1965,7 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     } else if resource.host_lazy_state.is_some()
-        || resource.host.get().is_some_and(Option::is_some)
+        || made(&resource).is_some()
     {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -2003,8 +2017,8 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
                 && bytes(&a.desc) == Some(want)
                 // Do not allocate under TEXTURES_AT: writable sources
                 // and placed destinations are still eagerly initialized.
-                && matches!((a.host.get().and_then(Option::as_ref), b.host.get().and_then(Option::as_ref)),
-                    (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
+                && matches!((made(a), made(b)),
+                    (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
         })
 }
 
@@ -2012,10 +2026,7 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
 impl Drop for Resource {
     fn drop(&mut self) {
         #[cfg(feature = "diagnostics")]
-        if self
-            .host
-            .get().and_then(Option::as_ref)
-            .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
+        if made(self).is_some_and(|h| std::sync::Arc::strong_count(&h) > 2)
         {
             // Before lists held their textures, this freed a texture that
             // lists not yet run still named (a GPU page fault).
@@ -2030,7 +2041,7 @@ impl Drop for Resource {
             }
         }
         #[cfg(feature = "diagnostics")]
-        if let Some(h) = self.host.get().and_then(Option::as_ref) {
+        if let Some(h) = made(self) {
             use windows::core::Interface;
             life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
@@ -2269,7 +2280,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     PLACED_BYTES.fetch_add(placed_size(desc).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     map.insert((address, *desc), out as usize);
-    resource(out).host.get().is_some_and(Option::is_some).then_some(out)
+    made(resource(out)).is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -2974,17 +2985,18 @@ mod tests {
             heap: PROPERTIES,
             heap_flags: 0,
             backing: Backing::Committed(memory),
-            host: std::sync::OnceLock::new(),
+            host: std::sync::Mutex::new(None),
             host_lazy_state: None,
+            made_with: (0, None),
         });
         // Exercise the same initialization path without mutating a
         // process-global option during parallel tests.
         r.initialize_host(0, std::ptr::null(), true);
-        assert!(r.host.get().is_none());
+        assert!(r.host.lock().unwrap_or_else(|e| e.into_inner()).is_none());
         let first = r.host_ref().expect("first host access creates a copy");
         let second = r.host_ref().expect("second access keeps the same copy");
-        assert!(std::sync::Arc::ptr_eq(first, second));
-        assert!(r.host.get().is_some_and(Option::is_some));
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(made(&r).is_some());
         // A query after real access must observe the actual retained shape.
         let actual = unsafe { first.texture.GetDesc() };
         assert_eq!((actual.Width, actual.Height), (1024, 1024));
@@ -3150,7 +3162,7 @@ mod tests {
         // SAFETY: an open list, live resources, locations in the host layout.
         unsafe {
             back.list.ResourceBarrier(&[crate::host::transition(
-                host_image,
+                &host_image,
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
