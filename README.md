@@ -284,8 +284,14 @@ before a memory-writing step or GPU submission. The independent tracked
 reads use a persistent CPU worker pool, following the wide_each approach
 in [cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/shadow.rs)
 and [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX).
-Only tracked source memory uses workers; untracked hash reads remain
-serial. The submitting thread participates and waits for every job before
+Tracked source memory uses workers by default; untracked hash reads
+remain serial unless `VICTORY_PARALLEL_UNTRACKED=1` is set. That
+experimental path reads a complete owned snapshot through the kernel
+before hashing and detiling on a worker, rather than relying on the
+reference renderer's remapping read lock (which is absent here). Failed
+reads preserve the last valid staging contents and retry next use.
+Single textures and RAM-pressure fallback keep the serial path.
+The submitting thread participates and waits for every job before
 recorded GPU work can execute. Existing resource ownership, command
 order and GPU fences remain unchanged.
 

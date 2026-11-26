@@ -430,12 +430,20 @@ fn chunk_len(sizes: impl Iterator<Item = u64>, limit: u64, count: usize) -> usiz
     n
 }
 
-/// Refresh independent staging buffers in input order (the returned flags
-/// correspond to the input). Only tracked source memory enters workers:
-/// it is read by the existing checked kernel copy. Untracked memory keeps
-/// its existing serial hash path. Each worker owns a distinct staging
-/// mapping, and no job survives this call or a submission boundary.
+fn parallel_untracked() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_PARALLEL_UNTRACKED").as_deref() == Ok("1"))
+}
+
+/// Refresh independent staging buffers in input order. Tracked reads
+/// use the existing kernel copy; the optional untracked worker path
+/// reads an owned snapshot through ReadProcessMemory before hashing.
+/// No worker dereferences untracked title memory or survives this call.
 pub(crate) fn refresh_many(stagings: &[Arc<Staging>]) -> Vec<bool> {
+    refresh_many_impl(stagings, parallel_untracked())
+}
+
+fn refresh_many_impl(stagings: &[Arc<Staging>], allow_untracked: bool) -> Vec<bool> {
     if let [staging] = stagings {
         return vec![staging.refresh()];
     }
@@ -450,18 +458,24 @@ pub(crate) fn refresh_many(stagings: &[Arc<Staging>]) -> Vec<bool> {
         } else {
             crate::texture_workers::configured_threads()
         };
-        if threads < 2 || stagings[at].tracked.is_none() {
+        if threads < 2 || (!allow_untracked && stagings[at].tracked.is_none()) {
             let (bytes, changed) = stagings[at].refresh_now();
             read = read.saturating_add(bytes);
             flags.push(changed);
             at += 1;
             continue;
         }
-        let n = chunk_len(stagings[at..].iter().take_while(|s| s.tracked.is_some())
+        let n = chunk_len(stagings[at..].iter().take_while(|s| allow_untracked || s.tracked.is_some())
             .map(|s| s.layout.size as u64), REFRESH_CHUNK_BYTES, REFRESH_CHUNK_COUNT);
         debug_assert!(n > 0);
-        let results = crate::texture_workers::ordered_map(stagings[at..at + n].to_vec(), threads,
-            |staging| staging.refresh_now());
+        // A lone or oversized texture has no parallel work to overlap.
+        // Avoid an unnecessary full-size snapshot for that case.
+        let results = if n == 1 {
+            vec![stagings[at].refresh_now()]
+        } else {
+            crate::texture_workers::ordered_map(stagings[at..at + n].to_vec(), threads,
+                |staging| staging.refresh_now_with(true))
+        };
         for (bytes, changed) in results {
             read = read.saturating_add(bytes);
             flags.push(changed);
@@ -490,6 +504,10 @@ impl Staging {
 
     /// Returns the bytes of title memory read, and whether it detiled.
     fn refresh_now(&self) -> (usize, bool) {
+        self.refresh_now_with(false)
+    }
+
+    fn refresh_now_with(&self, checked_untracked: bool) -> (usize, bool) {
         self.used_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -563,8 +581,29 @@ impl Staging {
             );
             return (0, false);
         }
-        // SAFETY: committed memory of the texture's layout size.
+        if checked_untracked {
+            // The reference renderer has a remapping read lock, which
+            // this older runtime lacks. A kernel snapshot lets workers
+            // hash/detile owned bytes without the query/read race.
+            // Do not consume the previous hash or publish a partial
+            // snapshot if a page disappears during the read.
+            let mut snapshot = crate::shadow::pooled(size);
+            snapshot.resize(size, 0);
+            let result = if crate::host::read_into(self.memory, &mut snapshot) {
+                self.refresh_untracked(last, &snapshot)
+            } else {
+                (0, false)
+            };
+            crate::shadow::give_back(snapshot);
+            return result;
+        }
+        // SAFETY: the original serial path uses committed title memory.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        self.refresh_untracked(last, tiled)
+    }
+
+    fn refresh_untracked(&self, last: &mut Last, tiled: &[u8]) -> (usize, bool) {
+        let size = tiled.len();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -826,6 +865,45 @@ mod tests {
         for (p, image) in images {
             assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
             pools::free(p);
+        }
+    }
+
+    #[test]
+    fn checked_untracked_workers_match_serial_hash_and_detile() {
+        let Some(_host) = host() else { return };
+        let words: [u32; 14] = [3, 0, 0, 0, 256, 0, 256, (1 << 16) | 1, 28, 1, 0, 1, 0, 0];
+        // SAFETY: the C-layout resource description consists of these words.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+        let size = crate::resource::texture_layout(&desc).unwrap().planes[0].layout.size as usize;
+        let mut sources = [vec![0x31u8; size], vec![0x72u8; size]];
+        let mut images = Vec::new();
+        let mut uploads = Vec::new();
+        for source in &sources {
+            let mut image = std::ptr::null();
+            assert_eq!(crate::resource::create_at_address(
+                std::ptr::null(), source.as_ptr() as u64, &desc, 0, std::ptr::null(),
+                std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
+            ), crate::object::S_OK);
+            let upload = staging(image, crate::resource::host_resource(image).unwrap()).unwrap();
+            assert!(upload.tracked.is_none());
+            images.push(image);
+            uploads.push(upload);
+        }
+        // Exercise the checked path even on a test machine with one CPU.
+        assert_eq!(uploads[0].refresh_now_with(true), (size, true));
+        assert_eq!(uploads[1].refresh_now_with(true), (size, true));
+        assert_eq!(refresh_many_impl(&uploads, true), vec![false, false]);
+        sources[1][0] = 0x93;
+        assert_eq!(refresh_many_impl(&uploads, true), vec![false, true]);
+        for (upload, source) in uploads.iter().zip(&sources) {
+            assert_eq!(upload.last.lock().unwrap().hash, Some(blake3::hash(source)));
+            assert_eq!(upload.refresh_now(), (size, false));
+            // SAFETY: both jobs have joined, and this is a live mapping.
+            assert_eq!(unsafe { *upload.data }, source[0]);
+        }
+        drop(uploads);
+        for image in images {
+            assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
         }
     }
 
