@@ -122,6 +122,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     })
 }
 
@@ -140,6 +141,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
 }
 

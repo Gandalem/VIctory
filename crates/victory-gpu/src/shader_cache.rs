@@ -235,6 +235,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         view_addresses,
         heap,
         heap_writes,
+        view_marks,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -283,7 +284,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*memory_writes) << 1
             | u32::from(*view_addresses) << 2
             | u32::from(*heap) << 3
-            | u32::from(*heap_writes) << 4,
+            | u32::from(*heap_writes) << 4
+            | u32::from(*view_marks) << 5,
     );
     out
 }
@@ -360,6 +362,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         view_addresses: memory & 4 != 0,
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
+        view_marks: memory & 32 != 0,
     }))
 }
 
@@ -392,6 +395,7 @@ mod tests {
             view_addresses: true,
             heap: true,
             heap_writes: true,
+            view_marks: true,
         }
     }
 

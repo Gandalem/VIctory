@@ -410,6 +410,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
     .expect("lower");
 
@@ -427,6 +428,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

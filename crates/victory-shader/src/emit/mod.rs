@@ -145,6 +145,22 @@
 //!   come from the root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap
 //!   index, two dwords, the buffer view's title address (high dword bits
 //!   0-15; stride bits 0), zeros for no buffer view.
+//! * **Write marks** ([`HostShader::view_marks`], with
+//!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
+//!   through an unordered buffer view from the heap (tables, the heap
+//!   itself, root UAVs as their heap views) also sets bits in the root UAV
+//!   `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`], a bitmap of
+//!   [`VIEW_WRITE_BITS`] bits, so the host copies back only what shaders
+//!   wrote. The root SRV `t`[`VIEW_MARKS`] there holds two dwords per heap
+//!   index: a base bit and a phase (0-65535); a write of byte `x` of the
+//!   view (its offset in the view, an element times the stride plus the
+//!   offset) sets bit `base + ((phase + x) >> 16)`, for the access's first
+//!   and last byte, at most [`VIEW_WRITE_BITS`] − 1. Base
+//!   [`VIEW_MARK_NONE`]: nothing is marked. The host gives each copy of
+//!   title memory a run of bits, one per 64 KiB title page it touches, and
+//!   a view the bit of its first byte's page as base with that byte's
+//!   offset in its page as phase. Writes at computed addresses mark the
+//!   page-table bitmap instead ("Title memory").
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -289,6 +305,11 @@ pub struct HostShader {
     /// Whether some of those are unordered access views: it may write
     /// through any of the heap's.
     pub heap_writes: bool,
+    /// Whether it marks the pages it writes through buffer views: the host
+    /// binds the view-mark table `t`[`VIEW_MARKS`] and the bitmap
+    /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
+    /// marks").
+    pub view_marks: bool,
 }
 
 impl HostShader {
@@ -332,9 +353,23 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// How a translation is made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Writes through buffer views mark the pages they write (module notes,
+    /// "Write marks"); the host must then bind the view-mark table and the
+    /// bitmap ([`HostShader::view_marks`]).
+    pub view_marks: bool,
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with(container, Options::default())
+}
+
+/// [`translate`] made as `options` say.
+pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -358,10 +393,10 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran, without write marks.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -369,6 +404,19 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_with(c, native, p, st, io, res, Options::default())
+}
+
+/// [`emit`] made as `options` say.
+pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -435,6 +483,7 @@ pub fn emit(
         outputs: outputs.clone(),
         prims: prims.clone(),
         mesh_stride,
+        view_marks: options.view_marks,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
@@ -472,6 +521,7 @@ pub fn emit(
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
     })
 }
 
@@ -830,6 +880,7 @@ mod tests {
             view_addresses: false,
             heap: false,
             heap_writes: false,
+            view_marks: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -846,6 +897,7 @@ mod tests {
                 view_addresses: false,
                 heap: false,
                 heap_writes: false,
+                view_marks: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
