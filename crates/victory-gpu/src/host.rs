@@ -971,7 +971,7 @@ impl Host {
     /// A worker may prepare staging only between synchronous GPU
     /// submissions. Never wait behind GPU work: the normal submission
     /// path is responsible for all required uploads.
-    pub(crate) fn prepare_heap_ahead(&self, viewed: &crate::bindless::Viewed) {
+    pub(crate) fn prepare_heap_ahead(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
         let Ok(_submitted) = self.submitted.try_lock() else { return };
         crate::bindless::prepare_ahead(viewed);
     }
@@ -983,6 +983,7 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         crate::shadow::maintain_snapshot_pool();
         self.video_memory();
+        crate::bindless::maintain_ready();
         crate::upload_pool::maintain();
         crate::shadow::reclaim_idle_loose();
         crate::texture::reclaim_idle_staging();
@@ -1019,8 +1020,8 @@ impl Host {
         drop(uploading);
         let runs: Vec<&HostList> = uploads
             .as_ref()
-            .map(|u| u.list())
             .into_iter()
+            .flat_map(|u| u.lists())
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];

@@ -397,7 +397,7 @@ pub(crate) fn prepare_heap_upload(resource: This, admission: &mut crate::upload_
 /// worker. The caller holds both the submission and viewed-heap locks.
 /// Cap source reads before allocating staging; recheck at submission.
 pub(crate) fn prepare_ahead(resource: This, admission: &mut crate::upload_pool::Admission,
-    remaining: u64) -> Option<u64>
+    remaining: u64) -> Option<(u64, Arc<Staging>)>
 {
     const MAX_SOURCE: u64 = 4 << 20;
     let (_, desc) = crate::resource::texture_memory(resource)?;
@@ -409,7 +409,77 @@ pub(crate) fn prepare_ahead(resource: This, admission: &mut crate::upload_pool::
     // In-place untracked reads are not safe on a background worker.
     // Tracked reads already go through the checked kernel copy.
     staging.refresh_now_with(true);
-    Some(source)
+    Some((source, staging))
+}
+
+/// A speculative recorded upload owns its destination and staging.
+/// The title ID is used only as a lookup key under the viewed-heap lock.
+/// No dirty bits are acknowledged until the mandatory submission pass
+/// revalidates the actual owner and complete dirty mask.
+pub(crate) struct AheadUpload {
+    pub(crate) key: usize,
+    copy: Arc<crate::resource::HostTexture>,
+    staging: Arc<Staging>,
+    mask: Vec<bool>,
+}
+
+fn same_pending(recorded: &[bool], ready: bool, current: &[bool]) -> bool {
+    ready && recorded.iter().any(|&dirty| dirty) && recorded == current
+}
+
+impl AheadUpload {
+    pub(crate) fn aliases(&self, staging: &Arc<Staging>) -> bool {
+        Arc::ptr_eq(&self.staging, staging)
+    }
+
+    pub(crate) fn revalidate(&self, resource: This) -> bool {
+        let Some(copy) = crate::resource::host_copy(resource) else { return false };
+        if !Arc::ptr_eq(&copy, &self.copy)
+            || copy.host_written.load(std::sync::atomic::Ordering::Relaxed)
+            || !copy.staging.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &self.staging))
+        {
+            return false;
+        }
+        self.staging.refresh_now_with(true);
+        let last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
+        same_pending(&self.mask, last.ready, &last.pending)
+    }
+
+    pub(crate) fn acknowledge(&self) {
+        // The submitter holds the same submission and heap locks as
+        // revalidate(). No speculative worker can change this staging.
+        let mut last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
+        debug_assert!(same_pending(&self.mask, last.ready, &last.pending));
+        last.pending.fill(false);
+    }
+}
+
+/// Record on the ahead worker, but keep the mask pending. Restrict
+/// speculative recording to tracked title memory; untracked data still
+/// benefits from the existing checked snapshot preparation.
+pub(crate) fn record_ahead_upload(list: &HostList, resource: This,
+    staging: &Arc<Staging>) -> Option<AheadUpload>
+{
+    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    if staging.tracked.is_none() {
+        return None;
+    }
+    let copy = crate::resource::host_copy(resource)?;
+    if !copy.sampled || copy.host_written.load(std::sync::atomic::Ordering::Relaxed)
+        || copy.twin.get().is_some_and(Option::is_some)
+    {
+        return None;
+    }
+    let last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
+    if !last.has_pending() {
+        return None;
+    }
+    let mask = last.pending.clone();
+    record(list, resource, &copy.texture, staging, Some(&mask));
+    crate::list::ensure_state(list, resource, SHADER_RESOURCE);
+    list.keep_staging(staging);
+    Some(AheadUpload { key: resource as usize, copy, staging: staging.clone(), mask })
 }
 
 /// Record only after all CPU preparation jobs have joined. The heap lock
@@ -876,6 +946,17 @@ fn staging_with_admission(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ahead_upload_requires_the_complete_current_dirty_mask() {
+        assert!(same_pending(&[true, false], true, &[true, false]));
+        assert!(!same_pending(&[true, false], false, &[true, false]));
+        assert!(!same_pending(&[true, false], true, &[false, false]));
+        assert!(!same_pending(&[true, false], true, &[true, true]));
+        assert!(!same_pending(&[true, true], true, &[false, true]));
+        assert!(!same_pending(&[false, false], true, &[false, false]));
+        assert!(!same_pending(&[true, false], true, &[true]));
+    }
 
     #[test]
     fn explicit_upload_selection_preserves_full_fallback_and_clean_subresources() {

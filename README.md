@@ -326,12 +326,21 @@ It accepts up to eight deduplicated weak heap requests and prepares
 staging between synchronous submissions, never waiting on an occupied
 submission lock. Each pass rotates through at most 32 entries, 16 MiB
 of source reads (4 MiB per texture), and checks an 8 ms soft time budget
-between textures. Pressure and OOM stop speculative work. It never
-records GPU commands or publishes views: the normal submission rechecks
-dirty pages or hashes, records pending copies and retains all staging
-owners. The reference's asynchronous ready-list publication depends on
-late-wait and deferred descriptor publication, which are not present in
-this renderer. This option is off by default pending Windows tests.
+between textures. Pressure and OOM stop speculative work.
+With the additional experimental `VICTORY_HEAP_READY_LISTS=1` switch,
+the worker also records closed upload command lists for tracked sampled
+textures. At most eight weak-heap ready batches are kept; entries expire
+after 250 ms or under memory pressure. Each list retains its host texture
+and staging owners but does not acknowledge pending changes until the
+submitter verifies current heap membership, host identity, staging
+identity and the complete dirty mask after a refresh. A stale batch
+falls back to normal submission-time recording without losing pending
+changes. Accepted lists run ahead of the synchronous fallback and title
+lists, with their state preludes and the existing submission fence.
+Neither switch is on by default pending Windows tests. This is
+asynchronous recording and ready-list handoff, not asynchronous GPU
+execution or delayed descriptor publication: the reference's late-wait
+and deferred descriptor architecture is still absent.
 
 ## Parallel buffer refresh
 

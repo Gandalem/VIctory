@@ -212,13 +212,62 @@ fn left_kind(view: &View) -> usize {
     }
 }
 
-// The reference heap_worker publishes asynchronously recorded lists.
-// This older eager renderer cannot publish descriptors at submission,
-// so the worker only prepares staging ahead. The mandatory submission
-// pass still rechecks contents, records copies and settles states.
+// Adapt the reference heap_worker's ready-list handoff to eager views.
+// The worker may record a bounded speculative list, but cannot publish
+// descriptors or submit it. The mandatory submitter validates its owners
+// and exact dirty masks before allowing that list into the GPU queue.
 const AHEAD_COUNT: usize = 32;
 const AHEAD_BYTES: u64 = 16 << 20;
 const AHEAD_MS: u128 = 8;
+const READY_LIMIT: usize = 8;
+const READY_AGE_MS: u128 = 250;
+
+struct Ready {
+    viewed: Weak<Viewed>,
+    made: std::time::Instant,
+    list: HostList,
+    entries: Vec<crate::texture::AheadUpload>,
+}
+// SAFETY: D3D12 resources are free-threaded. The list is closed before
+// publication, and a single submitter takes ownership before use.
+unsafe impl Send for Ready {}
+
+static READY: Mutex<Vec<Ready>> = Mutex::new(Vec::new());
+
+fn ready_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    worker_enabled() && *ON.get_or_init(|| std::env::var("VICTORY_HEAP_READY_LISTS").as_deref() == Ok("1"))
+}
+
+fn ready_live(age_ms: u128, heap_alive: bool, pressure: bool) -> bool {
+    !pressure && heap_alive && age_ms <= READY_AGE_MS
+}
+
+/// Called under the submission lock before other staging reclamation.
+/// Expired speculative lists release all owners without consuming masks.
+pub(crate) fn maintain_ready() {
+    if !ready_enabled() { return; }
+    let pressure = ahead_pressured();
+    let mut ready = READY.lock().unwrap_or_else(|e| e.into_inner());
+    ready.retain(|r| ready_live(r.made.elapsed().as_millis(), r.viewed.strong_count() != 0, pressure));
+}
+
+fn publish_ready(ready: Ready) {
+    let mut queue = READY.lock().unwrap_or_else(|e| e.into_inner());
+    queue.retain(|r| !Weak::ptr_eq(&r.viewed, &ready.viewed)
+        && ready_live(r.made.elapsed().as_millis(), r.viewed.strong_count() != 0, false));
+    if queue.len() >= READY_LIMIT {
+        queue.remove(0);
+    }
+    queue.push(ready);
+}
+
+fn take_ready(viewed: &Arc<Viewed>) -> Option<Ready> {
+    let key = Arc::downgrade(viewed);
+    let mut queue = READY.lock().unwrap_or_else(|e| e.into_inner());
+    let i = queue.iter().position(|r| Weak::ptr_eq(&r.viewed, &key))?;
+    Some(queue.remove(i))
+}
 
 struct AheadJob {
     viewed: Weak<Viewed>,
@@ -288,9 +337,9 @@ fn ahead_keys(textures: &BTreeMap<usize, u32>, cursor: Option<usize>, count: usi
 }
 
 /// Called only with the host's submission lock held, so no GPU list is
-/// reading a staging buffer while the worker changes it. Do not record
-/// commands, publish descriptors or acknowledge pending upload masks.
-pub(crate) fn prepare_ahead(viewed: &Viewed) {
+/// reading a staging buffer while the worker changes it. Optional closed
+/// lists remain speculative until the submitter validates them.
+pub(crate) fn prepare_ahead(viewed: &Arc<Viewed>) {
     if ahead_pressured() {
         return;
     }
@@ -300,6 +349,9 @@ pub(crate) fn prepare_ahead(viewed: &Viewed) {
     let started = std::time::Instant::now();
     let mut admission = crate::upload_pool::Admission::new();
     let mut left = AHEAD_BYTES;
+    let record_ready = ready_enabled();
+    let mut list = None;
+    let mut entries: Vec<crate::texture::AheadUpload> = Vec::new();
     for key in keys {
         if left == 0 || started.elapsed().as_millis() >= AHEAD_MS || ahead_pressured() {
             break;
@@ -307,8 +359,25 @@ pub(crate) fn prepare_ahead(viewed: &Viewed) {
         *cursor = Some(key);
         // The heap lock prevents resource destruction, as in uploads().
         // Oversized textures remain on the mandatory submission path.
-        if let Some(bytes) = crate::texture::prepare_ahead(key as This, &mut admission, left) {
+        if let Some((bytes, staging)) = crate::texture::prepare_ahead(key as This, &mut admission, left) {
             left = left.saturating_sub(bytes);
+            if record_ready && !entries.iter().any(|e| e.aliases(&staging)) {
+                if list.is_none() {
+                    list = crate::host::host().and_then(|h| h.new_list().ok());
+                }
+                if let Some(list) = &list
+                    && let Some(entry) = crate::texture::record_ahead_upload(list, key as This, &staging)
+                {
+                    entries.push(entry);
+                }
+            }
+        }
+    }
+    if let Some(list) = list {
+        list.close();
+        if !entries.is_empty() && !ahead_pressured() {
+            publish_ready(Ready { viewed: Arc::downgrade(viewed),
+                made: std::time::Instant::now(), list, entries });
         }
     }
 }
@@ -331,12 +400,33 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     }
     let list = guard.0.as_ref()?;
     let mut recorded = false;
+    let mut accepted = Vec::new();
     let mut done = std::collections::HashSet::new();
     let mut admission = crate::upload_pool::Admission::new();
     for viewed in heaps {
         // Held while uploading: the title releasing a texture (and its
         // memory) waits in `forget`.
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Preserve the original fallback for changed heap membership,
+        // replaced resources, failed refreshes, new dirty subresources,
+        // or a batch already touched through another heap. Validate all
+        // entries first, then acknowledge; rejecting a list consumes none.
+        if ready_enabled() && !ahead_pressured()
+            && let Some(ready) = take_ready(viewed)
+            && ready_live(ready.made.elapsed().as_millis(), true, false)
+            && ready.entries.iter().all(|entry| {
+                !done.contains(&entry.key) && inner.textures.contains_key(&entry.key)
+                    && entry.revalidate(entry.key as This)
+            })
+        {
+            for entry in &ready.entries {
+                entry.acknowledge();
+                done.insert(entry.key);
+            }
+            #[cfg(feature = "diagnostics")]
+            UPLOADED.fetch_add(ready.entries.len() as u64, Relaxed);
+            accepted.push(ready);
+        }
         let mut pending = Vec::with_capacity(32);
         for &r in inner.textures.keys() {
             if !done.insert(r) {
@@ -356,7 +446,11 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    if recorded || !accepted.is_empty() {
+        Some(Uploads { ready: accepted, fallback: recorded, guard })
+    } else {
+        None
+    }
 }
 
 /// Complete CPU jobs before recording changed textures in input order.
@@ -386,6 +480,15 @@ mod ahead_tests {
     use super::*;
 
     #[test]
+    fn ready_lists_expire_or_are_dropped_under_pressure() {
+        assert!(ready_live(0, true, false));
+        assert!(ready_live(READY_AGE_MS, true, false));
+        assert!(!ready_live(READY_AGE_MS + 1, true, false));
+        assert!(!ready_live(0, false, false));
+        assert!(!ready_live(0, true, true));
+    }
+
+    #[test]
     fn ahead_cursor_wraps_without_repeating_entries() {
         let textures = BTreeMap::from([(1, 1), (3, 1), (7, 1), (9, 1)]);
         assert_eq!(ahead_keys(&textures, None, 2), [1, 3]);
@@ -413,12 +516,19 @@ pub(crate) struct Holder(Option<HostList>);
 // submission at a time, under the lock.
 unsafe impl Send for Holder {}
 
-/// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
+/// All upload lists of a submission, held until its fence completes.
+/// Ready lists precede the synchronous fallback. State preludes still
+/// settle each list in execution order on the submitting thread.
+pub(crate) struct Uploads {
+    ready: Vec<Ready>,
+    fallback: bool,
+    guard: std::sync::MutexGuard<'static, Holder>,
+}
 
 impl Uploads {
-    pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
+    pub(crate) fn lists(&self) -> impl Iterator<Item = &HostList> {
+        self.ready.iter().map(|r| &r.list)
+            .chain(self.guard.0.as_ref().filter(|_| self.fallback))
     }
 }
 
