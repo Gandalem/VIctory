@@ -752,9 +752,14 @@ struct Resource {
     heap_flags: u32,
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// yet. Once published, the host copy must remain stable for borrowed
+    /// pointers, recorded commands and descriptors.
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    /// Initial console state for an eligible deferred committed texture.
+    /// None for eager resources, buffers, and resources with a clear value.
+    #[cfg(windows)]
+    host_lazy_state: Option<u32>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -994,7 +999,7 @@ pub(crate) mod life {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = resource(this).host_ref()?;
     host.residency.expose(&host.texture, host.bytes);
     let before = host
         .state
@@ -1010,7 +1015,7 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    let copy = resource(this).host.as_deref()?;
+    let copy = resource(this).host_ref()?;
     copy.residency.expose(&copy.texture, copy.bytes);
     Some(&copy.texture)
 }
@@ -1021,7 +1026,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    let copy = resource(this).host.clone()?;
+    let copy = resource(this).host_ref()?.clone();
     copy.residency.expose(&copy.texture, copy.bytes);
     Some(copy)
 }
@@ -1224,7 +1229,7 @@ pub(crate) fn dropped(this: This) -> u32 {
         return 0;
     }
     let r = resource(this);
-    let Some(host) = r.host.as_ref() else { return 0 };
+    let Some(host) = r.host_ref() else { return 0 };
     if r.desc.dimension != 3 || r.desc.mip_levels == 0 {
         return 0;
     }
@@ -1482,7 +1487,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
 #[cfg(windows)]
 fn current(this: This) -> bool {
     let r = resource(this);
-    let (Some(h), Some(k)) = (&r.host, memory_key(r.data() as u64, &r.desc)) else {
+    let (Some(h), Some(k)) = (r.host.get().and_then(Option::as_ref), memory_key(r.data() as u64, &r.desc)) else {
         return true;
     };
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -1653,7 +1658,50 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
 
+#[cfg(windows)]
+fn lazy_texture_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LAZY_TEXTURES").as_deref() == Ok("1"))
+}
+
+/// Start with independent committed sampled textures. Placed and
+/// address-backed resources can alias GPU-authored content; delaying
+/// those requires the reference renderer's deferred descriptor and
+/// alias machinery. Never defer a buffer or a resource with a clear value.
+#[cfg(windows)]
+fn defer_host_texture(desc: &ResourceDesc, committed: bool, has_clear: bool, enabled: bool) -> bool {
+    enabled && committed && !has_clear && desc.dimension == 3
+        && desc.flags & (USES | 8) == 0 && desc.sample_count <= 1
+        && memory_key(0, desc).is_some()
+        && footprint(desc).is_some_and(|f| f.size >= 1 << 20)
+}
+
 impl Resource {
+    #[cfg(windows)]
+    fn initialize_host(&mut self, state: u32, clear: *const c_void, allow_lazy: bool) {
+        if defer_host_texture(&self.desc, matches!(&self.backing, Backing::Committed(_)),
+            !clear.is_null(), allow_lazy)
+        {
+            self.host_lazy_state = Some(state);
+        } else {
+            let host = shared_texture(self.data() as u64, &self.desc, state, clear);
+            let _ = self.host.set(host);
+        }
+    }
+
+    /// The first real host access creates the texture. OnceLock gives
+    /// every concurrent accessor the same Arc and a stable address for
+    /// the older renderer's borrowed host-resource API. Match the eager
+    /// path's permanent None on creation failure; never silently swap a
+    /// published resource for a new allocation.
+    #[cfg(windows)]
+    fn host_ref(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        self.host.get_or_init(|| {
+            let state = self.host_lazy_state?;
+            shared_texture(self.data() as u64, &self.desc, state, std::ptr::null())
+        }).as_ref()
+    }
+
     fn data(&self) -> *mut u8 {
         match self.backing {
             Backing::Committed(ref memory) => memory.ptr.as_ptr(),
@@ -1697,17 +1745,21 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: None,
+        host: std::sync::OnceLock::new(),
+        #[cfg(windows)]
+        host_lazy_state: None,
     });
     #[cfg(windows)]
     {
-        resource.host = shared_texture(resource.data() as u64, &desc, state, clear);
+        resource.initialize_host(state, clear, lazy_texture_enabled());
     }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if resource.host.is_some() {
+    } else if resource.host_lazy_state.is_some()
+        || resource.host.get().is_some_and(Option::is_some)
+    {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
@@ -1752,7 +1804,10 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
             let a = resource(r);
             a.desc.flags & WRITTEN != 0
                 && bytes(&a.desc) == Some(want)
-                && matches!((&a.host, &b.host), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
+                // Do not allocate under TEXTURES_AT: writable sources
+                // and placed destinations are still eagerly initialized.
+                && matches!((a.host.get().and_then(Option::as_ref), b.host.get().and_then(Option::as_ref)),
+                    (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
         })
 }
 
@@ -1762,7 +1817,7 @@ impl Drop for Resource {
         #[cfg(feature = "diagnostics")]
         if self
             .host
-            .as_ref()
+            .get().and_then(Option::as_ref)
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -1778,7 +1833,7 @@ impl Drop for Resource {
             }
         }
         #[cfg(feature = "diagnostics")]
-        if let Some(h) = &self.host {
+        if let Some(h) = self.host.get().and_then(Option::as_ref) {
             use windows::core::Interface;
             life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
@@ -2003,7 +2058,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    resource(out).host.get().is_some_and(Option::is_some).then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -2678,6 +2733,44 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lazy_committed_sampled_texture_is_created_once_on_first_host_access() {
+        let Some(_host) = crate::host::host() else { return };
+        let desc = texture(1024, 1024, 28, 1);
+        assert!(defer_host_texture(&desc, true, false, true));
+        assert!(!defer_host_texture(&desc, false, false, true));
+        assert!(!defer_host_texture(&desc, true, true, true));
+        assert!(!defer_host_texture(&desc, true, false, false));
+        for flags in [1, 2, 4, 8] {
+            assert!(!defer_host_texture(&ResourceDesc { flags, ..desc }, true, false, true));
+        }
+        assert!(!defer_host_texture(&buffer(4 << 20), true, false, true));
+        assert!(!defer_host_texture(&texture(4, 4, 28, 1), true, false, true));
+        let memory = Memory::for_resource(footprint(&desc).unwrap(), PROPERTIES.kind).unwrap_or_else(|hr|
+            panic!("test texture memory allocation failed: {hr:?}"));
+        let mut r = Box::new(Resource {
+            object: Object::new(&RESOURCE_FUNCTIONS),
+            desc,
+            heap: PROPERTIES,
+            heap_flags: 0,
+            backing: Backing::Committed(memory),
+            host: std::sync::OnceLock::new(),
+            host_lazy_state: None,
+        });
+        // Exercise the same initialization path without mutating a
+        // process-global option during parallel tests.
+        r.initialize_host(0, std::ptr::null(), true);
+        assert!(r.host.get().is_none());
+        let first = r.host_ref().expect("first host access creates a copy");
+        let second = r.host_ref().expect("second access keeps the same copy");
+        assert!(std::sync::Arc::ptr_eq(first, second));
+        assert!(r.host.get().is_some_and(Option::is_some));
+        // A query after real access must observe the actual retained shape.
+        let actual = unsafe { first.texture.GetDesc() };
+        assert_eq!((actual.Width, actual.Height), (1024, 1024));
     }
 
     #[cfg(windows)]

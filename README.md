@@ -486,9 +486,22 @@ registry. Non-local-only pressure does not trigger local eviction.
 Diagnostics separate these estimates from driver-reported usage; none
 is a measurement of actual physical VRAM residency.
 
-This implements conservative eviction, deferred initial residency and OS
-residency priority hints, not the full lazy resource recreation,
-tile-level eviction and descriptor rebuilding architecture in
+`VICTORY_LAZY_TEXTURES=1` additionally defers creation of the host
+D3D12 resource itself for independent committed, shader-readable 2D
+sampled textures with at least 1 MiB of title backing, no writable or
+deny-shader flags, no multisampling and no clear value. The title
+allocation and initial state still exist immediately; the first host
+access creates and shares the resource through the existing memory key,
+and concurrent accessors use the same OnceLock result. Descriptor
+creation is a host access, so this is not deferred descriptor
+publication. Placed/address-backed textures and writable resources
+retain the eager path. Unused deferred textures never create a host
+allocation. Published resources retain stable identity.
+
+This implements conservative eviction, deferred initial residency,
+limited lazy resource creation and OS residency priority hints, not
+the full lazy resource recreation, tile-level eviction and descriptor
+rebuilding architecture in
 [cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/resource.rs).
 Logical evicted allocation bytes are not a measured VRAM reduction.
 The default is off until validated on Windows hardware.
