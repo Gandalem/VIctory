@@ -199,10 +199,10 @@ fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     if let View::Shader(resource, desc) = view
-        && let Some(texture) = crate::resource::host_resource(*resource as This)
+        && let Some(texture) = crate::resource::made_copy(*resource as This)
     {
-        let mask = crate::descriptor::host::srv_mip_mask(*resource as This, desc.as_ref(), texture);
-        return crate::texture::title_written(texture).then_some(Seen::Texture(*resource, mask));
+        let mask = crate::descriptor::host::srv_mip_mask(*resource as This, desc.as_ref(), &texture.texture);
+        return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource, mask));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {
@@ -384,6 +384,9 @@ pub(crate) fn prepare_ahead(viewed: &Arc<Viewed>) {
             if record_ready && !entries.iter().any(|e| e.aliases(&staging)) {
                 if list.is_none() {
                     list = crate::host::host().and_then(|h| h.new_list().ok());
+                    if let Some(list) = &list {
+                        list.set_ours();
+                    }
                 }
                 if let Some(list) = &list
                     && let Some(entry) = crate::texture::record_ahead_upload(list, key as This, &staging)
@@ -416,7 +419,11 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
         // Closed by the last submission, which has run.
         Some(list) => list.reset(),
         // Made open.
-        None => guard.0 = Some(crate::host::host()?.new_list().ok()?),
+        None => {
+            let list = crate::host::host()?.new_list().ok()?;
+            list.set_ours();
+            guard.0 = Some(list);
+        }
     }
     let list = guard.0.as_ref()?;
     let mut recorded = false;

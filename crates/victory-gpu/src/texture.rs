@@ -493,10 +493,12 @@ impl ExplicitUpload {
 /// never uploaded). True if it recorded; the texture is then in the copy
 /// destination state.
 pub(crate) fn prepare_heap_upload(resource: This, admission: &mut crate::upload_pool::Admission) -> Option<Arc<Staging>> {
-    if is_host_written(resource) {
+    // Not made (given up, or never read): nothing to bring up.
+    let copy = crate::resource::made_copy(resource)?;
+    if copy.host_written.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    staging_with_admission(resource, crate::resource::host_resource(resource)?, Some(admission), true)
+    staging_with_admission(resource, &copy.texture, Some(admission), true)
 }
 
 /// Prepare and record the initial image before publishing a deferred

@@ -240,6 +240,7 @@ pub(crate) fn publish_pending(device: &crate::host::Host,
     }
     let list = device.new_list().unwrap_or_else(|e|
         crate::host::fail(format_args!("could not allocate deferred view upload list: {e}")));
+    list.set_ours();
     let mut admission = crate::upload_pool::Admission::new();
     for h in due {
         h.publish_pending_views(&list, &mut admission);
@@ -274,6 +275,7 @@ pub(crate) fn make_read(slots: &[u32]) {
         }
         for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
             host.mirror(i, start + u64::from(i) * u64::from(step), true);
+            host.stamp_read(i);
         }
     }
 }
@@ -282,6 +284,22 @@ pub(crate) fn make_read(slots: &[u32]) {
 /// null: the 12 GB card held 6.5 GB without them (run textures2).
 #[cfg(windows)]
 const PLACED_CAP: u64 = 3 << 30;
+
+/// The host textures (raw pointers) that slots `slots` of the
+/// shader-visible view heaps view.
+#[cfg(windows)]
+pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut textures = std::collections::HashSet::new();
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
+            textures.extend(host.textures_at(slots));
+        }
+    }
+    textures
+}
 
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.

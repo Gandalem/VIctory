@@ -799,6 +799,9 @@ pub(crate) struct HostTexture {
     pub(crate) residency: crate::residency::Residency,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
+    /// When the title last used it: presented frame and milliseconds since
+    /// the first stamp ([`HostTexture::stamp`]).
+    last: [std::sync::atomic::AtomicU64; 2],
 }
 
 #[cfg(windows)]
@@ -843,7 +846,35 @@ impl HostTexture {
             placement: None,
             residency: Default::default(),
             used: false.into(),
+            last: [crate::queue::presented().into(), now_ms().into()],
         }
+    }
+
+    /// The title used it now: a list of the title's names it, or a shader
+    /// read a heap slot viewing it (`crate::descriptor::make_read`).
+    pub(crate) fn stamp(&self) {
+        self.stamp_at(crate::queue::presented(), now_ms());
+    }
+
+    /// Used at presented frame `frame`, `ms` milliseconds in.
+    fn stamp_at(&self, frame: u64, ms: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.last[0].store(frame, Relaxed);
+        self.last[1].store(ms, Relaxed);
+    }
+
+    /// When the title last used it: presented frame and milliseconds
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn last_used(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.last[0].load(Relaxed), self.last[1].load(Relaxed))
+    }
+
+    /// Forgets its uses (tests: a stamp is then seen to happen).
+    #[cfg(test)]
+    pub(crate) fn unstamp(&self) {
+        self.stamp_at(u64::MAX, 0);
     }
 
     /// A list uses it: counted the first time (diagnostics of how much of
@@ -1074,6 +1105,16 @@ pub(crate) fn host_resource<'a>(
     Some(&copy.texture)
 }
 
+/// A title texture's host copy if it is made, without making it: for work
+/// that is no use of the title's (uploads of what heap slots view).
+#[cfg(windows)]
+pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    resource(this).host.get()?.clone()
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -1083,6 +1124,43 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     let copy = resource(this).host_ref()?.clone();
     copy.residency.expose(&copy.texture, copy.bytes);
     Some(copy)
+}
+
+/// Milliseconds since the first call: host textures' use stamps.
+#[cfg(windows)]
+fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Stamp heap reads once per presented frame, before the next submission.
+/// The upstream eviction pass consumes these stamps; do not release any
+/// texture until its resettable owner and all owned callers are ported.
+#[cfg(windows)]
+pub(crate) fn stamp_heap_reads() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let frame = crate::queue::presented();
+    if LAST.swap(frame, Relaxed) == frame {
+        return;
+    }
+    let slots = crate::shadow::reads_since();
+    if slots.is_empty() {
+        return;
+    }
+    let read = crate::descriptor::read_textures(&slots);
+    if read.is_empty() {
+        return;
+    }
+    let now = now_ms();
+    let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    for &r in at.values().flatten() {
+        if let Some(t) = made_copy(r as This)
+            && read.contains(&(windows::core::Interface::as_raw(&t.texture) as usize))
+        {
+            t.stamp_at(frame, now);
+        }
+    }
 }
 
 /// Opt-in low-VRAM texture profile. The choice is fixed for the process:

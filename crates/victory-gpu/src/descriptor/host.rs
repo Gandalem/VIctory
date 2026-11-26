@@ -933,6 +933,31 @@ impl HostHeap {
         Some(text)
     }
 
+    /// The host textures (raw pointers) slots `slots` view.
+    pub(crate) fn textures_at(&self, slots: &[u32]) -> Vec<usize> {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .iter()
+            .filter_map(|&i| kept.get(i as usize)?.as_ref().filter(|k| k.1.is_none()))
+            .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
+            .collect()
+    }
+
+    /// A shader read slot `index` through the heap: the texture it views
+    /// was used now.
+    pub(crate) fn stamp_read(&self, index: u32) {
+        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
+        let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
+            return;
+        };
+        let view = placed_texture(&view).unwrap_or(view);
+        if let View::Shader(r, _) = view
+            && let Some(t) = crate::resource::made_copy(r as crate::object::This)
+        {
+            t.stamp();
+        }
+    }
+
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {

@@ -452,6 +452,58 @@ mod tests {
         assert_eq!(scratch_prefix_to_keep(sizes, 8 << 20), 4);
     }
 
+    /// The textures shaders read through the heap since the last eviction
+    /// pass are named again at each pass (a slot's read is reported as new
+    /// only once), and the marks are cleared for the next.
+    #[test]
+    fn heap_reads_since_the_last_pass_name_their_textures() {
+        let Some(host) = host() else { return };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        // A 4x1 RGBA8 texture, linear, in memory of its own, and a 2D view.
+        let memory = Box::leak(vec![0u8; 1 << 16].into_boxed_slice());
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        crate::descriptor::create_placed_srv(null, &words, &view, title_heap.start);
+        let heap_host = title_heap.host().expect("a host view heap");
+        assert!(heap_host.mirror(0, title_heap.start, true).is_some());
+        let texture = crate::resource::texture_at(address, &words).expect("its resource");
+        let raw = windows::core::Interface::as_raw(&crate::resource::made_copy(texture).unwrap().texture) as usize;
+        // No submission takes the marks meanwhile.
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..2 {
+            crate::shadow::tests::mark_read(0);
+            let slots = crate::shadow::reads_since();
+            assert!(slots.contains(&0), "the slot read");
+            assert!(crate::descriptor::read_textures(&slots).contains(&raw), "its texture named");
+            assert!(!crate::shadow::reads_since().contains(&0), "the marks cleared");
+        }
+    }
+
+    #[test]
+    fn title_lists_stamp_textures_but_upload_lists_do_not() {
+        let Some(host) = host() else { return };
+        let texture = crate::resource::test_lazy_host();
+        let copy = crate::resource::host_copy(texture).unwrap();
+        for (ours, stamped) in [(true, false), (false, true)] {
+            copy.unstamp();
+            let list = host.new_list().unwrap();
+            if ours {
+                list.set_ours();
+            }
+            let _ = list.transition(texture, 0x40);
+            assert_eq!(copy.last_used().0 != u64::MAX, stamped, "ours: {ours}");
+        }
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(texture, 0x10)(texture);
+    }
+
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
         let Some(host) = host() else { return };
@@ -631,6 +683,8 @@ pub(crate) struct HostList {
     /// A copy of ours replaced the list's compute root signature and
     /// pipeline: draws and dispatches set theirs again.
     rebind: std::sync::atomic::AtomicBool,
+    /// A list of ours (uploads), whose uses are no use of the title's.
+    ours: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -985,6 +1039,7 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 rebind: false.into(),
+                ours: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 id,
@@ -1012,6 +1067,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::resource::stamp_heap_reads();
         crate::shadow::maintain_snapshot_pool();
         self.video_memory();
         crate::bindless::maintain_ready();
@@ -1674,6 +1730,9 @@ impl HostList {
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 copy.note_used();
+                if !self.ours.load(Ordering::Relaxed) {
+                    copy.stamp();
+                }
                 v.insert((wanted, wanted, copy.clone()));
                 None
             }
@@ -1718,6 +1777,12 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().again(side, writes),
         }
+    }
+
+    /// The list is one of ours (uploads): what it uses is no use of the
+    /// title's.
+    pub(crate) fn set_ours(&self) {
+        self.ours.store(true, Ordering::Relaxed);
     }
 
     /// A copy of ours replaced the compute root signature and pipeline.
@@ -2076,6 +2141,9 @@ impl HostList {
         };
         const COPY_DEST: u32 = 0x400;
         copy.note_used();
+        if !self.ours.load(Ordering::Relaxed) {
+            copy.stamp();
+        }
         entry.insert((COPY_DEST, COPY_DEST, copy.clone()));
         deferred.explicit_uploads.push(crate::texture::ExplicitUpload {
             copy: copy.clone(),
@@ -3072,6 +3140,7 @@ impl Host {
                 .and_then(|chain| chain.cast::<IDXGISwapChain3>())
                 .map_err(|e| ("swap chain", e))?;
             let copy = self.new_list().map_err(|e| ("copy list", e))?;
+            copy.set_ours();
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
