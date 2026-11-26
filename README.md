@@ -155,6 +155,31 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+## Memory retention (experimental)
+
+The idle snapshot cache is bounded by installed RAM, available physical RAM,
+and available commit. It is checked at most once per second while the cache
+is used; the default ceiling is 2048 MiB and the normal budget on a 32 GiB
+system is at most 512 MiB. Below 1 GiB available physical RAM or commit, idle
+snapshots are released. `VICTORY_SNAPSHOT_POOL_MB` overrides the ceiling
+(0–2048 MiB, 0 disables idle retention). It does not limit live snapshots.
+
+After a completed command list is reset, retained scratch chunks are capped
+at 4 MiB per list (`VICTORY_SCRATCH_KEEP_MB`, 0–64 MiB). Active uploads and
+resources still referenced by recorded GPU work are not reclaimed.
+
+Diagnostics report a `memory cache census` with working set, private commit,
+idle snapshot bytes/budget and the count/logical size of loose shadows. The
+logical shadow sizes are not measurements of physical RAM or VRAM residency.
+This change does not yet reclaim loose shadows: they may be referenced by
+persistent descriptors and page tables. Validate on identical synthetic or
+legally supplied workloads before drawing performance conclusions.
+
+The pressure-aware retention policy is informed by the RAM cache pressure
+handling in [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)
+(commit `c09a44e97df4170ef0caa8cc236f7cb46fd1ce90`), with independent changes to
+this repository's older snapshot and scratch implementations.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

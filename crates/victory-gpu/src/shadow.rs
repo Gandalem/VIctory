@@ -47,42 +47,149 @@ pub(crate) struct Shadow {
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Only returned snapshots may be retained or discarded here. Snapshots
+/// still needed by an in-flight copy-back remain owned by their Shadow.
+const MIB: usize = 1 << 20;
+const MAX_POOL_BYTES: usize = 2048 * MIB;
+const MAX_POOL_ENTRIES: usize = 4096;
 
-/// An empty buffer with room for `n` bytes, from the pool if it has one.
+struct SnapshotPool {
+    buffers: Vec<Vec<u8>>,
+    bytes: usize,
+    limit: usize,
+    checked: Option<std::time::Instant>,
+}
+
+impl SnapshotPool {
+    const fn new() -> Self {
+        Self {
+            buffers: Vec::new(),
+            bytes: 0,
+            limit: 0,
+            checked: None,
+        }
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        if self.bytes <= self.limit && self.buffers.len() <= MAX_POOL_ENTRIES {
+            return;
+        }
+        let mut remaining = self.limit;
+        let mut count = 0;
+        self.buffers.retain(|v| {
+            let capacity = v.capacity();
+            if capacity > remaining || count == MAX_POOL_ENTRIES {
+                return false;
+            }
+            remaining -= capacity;
+            count += 1;
+            true
+        });
+        self.bytes = self.limit - remaining;
+    }
+
+    fn refresh_limit(&mut self) {
+        use std::time::{Duration, Instant};
+        if self.checked.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.checked = Some(Instant::now());
+        self.set_limit(snapshot_limit(system_memory(), configured_pool_ceiling()));
+    }
+
+    fn take(&mut self, n: usize) -> Vec<u8> {
+        // Largest first, so the last fit is the smallest adequate buffer.
+        let Some(i) = self.buffers.iter().rposition(|v| v.capacity() >= n) else {
+            return Vec::with_capacity(n);
+        };
+        let mut v = self.buffers.remove(i);
+        self.bytes -= v.capacity();
+        v.clear();
+        v
+    }
+
+    fn put(&mut self, mut v: Vec<u8>) {
+        let capacity = v.capacity();
+        if capacity == 0 || capacity > self.limit {
+            return;
+        }
+        v.clear();
+        let i = self.buffers.partition_point(|b| b.capacity() > capacity);
+        self.buffers.insert(i, v);
+        self.bytes += capacity;
+        self.trim();
+    }
+}
+
+/// Upper bound for idle snapshot allocations, not a limit on live memory.
+/// Under pressure keep at most one eighth of available RAM or commit,
+/// with a complete idle-cache release below 1 GiB of either.
+fn snapshot_limit(memory: Option<(u64, u64, u64)>, ceiling: usize) -> usize {
+    const GIB: u64 = 1 << 30;
+    let limit = match memory {
+        Some((total, available, commit)) => {
+            if available.min(commit) < GIB {
+                0
+            } else {
+                (total / 64).min(available / 8).min(commit / 8)
+            }
+        }
+        None => 512 * MIB as u64,
+    };
+    usize::try_from(limit).unwrap_or(usize::MAX).min(ceiling)
+}
+
+fn configured_pool_ceiling() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map_or(MAX_POOL_BYTES, |mb| mb.min(2048) * MIB)
+    })
+}
+
+fn system_memory() -> Option<(u64, u64, u64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: a plain structure filled by GlobalMemoryStatusEx.
+    let mut memory: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    memory.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: the structure is writable and dwLength describes its size.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut memory) } != 0;
+    ok.then_some((memory.ullTotalPhys, memory.ullAvailPhys, memory.ullAvailPageFile))
+}
+
+static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool::new());
+
+/// An empty buffer with room for n bytes, from the idle pool if possible.
 fn pooled(n: usize) -> Vec<u8> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+    pool.refresh_limit();
+    pool.take(n)
 }
 
-/// Returns a snapshot buffer to the pool, which keeps the largest up to
-/// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
-/// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
+/// Return a completed snapshot to the bounded idle cache.
 fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
+    pool.refresh_limit();
+    pool.put(v);
 }
 
-/// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 2 << 30;
+/// Logical cache accounting, not physical RAM or D3D12 residency.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cache_stats() -> (usize, usize, usize, usize, u64) {
+    let (count, bytes, limit) = {
+        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        (pool.buffers.len(), pool.bytes, pool.limit)
+    };
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    (count, bytes, limit, loose.len(), loose.values().map(|s| s.len).sum())
+}
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -738,6 +845,52 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_budget_scales_with_ram_and_commit() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(snapshot_limit(Some((32 * GIB, 12 * GIB, 20 * GIB)), MAX_POOL_BYTES), 512 * MIB);
+        assert_eq!(snapshot_limit(Some((64 * GIB, 2 * GIB, 8 * GIB)), MAX_POOL_BYTES), 256 * MIB);
+        assert_eq!(snapshot_limit(Some((64 * GIB, 8 * GIB, GIB / 2)), MAX_POOL_BYTES), 0);
+        assert_eq!(snapshot_limit(Some((64 * GIB, GIB / 2, 8 * GIB)), MAX_POOL_BYTES), 0);
+        assert_eq!(snapshot_limit(None, MAX_POOL_BYTES), 512 * MIB);
+        assert_eq!(snapshot_limit(Some((32 * GIB, 12 * GIB, 20 * GIB)), 64 * MIB), 64 * MIB);
+        assert_eq!(snapshot_limit(None, 0), 0);
+    }
+
+    #[test]
+    fn returned_snapshots_are_bounded_and_reused_best_fit() {
+        let mut pool = SnapshotPool::new();
+        pool.set_limit(100);
+        pool.put(vec![1; 64]);
+        pool.put(vec![2; 32]);
+        pool.put(vec![3; 256]); // too large to retain
+        assert_eq!(pool.bytes, 96);
+        let reused = pool.take(20);
+        assert_eq!(reused.capacity(), 32);
+        assert!(reused.is_empty());
+        pool.put(reused);
+        pool.set_limit(40);
+        assert_eq!(pool.bytes, 32);
+        assert_eq!(pool.buffers.len(), 1);
+        pool.set_limit(0);
+        assert_eq!(pool.bytes, 0);
+        assert!(pool.buffers.is_empty());
+        // No cache budget must not prevent a live snapshot from being made.
+        assert!(pool.take(128).capacity() >= 128);
+    }
+
+    #[test]
+    fn snapshot_pool_bounds_entry_count() {
+        let mut pool = SnapshotPool::new();
+        pool.set_limit(8192);
+        for _ in 0..MAX_POOL_ENTRIES + 8 {
+            pool.put(vec![0; 1]);
+        }
+        assert_eq!(pool.buffers.len(), MAX_POOL_ENTRIES);
+        assert_eq!(pool.bytes, MAX_POOL_ENTRIES);
+    }
+
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the

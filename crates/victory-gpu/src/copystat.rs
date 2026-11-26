@@ -132,19 +132,23 @@ pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
         .or_default() += bytes;
 }
 
-/// Our process's working set, bytes.
-fn working_set() -> u64 {
+/// Current working set and private committed bytes. Neither is VRAM.
+fn process_memory() -> Option<[u64; 2]> {
     use windows_sys::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut c = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
-    c.WorkingSetSize as u64
+    let cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let mut c = PROCESS_MEMORY_COUNTERS_EX { cb, ..Default::default() };
+    // SAFETY: our own process and a writable extended structure of size cb.
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&mut c as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
+            cb,
+        )
+    } != 0;
+    ok.then_some([c.WorkingSetSize as u64, c.PrivateUsage as u64])
 }
 
 /// Our process's hard page faults so far (read from disk or the page
@@ -202,6 +206,7 @@ pub(crate) fn log(frames: f64) {
         .iter()
         .map(|a| a.swap(0, Relaxed) as f64 / frames)
         .collect();
+    let process = process_memory();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
@@ -270,12 +275,23 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PreludeUs as usize]),
         mb(c[C::CompareBytes as usize]),
         ms(c[C::CompareUs as usize]),
-        working_set() as f64 / 1e6,
+        process.map_or(0, |m| m[0]) as f64 / 1e6,
         {
             static HARD: AtomicU64 = AtomicU64::new(0);
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    let (snapshots, cached, limit, loose, loose_bytes) = crate::shadow::cache_stats();
+    tracing::info!(
+        working_set_mib = ?process.map(|m| m[0] >> 20),
+        private_commit_mib = ?process.map(|m| m[1] >> 20),
+        idle_snapshot_count = snapshots,
+        idle_snapshot_mib = cached >> 20,
+        idle_snapshot_limit_mib = limit >> 20,
+        loose_shadow_count = loose,
+        loose_shadow_logical_mib = loose_bytes >> 20,
+        "memory cache census"
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

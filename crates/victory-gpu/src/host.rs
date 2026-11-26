@@ -305,6 +305,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn idle_scratch_retention_keeps_only_a_bounded_prefix() {
+        let sizes = [64 << 10, 128 << 10, 256 << 10, 4 << 20];
+        assert_eq!(scratch_prefix_to_keep(sizes, 0), 0);
+        assert_eq!(scratch_prefix_to_keep(sizes, 192 << 10), 2);
+        assert_eq!(scratch_prefix_to_keep(sizes, 4 << 20), 3);
+        assert_eq!(scratch_prefix_to_keep(sizes, 8 << 20), 4);
+    }
+
+    #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
         let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
@@ -612,6 +621,31 @@ unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
+
+/// Retain only this many bytes of scratch chunks per idle command list.
+fn scratch_keep_bytes() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_SCRATCH_KEEP_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(4)
+            .min(64) << 20
+    })
+}
+
+/// Keep a prefix so allocation order and the growth strategy are preserved.
+fn scratch_prefix_to_keep(sizes: impl IntoIterator<Item = u64>, mut remaining: u64) -> usize {
+    let mut count = 0;
+    for size in sizes {
+        if size > remaining {
+            break;
+        }
+        remaining -= size;
+        count += 1;
+    }
+    count
+}
 
 struct ScratchChunk {
     _buffer: ID3D12Resource,
@@ -1376,6 +1410,15 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
+        } else {
+            // The preceding submission has finished and Reset released the
+            // previous recording. No in-flight upload is reclaimed here.
+            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            let keep = scratch_prefix_to_keep(
+                scratch.chunks.iter().map(|chunk| chunk.capacity),
+                scratch_keep_bytes(),
+            );
+            scratch.chunks.truncate(keep);
         }
     }
 
