@@ -677,6 +677,37 @@ macro_rules! once {
     }};
 }
 
+/// Map an explicit SRV's levels onto a texture whose largest levels are
+/// omitted. The union member follows its actual D3D12 view dimension.
+fn shift_view_levels(drop: u32, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
+    if drop == 0 {
+        return;
+    }
+    let shift = crate::resource::shift_levels;
+    // SAFETY: the dimension selects the corresponding union member.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -1145,6 +1176,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if desc.is_none() && !default_view(resource) {
                     return None;
+                }
+                if let Some(d) = desc.as_mut() {
+                    shift_view_levels(crate::resource::dropped(resource), d);
                 }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;

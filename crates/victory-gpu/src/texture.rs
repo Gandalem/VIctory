@@ -43,8 +43,10 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Host mips per array slice.
     mips: u32,
+    /// Title mip corresponding to host level zero.
+    first_mip: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -149,14 +151,24 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     };
     let (fa, ra, total) = footprints(&da, count(&da));
     let (fb, rb, _) = footprints(&db, count(&db));
-    // Subresources in order while both have the same bytes there (mips of
-    // a block-compressed texture past its last whole block do not).
-    let n = (0..fa.len().min(fb.len()))
-        .take_while(|&i| {
+    // Map aliases by their title mip/slice when either host texture is
+    // shortened. Otherwise preserve the original prefix-copy behavior.
+    let pairs: Vec<(usize, usize)> = if crate::resource::dropped(from) > 0 || crate::resource::dropped(to) > 0 {
+        let count = crate::resource::title_subresources(from).min(crate::resource::title_subresources(to));
+        (0..count).filter_map(|i| {
+            Some((crate::resource::host_subresource(from, i)? as usize,
+                  crate::resource::host_subresource(to, i)? as usize))
+        }).take_while(|&(i, j)| {
+            i < fa.len() && j < fb.len() && fa[i].Footprint.RowPitch == fb[j].Footprint.RowPitch
+                && ra[i] == rb[j] && fa[i].Footprint.Depth == fb[j].Footprint.Depth
+        }).collect()
+    } else {
+        (0..fa.len().min(fb.len())).take_while(|&i| {
             let (x, y) = (fa[i], fb[i]);
             x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && ra[i] == rb[i] && x.Footprint.Depth == y.Footprint.Depth
-        })
-        .count() as u32;
+        }).map(|i| (i, i)).collect()
+    };
+    let n = pairs.len() as u32;
     if n == 0 {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return;
@@ -181,16 +193,18 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let l = &list.list;
     // SAFETY: an open list; live resources in the states named.
     unsafe {
-        for i in 0..n {
-            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(a, i), None);
+        for &(i, _) in &pairs {
+            l.CopyTextureRegion(&place(&buffer, fa[i]), 0, 0, 0, &sub(a, i as u32), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
-        for i in 0..n {
-            l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
+        for &(i, j) in &pairs {
+            let mut footprint = fb[j];
+            footprint.Offset = fa[i].Offset;
+            l.CopyTextureRegion(&sub(b, j as u32), 0, 0, 0, &place(&buffer, footprint), None);
         }
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -383,7 +397,7 @@ impl Staging {
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip + self.first_mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -495,6 +509,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        first_mip: crate::resource::dropped(resource),
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
@@ -508,6 +523,42 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_texture_staging_reads_original_mip_and_slice() {
+        use windows::core::Interface;
+        let Some(_host) = host() else { return };
+        let words: [u32; 14] = [3, 0, 0, 0, 512, 0, 512, (5 << 16) | 2, 28, 1, 0, 1, 0, 0];
+        // SAFETY: the C-layout resource description consists of these words.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+        let title = &crate::resource::texture_layout(&desc).unwrap().planes[0].layout;
+        let bytes: Vec<u8> = (0..title.size).map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8).collect();
+        let mut image = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(
+            std::ptr::null(), bytes.as_ptr() as u64, &desc, 0, std::ptr::null(),
+            std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
+        ), crate::object::S_OK);
+        let upload = staging(image, crate::resource::host_resource(image).unwrap()).unwrap();
+        let drop = crate::resource::dropped(image);
+        assert_eq!(upload.first_mip, drop);
+        assert_eq!(upload.mips, 5 - drop);
+        upload.detile(&bytes);
+        for slice in 0..2 {
+            let index = (slice * upload.mips) as usize;
+            let f = upload.footprints[index];
+            let pitch = f.Footprint.RowPitch as usize;
+            let rows = upload.rows[index] as usize;
+            let len = pitch * rows;
+            let mut expected = vec![0u8; len];
+            title.detile(&bytes, drop, slice, &mut expected, pitch, len).unwrap();
+            // This first retained level is large enough to fill whole rows.
+            // SAFETY: this subresource is within the live staging allocation.
+            let got = unsafe { std::slice::from_raw_parts(upload.data.add(f.Offset as usize), len) };
+            assert_eq!(got, expected.as_slice(), "retained mip {drop}, slice {slice}");
+        }
+        std::mem::drop(upload);
+        assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

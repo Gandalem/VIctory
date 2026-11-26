@@ -185,6 +185,39 @@ The existing expected-value stride and gather tests are unchanged. This
 is a candidate fix for both failures, not a claim of a verified hardware
 result. Full GPU and shader regression testing is required before merge.
 
+## Low-VRAM texture profile (experimental)
+
+`VICTORY_TEXTURE_DROP_MIPS=0` (default) keeps the original texture sizes.
+`1` omits the largest mip of eligible sampled 2D textures, and `2`–`4`
+omit additional levels. `auto` selects one omitted level on a detected
+adapter with up to 8 GiB dedicated video memory, or zero when the adapter
+is unknown or has more memory. This is a process-wide choice; no live
+texture changes shape. Eligible textures have at least five mips and
+512 texels on the shorter side. Render targets, depth, UAV, MSAA and
+incompatible formats are excluded. Eligible texture chains typically
+use about a quarter of their original host bytes when one mip is omitted,
+not a quarter of total VRAM. This trades texture detail for memory.
+
+SRV mip ranges, tiled upload source mips, array slice indices, texture
+copies and alias transfers map to retained levels. Copies involving
+omitted levels do not copy those levels; resolves involving shortened
+textures are unsupported. Texture-to-buffer readback is not implemented
+in this older runtime. Full title-memory layout and tracking remain
+intact; the CPU may still read the full tiled allocation.
+
+DXGI local and nonlocal process usage and budget are sampled once per
+second. `VICTORY_TEXTURE_ROOM_PERCENT` (50–97, default 90) is a pressure
+threshold for reducing completed-list idle scratch retention, with a
+10-percentage-point recovery margin. This is **not** a hard VRAM cap:
+the older runtime creates textures eagerly and cannot safely reject
+required allocations. Deferred residency, eviction and queued texture
+admission are not included in this change.
+
+The mip mapping follows
+[fxceless/victory-fork PR 610](https://github.com/fxceless/victory-fork/pull/610)
+and [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/tree/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90).
+Validate both modes, including retained array uploads, before deployment.
+
 ## Memory retention (experimental)
 
 The idle CPU buffer cache (snapshots and temporary texture detiling reads)

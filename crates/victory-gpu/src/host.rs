@@ -38,6 +38,8 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    adapter: Option<IDXGIAdapter3>,
+    video_budget: Mutex<VideoBudget>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -237,8 +239,13 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
+            .ok();
         Ok(Host {
             device,
+            adapter,
+            video_budget: Mutex::new(VideoBudget::default()),
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -256,6 +263,78 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(Presentation::default()),
         })
     }
+}
+
+/// DXGI process-local accounting: local budget/usage and nonlocal
+/// budget/usage. Sample at most once per second, preserving the last good
+/// sample if the driver cannot answer.
+#[derive(Default)]
+struct VideoBudget {
+    checked: Option<Instant>,
+    memory: Option<[u64; 4]>,
+    pressure: bool,
+}
+
+static VIDEO_PRESSURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn video_room_percent() -> u64 {
+    static PERCENT: OnceLock<u64> = OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(90).clamp(50, 97)
+    })
+}
+
+fn next_video_pressure(was: bool, budget: u64, usage: u64, percent: u64) -> bool {
+    if budget == 0 {
+        return false;
+    }
+    let threshold = if was { percent.saturating_sub(10) } else { percent };
+    u128::from(usage) * 100 >= u128::from(budget) * u128::from(threshold)
+}
+
+impl Host {
+    pub(crate) fn dedicated_video_memory(&self) -> Option<u64> {
+        let adapter = self.adapter.as_ref()?;
+        // SAFETY: plain DXGI adapter description query.
+        let desc = unsafe { adapter.GetDesc1() }.ok()?;
+        Some(desc.DedicatedVideoMemory as u64)
+    }
+
+    pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
+        let mut state = self.video_budget.lock().unwrap_or_else(|e| e.into_inner());
+        if state.checked.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            return state.memory;
+        }
+        state.checked = Some(Instant::now());
+        let Some(adapter) = &self.adapter else { return state.memory };
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut nonlocal = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: the structures are valid writable DXGI outputs.
+        let ok = unsafe {
+            adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).is_ok()
+                && adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal).is_ok()
+        };
+        if !ok || local.Budget == 0 {
+            return state.memory;
+        }
+        let pressure = next_video_pressure(state.pressure, local.Budget, local.CurrentUsage, video_room_percent())
+            || next_video_pressure(state.pressure, nonlocal.Budget, nonlocal.CurrentUsage, video_room_percent());
+        if pressure != state.pressure {
+            tracing::info!(pressure, local_budget_mib = local.Budget >> 20,
+                local_usage_mib = local.CurrentUsage >> 20, nonlocal_budget_mib = nonlocal.Budget >> 20,
+                nonlocal_usage_mib = nonlocal.CurrentUsage >> 20, "DXGI memory pressure changed");
+        }
+        state.pressure = pressure;
+        state.memory = Some([local.Budget, local.CurrentUsage, nonlocal.Budget, nonlocal.CurrentUsage]);
+        VIDEO_PRESSURE.store(pressure, Ordering::Relaxed);
+        state.memory
+    }
+}
+
+pub(crate) fn video_memory_pressured() -> bool {
+    VIDEO_PRESSURE.load(Ordering::Relaxed)
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -303,6 +382,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn dxgi_pressure_tracks_the_actual_budget_and_recovers_with_hysteresis() {
+        assert!(!next_video_pressure(false, 0, 100, 90));
+        assert!(!next_video_pressure(false, 100, 89, 90));
+        assert!(next_video_pressure(false, 100, 90, 90));
+        assert!(next_video_pressure(true, 100, 80, 90));
+        assert!(!next_video_pressure(true, 100, 79, 90));
+        assert!(next_video_pressure(false, 80, 75, 90));
+    }
 
     #[test]
     fn memory_pressure_caps_only_idle_command_scratch() {
@@ -640,7 +729,7 @@ fn scratch_keep_bytes() -> u64 {
             .unwrap_or(4)
             .min(64) << 20
     });
-    idle_scratch_budget(configured, crate::shadow::memory_pressured())
+    idle_scratch_budget(configured, crate::shadow::memory_pressured() || video_memory_pressured())
 }
 
 fn idle_scratch_budget(configured: u64, pressure: bool) -> u64 {
@@ -849,6 +938,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         crate::shadow::maintain_snapshot_pool();
+        self.video_memory();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
