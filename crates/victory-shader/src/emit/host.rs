@@ -1604,12 +1604,20 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
-                            Stride::Structured(s) => (
-                                DXGI_FORMAT_UNKNOWN,
-                                data.len() * 4 / s as usize,
-                                s,
-                                D3D12_BUFFER_SRV_FLAG_NONE,
-                            ),
+                            Stride::Structured(s) => {
+                                if s == 0 || !s.is_multiple_of(4) || !(data.len() * 4).is_multiple_of(s as usize) {
+                                    return Err("invalid structured buffer byte extent".into());
+                                }
+                                // Match the runtime's raw representation.
+                                // The original stride is supplied separately to
+                                // a shader that obtains it from the view table.
+                                (
+                                    DXGI_FORMAT_R32_TYPELESS,
+                                    data.len(),
+                                    0,
+                                    D3D12_BUFFER_SRV_FLAG_RAW,
+                                )
+                            },
                             Stride::Format(f, bytes) => (
                                 f,
                                 data.len() * 4 / bytes as usize,

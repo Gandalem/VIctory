@@ -168,6 +168,23 @@ This follows the heap capacity and cache-key design in
 [DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox/tree/f4b48ad766ddbec1a1867022cd42f7645b0dd55e),
 adapted to the earlier runtime.
 
+## Structured-buffer compatibility (experimental)
+
+Untyped structured SRV/UAV descriptors are normalized to raw views with
+their original byte extent and stride metadata preserved. The translator
+computes byte offsets once and converts raw byte dimensions back to
+record counts for structured accesses. The descriptor and refresh paths
+use the same backing copy; views off 16-byte alignment use exact copies.
+
+This adapts the no-descriptor-twin approach described by
+[avatarmanz/VIctory-7900XTX b68e65e](https://github.com/avatarmanz/VIctory-7900XTX/commit/b68e65e08c4276e2159eb3c23b203a35985a0b7c)
+and its registered-buffer regression
+[ce42cc7](https://github.com/avatarmanz/VIctory-7900XTX/commit/ce42cc74b27e211f214673e135d87ac071b820d7).
+The test harness uses the same raw descriptor representation as runtime.
+The existing expected-value stride and gather tests are unchanged. This
+is a candidate fix for both failures, not a claim of a verified hardware
+result. Full GPU and shader regression testing is required before merge.
+
 ## Memory retention (experimental)
 
 The idle snapshot cache is bounded by installed RAM, available physical RAM,

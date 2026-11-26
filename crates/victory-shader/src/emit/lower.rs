@@ -4059,6 +4059,7 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
+        let mut record_stride = None;
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
@@ -4078,7 +4079,8 @@ impl<'a> Lower<'a> {
                 {
                     (10 | u, 0x409)
                 } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
+                    record_stride = Some(stride);
+                    (11 | u, 0)
                 } else {
                     (11 | u, 0)
                 };
@@ -4087,9 +4089,8 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
-            // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
-            // at a uniform index): structured by the used-resource entry's
-            // stride, so its record count is in elements, else raw (bytes).
+            // The raw descriptor's dimensions are bytes. Recover the
+            // console record count from its known element stride.
             Fields::Smem { .. } => {
                 let used = used.ok_or("a scalar-loaded buffer of unknown kind read as data")?;
                 if used.kind == ResourceType::Cbv {
@@ -4097,7 +4098,10 @@ impl<'a> Lower<'a> {
                 }
                 let props = match used.stride {
                     0 | 1 => (11 | u, 0),
-                    s if s.is_multiple_of(4) => (12 | u, s),
+                    s if s.is_multiple_of(4) => {
+                        record_stride = Some(s);
+                        (11 | u, 0)
+                    }
                     _ => return Err("a scalar-loaded buffer of odd stride read as data"),
                 };
                 (props, None)
@@ -4154,7 +4158,17 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let bytes = field(self, 0);
+                let records = match record_stride {
+                    Some(stride) => {
+                        let stride = self.s.m.i32(stride);
+                        self.s.m.bin(c, Bin::UDiv, bytes, stride)
+                    }
+                    None => bytes,
+                };
+                vec![(2, records)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -4702,6 +4716,9 @@ impl<'a> Lower<'a> {
             _ => self.lane_heap_index(src, false)?,
         };
         let c = self.cur;
+        let last = self.s.m.i32(super::view_heap_capacity() - 1);
+        let over = self.s.m.cmp(c, pred::IUGT, index, last);
+        let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
         let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
@@ -8704,12 +8721,18 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // A heap-indexed buffer read by element has no used-resource entry,
-        // so no stride: its bytes are addressed as the hardware does, the
-        // element times the view's stride (the host's table) plus the offset.
+        // All untyped buffer views have raw host descriptors. Compute
+        // byte offsets exactly once, even for a statically known stride.
+        // Heap-indexed views obtain their original stride from the table.
         let index = match index {
-            Some(i) if used.is_none() && !typed => {
-                let stride = self.view_stride(src)?;
+            Some(i) if !typed => {
+                let stride = match used {
+                    Some(u) if u.stride >= 4 && u.stride.is_multiple_of(4) => {
+                        self.s.m.i32(u.stride)
+                    }
+                    Some(_) => return Err("a structured buffer of unknown stride"),
+                    None => self.view_stride(src)?,
+                };
                 let rows = self.s.m.bin(c, Bin::Mul, i, stride);
                 off = self.s.m.bin(c, Bin::Add, rows, off);
                 None

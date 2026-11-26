@@ -2393,9 +2393,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    /// A structured view the title places off its buffer's elements (the
-    /// culling constants at a ring position) is made over a copy of its own
-    /// bytes; one on an element views the buffer's copy.
+    /// A structured view represented as a raw descriptor requires a
+    /// 16-byte aligned base in its backing copy. Off-alignment views get
+    /// an exact copy, and refresh must find that same live copy.
     #[test]
     fn structured_views_off_their_buffers_elements_get_their_own_copy() {
         let Some(host) = crate::host::host() else {
@@ -2429,7 +2429,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
+        assert_eq!(width(start + 912), 1 << 16, "aligned: the buffer's copy");
+        assert_eq!(width(start + 456), (4 * 456u64).next_multiple_of(256), "on a structured element but off raw alignment");
         assert_eq!(width(start + 100), (4 * 456u64).next_multiple_of(256), "off: its own bytes");
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
@@ -2446,7 +2447,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         slots.make_at(0, &view(start + 100));
         let shown = std::sync::Arc::downgrade(&crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0);
         for k in 1..1200 {
-            if (100 + 4 * k) % 456 != 0 {
+            if (100 + 4 * k) % 16 != 0 {
                 crate::descriptor::host::view_copy(&view(start + 100 + 4 * k)).unwrap();
             }
         }
