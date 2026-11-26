@@ -312,6 +312,66 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
     }
 }
 
+/// Bound the simultaneous tiled reads rather than multiplying the size of
+/// every live texture by the number of workers. A texture larger than the
+/// limit is processed on its own, never silently omitted.
+const REFRESH_CHUNK_BYTES: u64 = 128 << 20;
+const REFRESH_CHUNK_COUNT: usize = 32;
+
+fn chunk_len(sizes: impl Iterator<Item = u64>, limit: u64, count: usize) -> usize {
+    let (mut bytes, mut n) = (0u64, 0usize);
+    for size in sizes.take(count) {
+        if n != 0 && bytes.saturating_add(size) > limit {
+            break;
+        }
+        bytes = bytes.saturating_add(size);
+        n += 1;
+    }
+    n
+}
+
+/// Refresh independent staging buffers in input order (the returned flags
+/// correspond to the input). Only tracked source memory enters workers:
+/// it is read by the existing checked kernel copy. Untracked memory keeps
+/// its existing serial hash path. Each worker owns a distinct staging
+/// mapping, and no job survives this call or a submission boundary.
+pub(crate) fn refresh_many(stagings: &[Arc<Staging>]) -> Vec<bool> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let mut flags = Vec::with_capacity(stagings.len());
+    let mut read = 0usize;
+    let mut at = 0;
+    while at < stagings.len() {
+        let threads = if crate::shadow::memory_pressured() {
+            1
+        } else {
+            crate::texture_workers::configured_threads()
+        };
+        if threads < 2 || stagings[at].tracked.is_none() {
+            let (bytes, changed) = stagings[at].refresh_now();
+            read = read.saturating_add(bytes);
+            flags.push(changed);
+            at += 1;
+            continue;
+        }
+        let n = chunk_len(stagings[at..].iter().take_while(|s| s.tracked.is_some())
+            .map(|s| s.layout.size as u64), REFRESH_CHUNK_BYTES, REFRESH_CHUNK_COUNT);
+        debug_assert!(n > 0);
+        let results = crate::texture_workers::ordered_map(stagings[at..at + n].to_vec(), threads,
+            |staging| staging.refresh_now());
+        for (bytes, changed) in results {
+            read = read.saturating_add(bytes);
+            flags.push(changed);
+        }
+        at += n;
+    }
+    // This is elapsed wall time, not the sum of overlapping worker times.
+    let preparing = &crate::host::PREPARING;
+    preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    preparing[3].fetch_add(read as u64, Relaxed);
+    flags
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all): whether it did.
@@ -523,6 +583,56 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_chunks_bound_temporary_reads_without_dropping_large_textures() {
+        let mb = 1u64 << 20;
+        assert_eq!(chunk_len([64 * mb, 64 * mb, mb].into_iter(), 128 * mb, 32), 2);
+        assert_eq!(chunk_len([256 * mb, mb].into_iter(), 128 * mb, 32), 1);
+        assert_eq!(chunk_len(std::iter::repeat_n(mb, 100), 128 * mb, 32), 32);
+        assert_eq!(chunk_len(std::iter::empty(), 128 * mb, 32), 0);
+    }
+
+    #[test]
+    fn tracked_texture_batch_keeps_staging_results_and_dirty_tracking() {
+        use crate::watch::{PAGE, tests as pools};
+        let Some(_host) = host() else { return };
+        let words: [u32; 14] = [3, 0, 0, 0, 256, 0, 256, (1 << 16) | 1, 28, 1, 0, 1, 0, 0];
+        // SAFETY: the C-layout resource description consists of these words.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+        let layout = crate::resource::texture_layout(&desc).unwrap();
+        let size = layout.planes[0].layout.size as usize;
+        let mut images = Vec::new();
+        let mut uploads = Vec::new();
+        for value in [0x23u8, 0x57] {
+            let p = pools::pool(size.div_ceil(PAGE));
+            // SAFETY: this test owns the writable pool of at least size bytes.
+            unsafe { (p as *mut u8).write_bytes(value, size) };
+            let mut image = std::ptr::null();
+            assert_eq!(crate::resource::create_at_address(
+                std::ptr::null(), p as u64, &desc, 0, std::ptr::null(),
+                std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
+            ), crate::object::S_OK);
+            let upload = staging(image, crate::resource::host_resource(image).unwrap()).unwrap();
+            assert!(upload.tracked.is_some());
+            images.push((p, image));
+            uploads.push(upload);
+        }
+        assert_eq!(refresh_many(&uploads), vec![true, true]);
+        for (s, value) in uploads.iter().zip([0x23u8, 0x57]) {
+            // SAFETY: both jobs have finished and the staging mappings are live.
+            assert_eq!(unsafe { *s.data }, value);
+        }
+        assert_eq!(refresh_many(&uploads), vec![false, false]);
+        // SAFETY: writing our tracked pool marks the second texture dirty.
+        unsafe { (images[1].0 as *mut u8).write_volatile(0x91) };
+        assert_eq!(refresh_many(&uploads), vec![false, true]);
+        drop(uploads);
+        for (p, image) in images {
+            assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
+            pools::free(p);
+        }
+    }
 
     #[test]
     fn retained_texture_staging_reads_original_mip_and_slice() {

@@ -1958,6 +1958,7 @@ impl HostList {
                     len
                 }
                 &Step::Fill(dst, src, len) => {
+                    batch.refresh_textures();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -1978,6 +1979,8 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else {
+                        batch.refresh_textures();
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -1995,7 +1998,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        batch.due.push(staging.clone());
                     }
                     continue;
                 }
@@ -2036,8 +2039,12 @@ struct Batch {
     /// Exact ranges brought up to date since the last title write, by
     /// copy (held, so that its address names no other).
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges)>,
-    /// Staging buffers (by address) refreshed since the last title write.
+    /// Staging buffers (by address) refreshed or queued since the last
+    /// title write.
     textures: std::collections::HashSet<usize>,
+    /// Independent texture reads, finished before a memory-writing step or
+    /// GPU submission. Holding the Arc also keeps each staging buffer live.
+    due: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 /// Sorted, disjoint, half-open byte intervals. Join only ranges that touch
@@ -2142,6 +2149,13 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    fn refresh_textures(&mut self) {
+        if !self.due.is_empty() {
+            crate::texture::refresh_many(&self.due);
+            self.due.clear();
+        }
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
@@ -2152,6 +2166,7 @@ impl Batch {
 
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
+        self.refresh_textures();
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();

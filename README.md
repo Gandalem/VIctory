@@ -277,6 +277,27 @@ avoided since the last report. These counters are not physical PCIe
 transfer measurements. No new GPU-local mirror, shared-heap mapping,
 or asynchronous submission lifetime is introduced here.
 
+## Bounded texture preparation workers (stage 1)
+
+Explicitly referenced texture staging buffers are collected and refreshed
+before a memory-writing step or GPU submission. The independent tracked
+reads use a persistent CPU worker pool, following the wide_each approach
+in [cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/shadow.rs)
+and [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX).
+Only tracked source memory uses workers; untracked hash reads remain
+serial. The submitting thread participates and waits for every job before
+recorded GPU work can execute. Existing resource ownership, command
+order and GPU fences remain unchanged.
+
+`VICTORY_TEXTURE_WORKERS` selects total preparation threads including the
+submitting thread (1–8, bounded by available CPUs). The default is one on
+fewer than six logical CPUs and two to four otherwise. RAM pressure
+forces serial processing. Batches contain at most 32 textures and up to
+128 MiB of logical tiled read sizes; an oversized texture runs alone.
+The bound is on these temporary reads, not on all process memory.
+Texture preparation timing measures elapsed wall time. This stage does
+not yet parallelize bindless uploads or make GPU submissions asynchronous.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
