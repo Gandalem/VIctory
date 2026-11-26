@@ -358,6 +358,24 @@ it is not yet the reference's worker-owned publication or late-wait
 asynchronous GPU execution. Both options remain off by default pending
 Windows validation.
 
+Experimental `VICTORY_SRV_MIP_UPLOADS=1` (requires deferred texture
+views) adapts the reference's SRV-driven `upload_from` selection to
+already initialized lazy committed 2D single-slice RGBA8 textures.
+Use the same retained-MIP shift as descriptor creation and maintain
+the union of SRV MIP masks for each heap, including rewrites and
+duplicate slots. Initial uploads and explicit copy/table paths remain
+full-range; subsequent bindless GPU refreshes copy only dirty MIPs in
+the current SRV union. Unseen dirty MIPs stay pending until visible or
+a full upload needs them. Unsupported views, formats, arrays and
+malformed ranges use the full fallback. Multiple heaps are processed
+without incorrectly skipping their different requested MIPs.
+CPU staging preparation still uses the existing refresh path; ready
+GPU-list recording is bypassed in range mode because its mask is not
+the current submission's view union. This is opt-in partial GPU
+upload selection, not yet the reference's sparse tile mapping or
+view-aware staging allocation. Verify GPU readback and mixed
+GPU-write/copy workloads before enabling it.
+
 ## Parallel buffer refresh
 
 Independent host buffer copies share the bounded preparation worker

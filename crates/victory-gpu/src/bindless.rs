@@ -24,7 +24,7 @@ enum Seen {
     /// `len` bytes at `address` of a buffer's host copy; unordered access.
     Buffer(Arc<Shadow>, u64, u64, bool),
     /// A title texture (resource object) whose contents the title writes.
-    Texture(usize),
+    Texture(usize, u32),
     /// A view left without a host view (textures the title placed itself),
     /// by kind (diagnostics: `KINDS`).
     Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] usize),
@@ -53,6 +53,9 @@ struct Inner {
     slots: HashMap<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
+    /// Counts of distinct retained SRV MIP masks per title texture.
+    /// u32::MAX is the conservative full-resource request.
+    texture_masks: BTreeMap<usize, BTreeMap<u32, u32>>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), while no
     /// range is added or dropped: every list running heap shaders asks.
     hulls: Option<Vec<Hull>>,
@@ -107,6 +110,11 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
+    fn requested_mips(&self, resource: usize) -> u32 {
+        self.texture_masks.get(&resource)
+            .map_or(u32::MAX, |masks| masks.keys().fold(0, |mask, &m| mask | m))
+    }
+
     fn count(&mut self, seen: &Seen, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
@@ -134,11 +142,19 @@ impl Inner {
                     }
                 }
             }
-            Seen::Texture(r) => {
+            Seen::Texture(r, mask) => {
                 let n = self.textures.entry(*r).or_insert(0);
                 step(n);
                 if *n == 0 {
                     self.textures.remove(r);
+                    self.texture_masks.remove(r);
+                } else {
+                    let masks = self.texture_masks.entry(*r).or_default();
+                    let count = masks.entry(*mask).or_insert(0);
+                    step(count);
+                    if *count == 0 {
+                        masks.remove(mask);
+                    }
                 }
             }
             Seen::Left(_) => {}
@@ -182,10 +198,11 @@ impl Viewed {
 fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
-    if let View::Shader(resource, _) = view
+    if let View::Shader(resource, desc) = view
         && let Some(texture) = crate::resource::host_resource(*resource as This)
     {
-        return crate::texture::title_written(texture).then_some(Seen::Texture(*resource));
+        let mask = crate::descriptor::host::srv_mip_mask(*resource as This, desc.as_ref(), texture);
+        return crate::texture::title_written(texture).then_some(Seen::Texture(*resource, mask));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {
@@ -349,7 +366,10 @@ pub(crate) fn prepare_ahead(viewed: &Arc<Viewed>) {
     let started = std::time::Instant::now();
     let mut admission = crate::upload_pool::Admission::new();
     let mut left = AHEAD_BYTES;
-    let record_ready = ready_enabled();
+    // Existing speculative GPU recordings have a full dirty mask, not
+    // the submission's live SRV union. Keep CPU preparation, and let the
+    // mandatory pass select MIPs when the range option is enabled.
+    let record_ready = ready_enabled() && !crate::texture::srv_ranges_enabled();
     let mut list = None;
     let mut entries: Vec<crate::texture::AheadUpload> = Vec::new();
     for key in keys {
@@ -402,6 +422,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     let mut recorded = false;
     let mut accepted = Vec::new();
     let mut done = std::collections::HashSet::new();
+    let range_mode = crate::texture::srv_ranges_enabled();
     let mut admission = crate::upload_pool::Admission::new();
     for viewed in heaps {
         // Held while uploading: the title releasing a texture (and its
@@ -411,7 +432,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
         // replaced resources, failed refreshes, new dirty subresources,
         // or a batch already touched through another heap. Validate all
         // entries first, then acknowledge; rejecting a list consumes none.
-        if ready_enabled() && !ahead_pressured()
+        if !range_mode && ready_enabled() && !ahead_pressured()
             && let Some(ready) = take_ready(viewed)
             && ready_live(ready.made.elapsed().as_millis(), true, false)
             && ready.entries.iter().all(|entry| {
@@ -429,17 +450,21 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
         }
         let mut pending = Vec::with_capacity(32);
         for &r in inner.textures.keys() {
-            if !done.insert(r) {
+            // Distinct heaps can show different MIPs of the same
+            // texture. In range mode process every heap's union; the
+            // pending mask avoids repeated copies of overlapping levels.
+            if !range_mode && !done.insert(r) {
                 continue;
             }
+            let mask = if range_mode { inner.requested_mips(r) } else { u32::MAX };
             let Some(staging) = crate::texture::prepare_heap_upload(r as This, &mut admission) else {
                 continue;
             };
             // Keep shared staging aliases in their original order.
-            if pending.len() == 32 || pending.iter().any(|(_, s)| Arc::ptr_eq(s, &staging)) {
+            if pending.len() == 32 || pending.iter().any(|(_, s, _)| Arc::ptr_eq(s, &staging)) {
                 recorded |= finish_uploads(list, &mut pending) != 0;
             }
-            pending.push((r, staging));
+            pending.push((r, staging, mask));
         }
         recorded |= finish_uploads(list, &mut pending) != 0;
         drop(inner);
@@ -454,18 +479,18 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
 }
 
 /// Complete CPU jobs before recording changed textures in input order.
-fn finish_uploads(list: &HostList, pending: &mut Vec<(usize, Arc<crate::texture::Staging>)>) -> usize {
+fn finish_uploads(list: &HostList, pending: &mut Vec<(usize, Arc<crate::texture::Staging>, u32)>) -> usize {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     if pending.is_empty() {
         return 0;
     }
-    let staging: Vec<_> = pending.iter().map(|(_, s)| s.clone()).collect();
+    let staging: Vec<_> = pending.iter().map(|(_, s, _)| s.clone()).collect();
     crate::texture::refresh_many(&staging);
     let mut recorded = 0;
-    for (r, staging) in pending.drain(..) {
+    for (r, staging, mips) in pending.drain(..) {
         // Pending staging changes can predate this refresh (an explicit
         // list prepared them). A clean refresh does not discard them.
-        if crate::texture::record_heap_upload(list, r as This, &staging) {
+        if crate::texture::record_heap_upload_mips(list, r as This, &staging, mips) {
             crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
             recorded += 1;
         }
@@ -478,6 +503,29 @@ fn finish_uploads(list: &HostList, pending: &mut Vec<(usize, Arc<crate::texture:
 #[cfg(test)]
 mod ahead_tests {
     use super::*;
+
+    #[test]
+    fn texture_srv_union_tracks_duplicate_rewrites_and_full_views() {
+        let mut inner = Inner::default();
+        let a = Seen::Texture(11, 0b0011);
+        let b = Seen::Texture(11, 0b1100);
+        let full = Seen::Texture(11, u32::MAX);
+        inner.count(&a, true);
+        inner.count(&a, true);
+        inner.count(&b, true);
+        assert_eq!(inner.requested_mips(11), 0b1111);
+        inner.count(&a, false);
+        assert_eq!(inner.requested_mips(11), 0b1111);
+        inner.count(&a, false);
+        assert_eq!(inner.requested_mips(11), 0b1100);
+        inner.count(&full, true);
+        assert_eq!(inner.requested_mips(11), u32::MAX);
+        inner.count(&full, false);
+        assert_eq!(inner.requested_mips(11), 0b1100);
+        inner.count(&b, false);
+        assert!(inner.textures.is_empty());
+        assert!(inner.texture_masks.is_empty());
+    }
 
     #[test]
     fn ready_lists_expire_or_are_dropped_under_pressure() {
@@ -580,7 +628,8 @@ pub(crate) fn forget(resource: usize) {
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.textures.remove(&resource).is_some() {
-            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
+            inner.texture_masks.remove(&resource);
+            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r, _) if *r == resource));
         }
     }
 }
@@ -599,7 +648,7 @@ pub(crate) fn log(frames: f64) {
         for seen in inner.slots.values() {
             match seen {
                 Seen::Buffer(..) => buffers += 1,
-                Seen::Texture(_) => textures += 1,
+                Seen::Texture(..) => textures += 1,
                 Seen::Left(k) => left[*k] += 1,
             }
         }

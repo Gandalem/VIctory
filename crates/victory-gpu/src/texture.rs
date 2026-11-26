@@ -78,6 +78,9 @@ struct Last {
     // them. Explicit lists may also refresh staging, so a clean refresh
     // must not discard changes not yet acknowledged by a heap upload.
     pending: Vec<bool>,
+    // A restricted SRV refresh must not leave an initially uninitialized
+    // host subresource. First populate every retained mip.
+    full_initialized: bool,
 }
 
 impl Last {
@@ -90,6 +93,30 @@ impl Last {
 
     fn has_pending(&self) -> bool {
         self.ready && self.pending.iter().any(|&dirty| dirty)
+    }
+
+    /// Select only the pending mips visible to current SRVs, but never
+    /// before a complete initial upload or for unsupported subresource
+    /// layouts. Index i is mip i for the supported single-slice path.
+    fn heap_mask(&self, count: usize, mips: u32) -> Vec<bool> {
+        if !self.ready || self.pending.len() != count {
+            return vec![false; count];
+        }
+        self.pending.iter().enumerate().map(|(i, &dirty)| {
+            dirty && (!self.full_initialized || count > 32 || mips == u32::MAX
+                || mips & (1u32 << i) != 0)
+        }).collect()
+    }
+
+    fn acknowledge(&mut self, mask: &[bool]) {
+        debug_assert_eq!(self.pending.len(), mask.len());
+        for (pending, &copied) in self.pending.iter_mut().zip(mask) {
+            if copied {
+                *pending = false;
+            }
+        }
+        self.full_initialized |= self.ready && !self.pending.is_empty()
+            && !self.pending.iter().any(|&dirty| dirty);
     }
 
     // The full-copy fallback preserves the old recording if refresh
@@ -411,6 +438,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// Scope the range optimization to the same deferred independent
+/// sampled views that publish only on a fenced submission.
+pub(crate) fn srv_ranges_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    crate::descriptor::deferred_texture_views()
+        && *ON.get_or_init(|| std::env::var("VICTORY_SRV_MIP_UPLOADS").as_deref() == Ok("1"))
+}
+
 pub(crate) fn explicit_partial_uploads() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_EXPLICIT_PARTIAL_UPLOADS").as_deref() == Ok("1"))
@@ -447,6 +482,7 @@ impl ExplicitUpload {
         let mut last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
         if last.ready {
             last.pending.fill(false);
+            last.full_initialized |= !last.pending.is_empty();
         }
     }
 }
@@ -547,7 +583,7 @@ impl AheadUpload {
         // revalidate(). No speculative worker can change this staging.
         let mut last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
         debug_assert!(same_pending(&self.mask, last.ready, &last.pending));
-        last.pending.fill(false);
+        last.acknowledge(&self.mask);
     }
 }
 
@@ -581,17 +617,26 @@ pub(crate) fn record_ahead_upload(list: &HostList, resource: This,
 /// Record only after all CPU preparation jobs have joined. The heap lock
 /// still protects the title resource; command recording stays serial.
 pub(crate) fn record_heap_upload(list: &HostList, resource: This, staging: &Arc<Staging>) -> bool {
+    record_heap_upload_mips(list, resource, staging, u32::MAX)
+}
+
+pub(crate) fn record_heap_upload_mips(list: &HostList, resource: This, staging: &Arc<Staging>,
+    mips: u32) -> bool
+{
     let Some(texture) = crate::resource::host_resource(resource) else {
         return false;
     };
     let mut last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
-    if !last.has_pending() {
+    let mips = if staging.footprints.len() == staging.mips as usize { mips } else { u32::MAX };
+    let selected = last.heap_mask(staging.footprints.len(), mips);
+    if !selected.iter().any(|&dirty| dirty) {
         return false;
     }
-    record(list, resource, texture, staging, Some(&last.pending));
+    record(list, resource, texture, staging, Some(&selected));
     // Recording and execution are serialized by the submission lock.
-    // If submission fails, the host stops instead of using stale data.
-    last.pending.fill(false);
+    // Only acknowledge copied levels. Hidden dirty levels survive clean
+    // refreshes, descriptor rewrites and a later full-copy request.
+    last.acknowledge(&selected);
     list.keep_staging(staging);
     true
 }
@@ -1155,6 +1200,27 @@ mod tests {
         assert!(!digest.matches(other.as_ptr(), other.len()));
         bytes[31] = 0x91;
         assert!(!digest.matches(bytes.as_ptr(), bytes.len()));
+    }
+
+    #[test]
+    fn srv_mip_uploads_initialize_all_then_preserve_unseen_pending_levels() {
+        let mut last = Last { ready: true, ..Default::default() };
+        last.mark(4, 0..4);
+        let initial = last.heap_mask(4, 1 << 3);
+        assert_eq!(initial, [true, true, true, true]);
+        last.acknowledge(&initial);
+        assert!(last.full_initialized);
+        last.mark(4, [0, 2, 3]);
+        let tail = last.heap_mask(4, 0b1100);
+        assert_eq!(tail, [false, false, true, true]);
+        last.acknowledge(&tail);
+        assert_eq!(last.pending, [true, false, false, false]);
+        assert_eq!(last.heap_mask(4, 0b1100), [false; 4]);
+        assert_eq!(last.heap_mask(4, 1), [true, false, false, false]);
+        // The explicit full path still sees the hidden dirty mip.
+        assert_eq!(last.explicit_indices(4, false), [0]);
+        assert_eq!(last.heap_mask(4, u32::MAX), [true, false, false, false]);
+        assert_eq!(last.heap_mask(5, u32::MAX), [false; 5]);
     }
 
     #[test]
