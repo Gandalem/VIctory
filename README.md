@@ -417,7 +417,22 @@ traffic. The explicit option is off by default pending GPU validation.
 A weak registry of staging owners is swept once per second. A staging
 allocation with no recorded-list owner becomes reclaimable after ten
 seconds of disuse (one second under RAM/DXGI pressure). Host textures
-and descriptor identities are unchanged; the next use rebuilds staging.
+and descriptor identities are unchanged; explicit uploads still rebuild
+staging on the next use.
+
+Experimental `VICTORY_TEXTURE_SAME=1` adapts the reference
+[cool_fox unchanged() check](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/texture.rs#L1618).
+After the synchronous submission fence, reclaiming a sole-owned staging
+buffer can retain its acknowledged whole-layout BLAKE3 digest on the
+host texture. A later bindless upload with the identical source address,
+layout length and checked content hash can skip creating staging and
+copying the unchanged GPU image. Only complete untracked images with
+no pending copies qualify; tracked, GPU-authored, changed or unreadable
+sources fall back to the normal path. The temporary snapshot is capped
+at 16 MiB and disabled under host-memory pressure or recent OOM. Explicit
+recordings still allocate actual staging; this does not omit any
+pre-recorded copy command. The switch is off by default pending GPU
+validation.
 
 New speculative bindless staging allocations reserve at least 512 MiB
 of system commit after allocation and require at least 1 GiB before

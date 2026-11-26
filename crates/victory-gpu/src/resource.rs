@@ -784,6 +784,9 @@ pub(crate) struct HostTexture {
     pub(crate) host_written: std::sync::atomic::AtomicBool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
+    /// Digest of a fully uploaded untracked image after idle staging
+    /// reclamation. Access is serialized by the staging lock.
+    pub(crate) uploaded_digest: std::sync::Mutex<Option<crate::texture::UploadedDigest>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
     /// unordered access view; `None` inside if it has none.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
@@ -820,6 +823,7 @@ impl HostTexture {
             castable,
             host_written: false.into(),
             staging: std::sync::Mutex::new(None),
+            uploaded_digest: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
             sampled,

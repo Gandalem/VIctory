@@ -100,6 +100,63 @@ impl Last {
     }
 }
 
+/// Adapt cool_fox's unchanged() check to the stable host texture.
+/// Retain only the digest of a complete, acknowledged untracked staging
+/// image; no title pointer or byte buffer is dereferenced from this key.
+#[derive(Clone, Copy)]
+pub(crate) struct UploadedDigest {
+    address: usize,
+    size: usize,
+    hash: blake3::Hash,
+}
+
+fn same_texture_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_SAME").as_deref() == Ok("1"))
+}
+
+fn acknowledged_hash(last: &Last, count: usize) -> Option<blake3::Hash> {
+    if !last.ready || count == 0 || last.pending.len() != count
+        || last.pending.iter().any(|&dirty| dirty)
+    {
+        return None;
+    }
+    last.hash
+}
+
+impl UploadedDigest {
+    fn from_staging(staging: &Staging) -> Option<Self> {
+        if staging.tracked.is_some() {
+            return None;
+        }
+        let last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
+        Some(Self {
+            address: staging.memory as usize,
+            size: usize::try_from(staging.layout.size).ok()?,
+            hash: acknowledged_hash(&last, staging.footprints.len())?,
+        })
+    }
+
+    fn matches(&self, memory: *const u8, size: usize) -> bool {
+        // Cap the transient snapshot, especially on 32 GiB systems.
+        // Larger textures retain the established refresh path. Kernel
+        // reads avoid racing an unmap on the speculative worker.
+        if self.address != memory as usize || self.size != size
+            || size == 0 || size > 16 << 20
+            || crate::shadow::memory_pressured()
+            || crate::upload_pool::recent_oom()
+        {
+            return false;
+        }
+        let mut read = crate::shadow::pooled(size);
+        read.resize(size, 0);
+        let same = crate::host::read_into(memory, &mut read)
+            && blake3::hash(&read) == self.hash;
+        crate::shadow::give_back(read);
+        same
+    }
+}
+
 static STAGING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn live_staging_bytes() -> u64 {
@@ -134,8 +191,9 @@ fn idle_staging(owners: usize, age: u64, pressure: bool) -> bool {
 }
 
 /// Reclaim uploads held only by their texture, not by any recorded list.
-/// The next use recreates and fully refreshes the staging contents. Never
-/// remove the host texture, its descriptors or GPU-authored contents.
+/// The next explicit use recreates and fully refreshes staging. Eligible
+/// unchanged bindless textures can reuse the already-uploaded GPU image.
+/// Never remove the host texture, descriptors or GPU-authored contents.
 pub(crate) fn reclaim_idle_staging() {
     use std::sync::atomic::Ordering::Relaxed;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -159,6 +217,15 @@ pub(crate) fn reclaim_idle_staging() {
         });
         if idle {
             if let Some(s) = staging.take() {
+                // This sweep runs under the submission lock after the
+                // previous GPU fence. The sole staging owner is the host
+                // texture; a recorded list cannot still consume it.
+                let digest = if same_texture_enabled() && copy.sampled
+                    && !copy.host_written.load(Relaxed)
+                {
+                    UploadedDigest::from_staging(&s)
+                } else { None };
+                *copy.uploaded_digest.lock().unwrap_or_else(|e| e.into_inner()) = digest;
                 reclaimed = reclaimed.saturating_add(s.capacity);
             }
         }
@@ -883,6 +950,16 @@ fn staging_with_admission(
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
+    // Only speculative heap uploads may return None for unchanged
+    // GPU content. Explicit pre-recorded commands need actual staging,
+    // including a full-copy fallback, so never skip those allocations.
+    if admission.is_some() && same_texture_enabled() && copy.sampled
+        && !copy.host_written.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(digest) = *copy.uploaded_digest.lock().unwrap_or_else(|e| e.into_inner())
+        && usize::try_from(layout.size).ok().is_some_and(|size| digest.matches(memory, size))
+    {
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -937,6 +1014,9 @@ fn staging_with_admission(
         used_ms: std::sync::atomic::AtomicU64::new(now_ms()),
     });
     STAGING_BYTES.fetch_add(s.size, std::sync::atomic::Ordering::Relaxed);
+    // A new staging allocation can supersede the digest. Never leave
+    // a previously acknowledged GPU image cached across a new refresh.
+    *copy.uploaded_digest.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *held = Some(s.clone());
     STAGED.lock().unwrap_or_else(|e| e.into_inner())
         .insert(Arc::as_ptr(&copy) as usize, Arc::downgrade(&copy));
@@ -946,6 +1026,40 @@ fn staging_with_admission(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_complete_acknowledged_untracked_images_have_reusable_digests() {
+        let hash = blake3::hash(b"texture");
+        let mut last = Last { hash: Some(hash), ready: true, ..Default::default() };
+        assert!(acknowledged_hash(&last, 2).is_none());
+        last.mark(2, [0, 1]);
+        assert!(acknowledged_hash(&last, 2).is_none());
+        last.pending.fill(false);
+        assert_eq!(acknowledged_hash(&last, 2), Some(hash));
+        assert!(acknowledged_hash(&last, 3).is_none());
+        last.ready = false;
+        assert!(acknowledged_hash(&last, 2).is_none());
+        last.ready = true;
+        last.hash = None;
+        assert!(acknowledged_hash(&last, 2).is_none());
+    }
+
+    #[test]
+    fn reclaimed_digest_detects_source_changes_and_rejects_other_ranges() {
+        let mut bytes = vec![0x37u8; 4096];
+        let digest = UploadedDigest { address: bytes.as_ptr() as usize, size: bytes.len(),
+            hash: blake3::hash(&bytes) };
+        // The matching path may decline under pressure; test only when
+        // the same policy would allow an actual speculative read.
+        if !crate::shadow::memory_pressured() && !crate::upload_pool::recent_oom() {
+            assert!(digest.matches(bytes.as_ptr(), bytes.len()));
+        }
+        assert!(!digest.matches(bytes.as_ptr(), bytes.len() - 1));
+        let other = bytes.clone();
+        assert!(!digest.matches(other.as_ptr(), other.len()));
+        bytes[31] = 0x91;
+        assert!(!digest.matches(bytes.as_ptr(), bytes.len()));
+    }
 
     #[test]
     fn ahead_upload_requires_the_complete_current_dirty_mask() {
