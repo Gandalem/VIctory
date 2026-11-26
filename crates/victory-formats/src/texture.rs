@@ -617,6 +617,57 @@ impl Layout {
         })
     }
 
+    /// Conservative source interval containing every byte of the mip.
+    /// Packed tails share one interval; volume layouts interleave slabs.
+    pub fn source_span(&self, mip: u32, slice: u32) -> Option<(u64, u64)> {
+        let m = self.mips.get(mip as usize)?;
+        if !self.addressable() {
+            return None;
+        }
+        if self.desc.dimension == Dimension::Tex3d {
+            return (slice == 0).then_some((0, self.size));
+        }
+        if slice >= self.slices || m.offset >= self.slice_size {
+            return None;
+        }
+        let end = self.mips.iter().map(|m| m.offset)
+            .filter(|&offset| offset > m.offset).min().unwrap_or(self.slice_size);
+        let base = u64::from(slice).checked_mul(self.slice_size)?;
+        let from = base.checked_add(m.offset)?;
+        let to = base.checked_add(end)?;
+        (from < to && to <= self.size).then_some((from, to))
+    }
+
+    /// Detile from just the source interval, retaining original mip offsets.
+    pub fn detile_span(
+        &self,
+        source: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let (from, to) = self.source_span(mip, slice).ok_or(Error::Invalid)?;
+        let base = usize::try_from(from).map_err(|_| Error::TooSmall)?;
+        let len = usize::try_from(to - from).map_err(|_| Error::TooSmall)?;
+        let source = source.get(..len).ok_or(Error::TooSmall)?;
+        if from == 0 && to == self.size {
+            return self.detile(source, mip, slice, linear, row_pitch, depth_pitch);
+        }
+        let mut invalid = false;
+        self.walk(self.size as usize, mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, n| {
+            if let Some(bytes) = t.checked_sub(base)
+                .and_then(|offset| offset.checked_add(n).and_then(|end| source.get(offset..end)))
+            {
+                linear[l..][..n].copy_from_slice(bytes);
+            } else {
+                invalid = true;
+            }
+        })?;
+        if invalid { Err(Error::TooSmall) } else { Ok(()) }
+    }
+
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
     pub fn tile(
         &self,
@@ -1092,6 +1143,31 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+    }
+
+    #[test]
+    fn source_spans_preserve_mip_and_array_offsets() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            let mut d = desc(64, 64, 9, 16, swizzle);
+            d.depth = 2;
+            let l = Layout::new(&d).unwrap();
+            let source: Vec<u8> = (0..l.size).map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8).collect();
+            for slice in 0..2 {
+                for mip in 0..d.mips {
+                    let m = &l.mips[mip as usize];
+                    let pitch = m.width as usize * d.element_bytes as usize;
+                    let bytes = pitch * m.height as usize;
+                    let mut expected = vec![0; bytes];
+                    let mut actual = vec![0; bytes];
+                    let (a, b) = l.source_span(mip, slice).unwrap();
+                    assert!(a >= u64::from(slice) * l.slice_size && b <= u64::from(slice + 1) * l.slice_size);
+                    l.detile(&source, mip, slice, &mut expected, pitch, bytes).unwrap();
+                    l.detile_span(&source[a as usize..b as usize], mip, slice, &mut actual, pitch, bytes).unwrap();
+                    assert_eq!(actual, expected, "mip {mip} slice {slice}");
+                    assert_eq!(l.detile_span(&source[a as usize..b as usize - 1], mip, slice, &mut actual, pitch, bytes), Err(Error::TooSmall));
+                }
+            }
+        }
     }
 
     /// A volume deeper than its block keeps its whole chain in the tail when

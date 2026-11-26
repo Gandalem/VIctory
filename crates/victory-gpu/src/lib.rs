@@ -46,6 +46,8 @@ mod primitive;
 pub mod query;
 pub mod queue;
 pub mod resource;
+#[cfg(windows)]
+mod residency;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
@@ -60,7 +62,11 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod texture_workers;
+#[cfg(windows)]
 mod twin;
+#[cfg(windows)]
+mod upload_pool;
 #[cfg(windows)]
 mod watch;
 

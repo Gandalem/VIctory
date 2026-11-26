@@ -1213,8 +1213,8 @@ pub enum View<'a> {
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
     Pair,
-    /// Last in the heap, which then has [`super::HEAP_VIEWS`] slots: the
-    /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
+    /// Last in the heap, which then has [`super::view_heap_capacity()`] slots: the
+    /// host's null raw buffer SRV at [`super::null_buffer_view()`] and UAV
     /// below it.
     NullBuffers,
 }
@@ -1365,7 +1365,7 @@ impl Host {
                 Ok(b)
             };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => super::view_heap_capacity() as usize,
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -1604,12 +1604,20 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
-                            Stride::Structured(s) => (
-                                DXGI_FORMAT_UNKNOWN,
-                                data.len() * 4 / s as usize,
-                                s,
-                                D3D12_BUFFER_SRV_FLAG_NONE,
-                            ),
+                            Stride::Structured(s) => {
+                                if s == 0 || !s.is_multiple_of(4) || !(data.len() * 4).is_multiple_of(s as usize) {
+                                    return Err("invalid structured buffer byte extent".into());
+                                }
+                                // Match the runtime's raw representation.
+                                // The original stride is supplied separately to
+                                // a shader that obtains it from the view table.
+                                (
+                                    DXGI_FORMAT_R32_TYPELESS,
+                                    data.len(),
+                                    0,
+                                    D3D12_BUFFER_SRV_FLAG_RAW,
+                                )
+                            },
                             Stride::Format(f, bytes) => (
                                 f,
                                 data.len() * 4 / bytes as usize,
@@ -1695,7 +1703,7 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let null = super::null_buffer_view() as usize;
                         let (mut srv_at, mut uav_at) = (at, at);
                         srv_at.ptr += (null - i) * view_size;
                         uav_at.ptr += (null - 1 - i) * view_size;

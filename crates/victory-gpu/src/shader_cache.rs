@@ -64,24 +64,27 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        let views = crate::descriptor::host::probe_view_limit();
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, views)
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, views: u32) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&views.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    crate::descriptor::host::probe_view_limit();
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
@@ -428,17 +431,20 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let views = victory_shader::emit::HEAP_VIEWS;
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, views);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, views));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, views));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, views));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, views));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, victory_shader::emit::LARGE_HEAP_VIEWS));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                victory_shader::emit::view_heap_capacity()
             )
         );
         // The encoding part is this file as built.

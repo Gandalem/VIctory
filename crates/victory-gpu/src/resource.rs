@@ -782,8 +782,10 @@ pub(crate) struct HostTexture {
     /// A depth texture's writable twin (`crate::twin`), made with its first
     /// unordered access view; `None` inside if it has none.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
-    /// Bytes it takes on the host GPU.
-    bytes: u64,
+    /// Logical allocation size, not resident bytes.
+    pub(crate) bytes: u64,
+    pub(crate) sampled: bool,
+    pub(crate) residency: crate::residency::Residency,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
 }
@@ -796,10 +798,15 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
+        // SAFETY: plain query on a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        let sampled = desc.Flags.0 & USES as i32 == 0;
         let bytes = crate::host::host().map_or(0, |h| {
-            // SAFETY: plain queries on a live resource.
-            unsafe { h.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes
+            // SAFETY: valid descriptor.
+            let size = unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
+            if size == u64::MAX { 0 } else { size }
         });
+        texture_kind_bytes(sampled).fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
@@ -810,6 +817,8 @@ impl HostTexture {
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
+            sampled,
+            residency: Default::default(),
             used: false.into(),
         }
     }
@@ -817,6 +826,7 @@ impl HostTexture {
     /// A list uses it: counted the first time (diagnostics of how much of
     /// the host textures' memory the GPU ever touches).
     pub(crate) fn note_used(&self) {
+        self.residency.touch();
         if !self.used.swap(true, std::sync::atomic::Ordering::Relaxed) {
             USED.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
@@ -832,6 +842,23 @@ static USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 static TEXTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(windows)]
 static TEXTURE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Logical allocation accounting, separate from DXGI segment usage.
+#[cfg(windows)]
+static SAMPLED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static TARGET_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+fn texture_kind_bytes(sampled: bool) -> &'static std::sync::atomic::AtomicU64 {
+    if sampled { &SAMPLED_BYTES } else { &TARGET_BYTES }
+}
+
+#[cfg(windows)]
+pub(crate) fn texture_budget_usage() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (SAMPLED_BYTES.load(Relaxed), TARGET_BYTES.load(Relaxed))
+}
+
 /// Title textures that found their memory's host texture made already.
 #[cfg(windows)]
 static SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -859,6 +886,7 @@ impl Drop for HostTexture {
     fn drop(&mut self) {
         TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        texture_kind_bytes(self.sampled).fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         if *self.used.get_mut() {
             USED.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
@@ -966,6 +994,7 @@ pub(crate) mod life {
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let host = resource(this).host.as_ref()?;
+    host.residency.expose(&host.texture);
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -980,7 +1009,9 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    let copy = resource(this).host.as_deref()?;
+    copy.residency.expose(&copy.texture);
+    Some(&copy.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -989,13 +1020,233 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    let copy = resource(this).host.clone()?;
+    copy.residency.expose(&copy.texture);
+    Some(copy)
+}
+
+/// Opt-in low-VRAM texture profile. The choice is fixed for the process:
+/// changing the shape of a live resource would invalidate its descriptors.
+#[cfg(windows)]
+fn configured_mip_drop() -> u32 {
+    static LEVELS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LEVELS.get_or_init(|| {
+        let value = std::env::var("VICTORY_TEXTURE_DROP_MIPS").unwrap_or_default();
+        if value.trim().eq_ignore_ascii_case("auto") {
+            let dedicated = crate::host::host().and_then(|h| h.dedicated_video_memory());
+            let drop = auto_mip_drop(dedicated);
+            tracing::info!(?dedicated, drop, "automatic texture mip profile");
+            drop
+        } else {
+            value.trim().parse::<u32>().unwrap_or(0).min(4)
+        }
+    })
+}
+
+#[cfg(windows)]
+fn auto_mip_drop(dedicated: Option<u64>) -> u32 {
+    u32::from(dedicated.is_some_and(|bytes| bytes > 0 && bytes <= (8 << 30)))
+}
+
+/// Only sampled 2D textures (including arrays/cubes) with a sufficiently
+/// large, complete mip chain. No targets, depth, UAV or MSAA resources.
+/// Adapted from fxceless/victory-fork PR 610 and soldsawn's 8 GB fork.
+#[cfg(windows)]
+fn mip_drop_for(desc: &ResourceDesc, requested: u32) -> u32 {
+    if requested == 0 || desc.dimension != 3 || desc.flags & 0xf != 0
+        || desc.sample_count != 1 || desc.mip_levels < 5
+        || element(desc.format).is_none()
+        || [19, 39, 44, 53].contains(&family(desc.format))
+        || (118..=120).contains(&desc.format)
+    {
+        return 0;
+    }
+    let n = requested.min(4).min(u32::from(desc.mip_levels) - 1);
+    let (w, h) = (desc.width, u64::from(desc.height));
+    if w.min(h) < 512 || !w.is_multiple_of(4 << n) || !h.is_multiple_of(4 << n) {
+        return 0;
+    }
+    n
+}
+
+#[cfg(windows)]
+fn drop_levels(desc: &ResourceDesc) -> u32 {
+    mip_drop_for(desc, configured_mip_drop())
+}
+
+/// Allocation-time adaptation is opt-in. Numeric MIP profiles retain
+/// their original behavior unless a positive texture budget is set.
+#[cfg(windows)]
+fn adaptive_texture_budget() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        configured_texture_budget().is_some()
+            || std::env::var("VICTORY_TEXTURE_DROP_MIPS").is_ok_and(|v| v.trim().eq_ignore_ascii_case("auto"))
+    })
+}
+
+#[cfg(windows)]
+fn configured_texture_budget() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0).map(|v| v.min(65536) << 20))
+}
+
+#[cfg(windows)]
+pub(crate) fn texture_budget_pressure(video: Option<[u64; 4]>, was: bool) -> bool {
+    let (sampled, targets) = texture_budget_usage();
+    let limit = configured_texture_budget();
+    // Keep explicit budget enforcement, and connect the target reserve
+    // used by adaptive allocation to residency even before DXGI's raw
+    // usage threshold is crossed. Hysteresis avoids priority oscillation.
+    let reserve = if adaptive_texture_budget() { configured_target_reserve() } else { 0 };
+    budget_pressure(limit, video.filter(|_| adaptive_texture_budget()), sampled, targets,
+        reserve, crate::host::video_room_percent(), was)
+}
+
+#[cfg(windows)]
+fn budget_pressure(limit: Option<u64>, video: Option<[u64; 4]>, sampled: u64,
+    targets: u64, reserve: u64, percent: u64, was: bool) -> bool
+{
+    let margin = |budget: u64| if was { (budget / 20).min(256 << 20) } else { 0 };
+    if limit.is_some_and(|limit| sampled >= limit.saturating_sub(margin(limit))) {
+        return true;
+    }
+    video.filter(|v| v[0] != 0).is_some_and(|v| {
+        let room = sampled_room(None, Some(v), sampled, targets, reserve, percent);
+        if was { room <= margin(v[0]) } else { room == 0 }
+    })
+}
+
+#[cfg(windows)]
+fn configured_target_reserve() -> u64 {
+    static RESERVE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESERVE.get_or_init(|| std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(3072).min(8192) << 20)
+}
+
+/// Soft headroom: avoid double-counting logical texture allocations
+/// already included in DXGI usage. Reserve the outstanding target room.
+#[cfg(windows)]
+fn sampled_room(limit: Option<u64>, video: Option<[u64; 4]>, sampled: u64,
+    targets: u64, reserve: u64, percent: u64) -> u64
+{
+    let own = limit.unwrap_or(u64::MAX).saturating_sub(sampled);
+    let Some([budget, usage, ..]) = video.filter(|v| v[0] != 0) else { return own };
+    let reserved = reserve.min(budget / 3).saturating_sub(targets);
+    let used = usage.max(sampled.saturating_add(targets));
+    let ceiling = (u128::from(budget) * u128::from(percent.min(100)) / 100) as u64;
+    own.min(ceiling.saturating_sub(used).saturating_sub(reserved))
+}
+
+#[cfg(windows)]
+fn budgeted_drop(desc: &ResourceDesc, baseline: u32) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC;
+    if !adaptive_texture_budget() || mip_drop_for(desc, 1) == 0 {
+        return baseline;
+    }
+    let Some(host) = crate::host::host() else { return baseline };
+    let (sampled, targets) = texture_budget_usage();
+    let room = sampled_room(configured_texture_budget(), host.video_memory(), sampled,
+        targets, configured_target_reserve(), crate::host::video_room_percent());
+    let mut smallest = baseline;
+    for drop in baseline..=4 {
+        if drop != 0 && mip_drop_for(desc, drop) != drop {
+            continue;
+        }
+        let Some(d) = host_desc(desc, drop) else { continue };
+        // SAFETY: converted ResourceDesc has the D3D12 descriptor layout.
+        let bytes = unsafe { host.device.GetResourceAllocationInfo(0,
+            &[std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read_unaligned()]) }.SizeInBytes;
+        if bytes == u64::MAX {
+            continue;
+        }
+        smallest = drop;
+        if bytes <= room {
+            return drop;
+        }
+    }
+    // Required resources are not omitted to enforce a soft limit.
+    smallest
+}
+
+/// Determine the actual host shape, not just the requested profile.
+#[cfg(windows)]
+pub(crate) fn dropped(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    let Some(host) = r.host.as_ref() else { return 0 };
+    if r.desc.dimension != 3 || r.desc.mip_levels == 0 {
+        return 0;
+    }
+    // SAFETY: the resource owns the host texture.
+    let host_mips = unsafe { host.texture.GetDesc() }.MipLevels;
+    u32::from(r.desc.mip_levels.saturating_sub(host_mips))
+}
+
+#[cfg(windows)]
+fn map_mip_subresource(mips: u32, slices: u32, drop: u32, index: u32) -> Option<u32> {
+    if drop == 0 {
+        return Some(index);
+    }
+    if drop >= mips || index >= mips.checked_mul(slices)? {
+        return None;
+    }
+    let (mip, slice) = (index % mips, index / mips);
+    if mip < drop {
+        return None;
+    }
+    Some(slice * (mips - drop) + mip - drop)
+}
+
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
+    let drop = dropped(this);
+    if drop == 0 {
+        return Some(index);
+    }
+    let d = &resource(this).desc;
+    map_mip_subresource(mip_count(d), u32::from(d.depth_or_array_size), drop, index)
+}
+
+#[cfg(windows)]
+pub(crate) fn title_subresources(this: This) -> u32 {
+    let d = &resource(this).desc;
+    mip_count(d) * u32::from(d.depth_or_array_size).max(1)
+}
+
+#[cfg(windows)]
+pub(crate) fn matching_copy_shape(dst: This, src: This) -> bool {
+    let (a, b) = (&resource(dst).desc, &resource(src).desc);
+    a.dimension == 3 && b.dimension == 3 && a.width == b.width
+        && a.height == b.height && a.depth_or_array_size == b.depth_or_array_size
+        && mip_count(a) == mip_count(b) && a.sample_count == b.sample_count
+        && family(pc_format(a.format)) == family(pc_format(b.format))
+}
+
+/// Shift explicit SRV mip ranges to the retained levels. Views naming
+/// only an omitted level sample the largest retained level instead.
+#[cfg(windows)]
+pub(crate) fn shift_levels(drop: u32, first: &mut u32, levels: &mut u32, clamp: &mut f32) {
+    if drop == 0 {
+        return;
+    }
+    if *levels != u32::MAX {
+        let end = first.saturating_add(*levels);
+        *levels = end.saturating_sub(drop.max(*first)).max(1);
+    }
+    *first = first.saturating_sub(drop);
+    *clamp = (*clamp - drop as f32).max(0.0);
 }
 
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
 #[cfg(windows)]
-fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
+fn host_desc(desc: &ResourceDesc, drop: u32) -> Option<ResourceDesc> {
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
@@ -1004,6 +1255,11 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    if drop > 0 {
+        d.width >>= drop;
+        d.height >>= drop;
+        d.mip_levels -= drop as u16;
+    }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; Grand Theft Auto VI's shadow maps and material depth ask
     // for it): unordered views of such a texture write its twin
@@ -1105,11 +1361,24 @@ fn shared_texture(
     state: u32,
     clear: *const c_void,
 ) -> Option<std::sync::Arc<HostTexture>> {
-    let d = host_desc(desc)?;
+    let baseline = drop_levels(desc);
+    let mut d = host_desc(desc, baseline)?;
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
+    // Reuse a compatible live texture at its existing shape.
+    if adaptive_texture_budget() && let Some(t) = &live {
+        // SAFETY: the Arc owns the live resource.
+        let host_mips = unsafe { t.texture.GetDesc() }.MipLevels;
+        let drop = u32::from(desc.mip_levels.saturating_sub(host_mips));
+        if drop >= baseline && mip_drop_for(desc, drop) == drop
+            && let Some(candidate) = host_desc(desc, drop)
+            && takes(t, &candidate)
+        {
+            d = candidate;
+        }
+    }
     if let Some(t) = &live
         && takes(t, &d)
     {
@@ -1124,7 +1393,14 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
+    let selected = budgeted_drop(desc, baseline);
+    d = host_desc(desc, selected)?;
+    if selected > baseline {
+        tracing::debug!(baseline, selected, width = desc.width, height = desc.height,
+            "texture allocation reduced by soft VRAM budget");
+    }
     let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    crate::residency::register(&t);
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1146,7 +1422,11 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     // SAFETY: a live resource.
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
-    d.flags & USES & !flags == 0
+    td.Width == d.width
+        && td.Height == d.height
+        && td.DepthOrArraySize == d.depth_or_array_size
+        && (d.mip_levels == 0 || td.MipLevels == d.mip_levels)
+        && d.flags & USES & !flags == 0
         && (family(d.format) == family(own)
             || t.castable.iter().any(|&c| family(c) == family(d.format)))
 }
@@ -2187,6 +2467,111 @@ mod tests {
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
+    #[cfg(windows)]
+    #[test]
+    fn low_vram_profile_limits_only_eligible_textures() {
+        let d = texture(1024, 512, 28, 8);
+        assert_eq!(mip_drop_for(&d, 0), 0);
+        assert_eq!(mip_drop_for(&d, 1), 1);
+        assert_eq!(mip_drop_for(&d, 4), 4);
+        for bad in [
+            ResourceDesc { flags: 1, ..d },
+            ResourceDesc { flags: 2, ..d },
+            ResourceDesc { flags: 4, ..d },
+            ResourceDesc { flags: 8, ..d },
+            ResourceDesc { sample_count: 4, ..d },
+            ResourceDesc { dimension: 4, ..d },
+            ResourceDesc { width: 511, ..d },
+            ResourceDesc { height: 514, ..d },
+            ResourceDesc { mip_levels: 4, ..d },
+            ResourceDesc { format: 45, ..d },
+        ] {
+            assert_eq!(mip_drop_for(&bad, 1), 0);
+        }
+        assert_eq!(auto_mip_drop(Some(8 << 30)), 1);
+        assert_eq!(auto_mip_drop(Some(12 << 30)), 0);
+        assert_eq!(auto_mip_drop(Some(0)), 0);
+        assert_eq!(auto_mip_drop(None), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_budget_accounts_for_target_headroom() {
+        let mb = 1u64 << 20;
+        let video = Some([8000 * mb, 2000 * mb, 0, 0]);
+        assert_eq!(sampled_room(None, video, 1000 * mb, 500 * mb, 2000 * mb, 90), 3700 * mb);
+        assert_eq!(sampled_room(Some(1500 * mb), video, 1000 * mb, 500 * mb, 2000 * mb, 90), 500 * mb);
+        assert_eq!(sampled_room(None, video, 6000 * mb, 2000 * mb, 2000 * mb, 90), 0);
+        assert_eq!(sampled_room(Some(1024 * mb), None, 512 * mb, 0, 3072 * mb, 90), 512 * mb);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reserved_target_room_triggers_pressure_before_raw_dxgi_limit() {
+        let mb = 1u64 << 20;
+        let video = Some([8000 * mb, 6000 * mb, 0, 0]);
+        assert!(budget_pressure(None, video, 5000 * mb, 500 * mb, 2000 * mb, 90, false));
+        assert!(!budget_pressure(None, video, 5000 * mb, 1500 * mb, 2000 * mb, 90, false));
+        let near = Some([8000 * mb, 6000 * mb, 0, 0]);
+        assert!(!budget_pressure(None, near, 5000 * mb, 500 * mb, 1500 * mb, 90, false));
+        assert!(budget_pressure(None, near, 5000 * mb, 500 * mb, 1500 * mb, 90, true));
+        assert!(!budget_pressure(None, None, 9000 * mb, 0, 2000 * mb, 90, false));
+        assert!(budget_pressure(Some(1000 * mb), None, 1000 * mb, 0, 0, 90, false));
+        assert!(budget_pressure(Some(1000 * mb), None, 980 * mb, 0, 0, 90, true));
+        assert!(!budget_pressure(Some(1000 * mb), None, 940 * mb, 0, 0, 90, true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_mip_indices_and_view_ranges_preserve_array_slices() {
+        assert_eq!(map_mip_subresource(8, 2, 1, 0), None);
+        assert_eq!(map_mip_subresource(8, 2, 1, 1), Some(0));
+        assert_eq!(map_mip_subresource(8, 2, 1, 7), Some(6));
+        assert_eq!(map_mip_subresource(8, 2, 1, 8), None);
+        assert_eq!(map_mip_subresource(8, 2, 1, 9), Some(7));
+        assert_eq!(map_mip_subresource(8, 2, 1, 15), Some(13));
+        assert_eq!(map_mip_subresource(8, 2, 1, 16), None);
+        assert_eq!(map_mip_subresource(8, 2, 0, 15), Some(15));
+        let shifted = |drop, first, levels, clamp| {
+            let (mut f, mut l, mut c) = (first, levels, clamp);
+            shift_levels(drop, &mut f, &mut l, &mut c);
+            (f, l, c)
+        };
+        assert_eq!(shifted(1, 0, u32::MAX, 0.0), (0, u32::MAX, 0.0));
+        assert_eq!(shifted(1, 0, 1, 0.0), (0, 1, 0.0));
+        assert_eq!(shifted(1, 0, 8, 0.0), (0, 7, 0.0));
+        assert_eq!(shifted(1, 3, 2, 2.5), (2, 2, 1.5));
+        assert_eq!(shifted(0, 3, 2, 1.0), (3, 2, 1.0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_array_mips_use_the_expected_host_shape() {
+        let Some(host) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let d = ResourceDesc { depth_or_array_size: 2, ..texture(512, 512, 28, 8) };
+        let mut image = null;
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &d, 0, null.cast(), &RESOURCE_IIDS[0], &mut image), S_OK);
+        let baseline = drop_levels(&d);
+        let drop = dropped(image);
+        if adaptive_texture_budget() {
+            assert!(drop >= baseline && mip_drop_for(&d, drop) == drop);
+        } else {
+            assert_eq!(drop, baseline);
+        }
+        let gpu = host_resource(image).unwrap();
+        // SAFETY: the title resource owns the live host texture.
+        let actual = unsafe { gpu.GetDesc() };
+        assert_eq!((actual.Width, actual.Height, actual.MipLevels, actual.DepthOrArraySize),
+            (512 >> drop, 512 >> drop, 8 - drop as u16, 2));
+        assert_eq!(dropped(image), drop);
+        assert_eq!(host_subresource(image, 15), Some(15 - 2 * drop));
+        assert_eq!(host_subresource(image, 0), if drop == 0 { Some(0) } else { None });
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+    }
+
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {

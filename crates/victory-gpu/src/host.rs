@@ -38,6 +38,8 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    adapter: Option<IDXGIAdapter3>,
+    video_budget: Mutex<VideoBudget>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -237,8 +239,13 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
+            .ok();
         Ok(Host {
             device,
+            adapter,
+            video_budget: Mutex::new(VideoBudget::default()),
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -256,6 +263,98 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(Presentation::default()),
         })
     }
+}
+
+/// DXGI process-local accounting: local budget/usage and nonlocal
+/// budget/usage. Sample at most once per second, preserving the last good
+/// sample if the driver cannot answer.
+#[derive(Default)]
+struct VideoBudget {
+    checked: Option<Instant>,
+    memory: Option<[u64; 4]>,
+    pressure: bool,
+}
+
+static VIDEO_PRESSURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn video_room_percent() -> u64 {
+    static PERCENT: OnceLock<u64> = OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(90).clamp(50, 97)
+    })
+}
+
+fn next_video_pressure(was: bool, budget: u64, usage: u64, percent: u64) -> bool {
+    if budget == 0 {
+        return false;
+    }
+    let threshold = if was { percent.saturating_sub(10) } else { percent };
+    u128::from(usage) * 100 >= u128::from(budget) * u128::from(threshold)
+}
+
+// Local and non-local queries fail independently. Keep the last good
+// segment rather than losing a current local budget because the other
+// segment failed. A zero local budget is not a usable local observation.
+fn merge_video_memory(previous: Option<[u64; 4]>, local: Option<(u64, u64)>,
+    nonlocal: Option<(u64, u64)>) -> Option<[u64; 4]>
+{
+    let (budget, usage) = local.filter(|&(budget, _)| budget != 0)
+        .or_else(|| previous.map(|[b, u, ..]| (b, u)))?;
+    let (shared_budget, shared_usage) = nonlocal
+        .or_else(|| previous.map(|[_, _, b, u]| (b, u))).unwrap_or((0, 0));
+    Some([budget, usage, shared_budget, shared_usage])
+}
+
+impl Host {
+    pub(crate) fn dedicated_video_memory(&self) -> Option<u64> {
+        let adapter = self.adapter.as_ref()?;
+        // SAFETY: plain DXGI adapter description query.
+        let desc = unsafe { adapter.GetDesc1() }.ok()?;
+        Some(desc.DedicatedVideoMemory as u64)
+    }
+
+    pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
+        let mut state = self.video_budget.lock().unwrap_or_else(|e| e.into_inner());
+        // Adapt the reference renderer's 100 ms room-query cache. A
+        // large streaming sweep may outlast a whole one-second interval.
+        if state.checked.is_some_and(|at| at.elapsed() < Duration::from_millis(100)) {
+            return state.memory;
+        }
+        state.checked = Some(Instant::now());
+        let Some(adapter) = &self.adapter else { return state.memory };
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut nonlocal = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: the structures are valid writable DXGI outputs.
+        let local_ok = unsafe {
+            adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).is_ok()
+        };
+        let nonlocal_ok = unsafe {
+            adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal).is_ok()
+        };
+        let memory = merge_video_memory(state.memory,
+            local_ok.then_some((local.Budget, local.CurrentUsage)),
+            nonlocal_ok.then_some((nonlocal.Budget, nonlocal.CurrentUsage)));
+        let Some([local_budget, local_usage, nonlocal_budget, nonlocal_usage]) = memory else {
+            return state.memory;
+        };
+        let pressure = next_video_pressure(state.pressure, local_budget, local_usage, video_room_percent())
+            || next_video_pressure(state.pressure, nonlocal_budget, nonlocal_usage, video_room_percent());
+        if pressure != state.pressure {
+            tracing::info!(pressure, local_budget_mib = local_budget >> 20,
+                local_usage_mib = local_usage >> 20, nonlocal_budget_mib = nonlocal_budget >> 20,
+                nonlocal_usage_mib = nonlocal_usage >> 20, "DXGI memory pressure changed");
+        }
+        state.pressure = pressure;
+        state.memory = memory;
+        VIDEO_PRESSURE.store(pressure, Ordering::Relaxed);
+        state.memory
+    }
+}
+
+pub(crate) fn video_memory_pressured() -> bool {
+    VIDEO_PRESSURE.load(Ordering::Relaxed)
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -303,6 +402,44 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn dxgi_pressure_tracks_the_actual_budget_and_recovers_with_hysteresis() {
+        assert!(!next_video_pressure(false, 0, 100, 90));
+        assert!(!next_video_pressure(false, 100, 89, 90));
+        assert!(next_video_pressure(false, 100, 90, 90));
+        assert!(next_video_pressure(true, 100, 80, 90));
+        assert!(!next_video_pressure(true, 100, 79, 90));
+        assert!(next_video_pressure(false, 80, 75, 90));
+    }
+
+    #[test]
+    fn dxgi_keeps_each_last_good_segment_independently() {
+        assert_eq!(merge_video_memory(None, None, Some((100, 50))), None);
+        assert_eq!(merge_video_memory(None, Some((100, 20)), None), Some([100, 20, 0, 0]));
+        let old = Some([100, 20, 200, 30]);
+        assert_eq!(merge_video_memory(old, Some((80, 75)), None), Some([80, 75, 200, 30]));
+        assert_eq!(merge_video_memory(old, None, Some((150, 60))), Some([100, 20, 150, 60]));
+        assert_eq!(merge_video_memory(old, Some((0, 0)), Some((0, 0))), Some([100, 20, 0, 0]));
+        assert_eq!(merge_video_memory(old, None, None), old);
+    }
+
+    #[test]
+    fn memory_pressure_caps_only_idle_command_scratch() {
+        assert_eq!(idle_scratch_budget(4 << 20, false), 4 << 20);
+        assert_eq!(idle_scratch_budget(4 << 20, true), 256 << 10);
+        assert_eq!(idle_scratch_budget(64 << 10, true), 64 << 10);
+        assert_eq!(idle_scratch_budget(0, true), 0);
+    }
+
+    #[test]
+    fn idle_scratch_retention_keeps_only_a_bounded_prefix() {
+        let sizes = [64 << 10, 128 << 10, 256 << 10, 4 << 20];
+        assert_eq!(scratch_prefix_to_keep(sizes, 0), 0);
+        assert_eq!(scratch_prefix_to_keep(sizes, 192 << 10), 2);
+        assert_eq!(scratch_prefix_to_keep(sizes, 4 << 20), 3);
+        assert_eq!(scratch_prefix_to_keep(sizes, 8 << 20), 4);
+    }
 
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
@@ -613,6 +750,36 @@ unsafe impl Send for Scratch {}
 const SCRATCH_CHUNK: u64 = 4 << 20;
 const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
 
+/// Retain only this many bytes of scratch chunks per idle command list.
+fn scratch_keep_bytes() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let configured = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_SCRATCH_KEEP_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(4)
+            .min(64) << 20
+    });
+    idle_scratch_budget(configured, crate::shadow::memory_pressured() || video_memory_pressured())
+}
+
+fn idle_scratch_budget(configured: u64, pressure: bool) -> u64 {
+    if pressure { configured.min(256 << 10) } else { configured }
+}
+
+/// Keep a prefix so allocation order and the growth strategy are preserved.
+fn scratch_prefix_to_keep(sizes: impl IntoIterator<Item = u64>, mut remaining: u64) -> usize {
+    let mut count = 0;
+    for size in sizes {
+        if size > remaining {
+            break;
+        }
+        remaining -= size;
+        count += 1;
+    }
+    count
+}
+
 struct ScratchChunk {
     _buffer: ID3D12Resource,
     mapped: usize,
@@ -657,6 +824,9 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Staging ownership, not just COM references: an upload allocation
+    /// must not enter the idle pool while this recording can still read it.
+    staging_kept: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -801,6 +971,11 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::shadow::maintain_snapshot_pool();
+        self.video_memory();
+        crate::upload_pool::maintain();
+        crate::texture::reclaim_idle_staging();
+        crate::residency::maintain(self);
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -903,9 +1078,14 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        let result = WaitForSingleObject(self.event, INFINITE);
+                        if result != windows::Win32::Foundation::WAIT_OBJECT_0
+                            || self.fence.GetCompletedValue() < *submitted
+                        {
+                            fail(format_args!("host submission fence wait failed: {result:?}"));
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => fail(format_args!("host submission fence could not be armed: {e}")),
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1356,7 +1536,6 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1376,6 +1555,16 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
+        } else {
+            // The preceding submission has finished and Reset released the
+            // previous recording. No in-flight upload is reclaimed here.
+            *self.deferred() = Deferred::default();
+            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            let keep = scratch_prefix_to_keep(
+                scratch.chunks.iter().map(|chunk| chunk.capacity),
+                scratch_keep_bytes(),
+            );
+            scratch.chunks.truncate(keep);
         }
     }
 
@@ -1480,6 +1669,7 @@ impl HostList {
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
+                copy.note_used();
                 let real = copy.state.swap(*last, Ordering::Relaxed);
                 (real != *first).then(|| {
                     transition(
@@ -1754,6 +1944,11 @@ impl HostList {
         }
     }
 
+    /// Keep an upload's staging owner until the completed list resets.
+    pub(crate) fn keep_staging(&self, staging: &std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().staging_kept.push(staging.clone());
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -1811,6 +2006,7 @@ impl HostList {
                     len
                 }
                 &Step::Fill(dst, src, len) => {
+                    batch.refresh_textures();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -1831,6 +2027,8 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else {
+                        batch.refresh_textures();
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -1841,14 +2039,16 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
+                    // The snapshot needs this copy, not every unrelated
+                    // copy in the submission. Other reads can remain
+                    // batched until the next title write or GPU submission.
+                    batch.flush_one(shadow);
                     shadow.writing(*address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        batch.due.push(staging.clone());
                     }
                     continue;
                 }
@@ -1883,30 +2083,134 @@ impl HostList {
 /// GPU).
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, RefreshRanges)>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Staging buffers (by address) refreshed since the last title write.
+    /// Exact ranges brought up to date since the last title write, by
+    /// copy (held, so that its address names no other).
+    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges)>,
+    /// Staging buffers (by address) refreshed or queued since the last
+    /// title write.
     textures: std::collections::HashSet<usize>,
+    /// Independent texture reads, finished before a memory-writing step or
+    /// GPU submission. Holding the Arc also keeps each staging buffer live.
+    due: Vec<std::sync::Arc<crate::texture::Staging>>,
+}
+
+/// Sorted, disjoint, half-open byte intervals. Join only ranges that touch
+/// or overlap, not the unused bytes between two views of a large buffer.
+/// Adapted from the joined/outside range approach in cool_fox f4b48ad
+/// and victory-nvidia-8gb c09a44e. The tree bounds lookup cost even when
+/// a submission declares many unrelated ranges.
+#[derive(Default)]
+struct RefreshRanges(std::collections::BTreeMap<usize, usize>);
+
+impl RefreshRanges {
+    fn covers(&self, from: usize, to: usize) -> bool {
+        from >= to || self.0.range(..=from).next_back().is_some_and(|(_, &end)| end >= to)
+    }
+
+    fn insert(&mut self, mut from: usize, mut to: usize) {
+        if self.covers(from, to) {
+            return;
+        }
+        if let Some((&a, &b)) = self.0.range(..=from).next_back()
+            && b >= from
+        {
+            from = a;
+            to = to.max(b);
+            self.0.remove(&a);
+        }
+        while let Some((&a, &b)) = self.0.range(from..=to).next() {
+            to = to.max(b);
+            self.0.remove(&a);
+        }
+        self.0.insert(from, to);
+    }
+
+    fn missing(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        if self.covers(from, to) {
+            return Vec::new();
+        }
+        let mut at = from;
+        let mut out = Vec::new();
+        if let Some((_, &end)) = self.0.range(..=from).next_back() {
+            at = at.max(end.min(to));
+        }
+        for (&a, &b) in self.0.range(from..to) {
+            if a > at {
+                out.push((at, a));
+            }
+            at = at.max(b.min(to));
+            if at >= to {
+                break;
+            }
+        }
+        if at < to {
+            out.push((at, to));
+        }
+        out
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn gap_bytes(&self) -> u64 {
+        let Some((&first, _)) = self.0.first_key_value() else { return 0 };
+        let Some((_, &last)) = self.0.last_key_value() else { return 0 };
+        let covered: usize = self.0.iter().map(|(&a, &b)| b - a).sum();
+        (last - first - covered) as u64
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static REFRESH_SAVINGS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_refresh_savings() -> [u64; 2] {
+    REFRESH_SAVINGS.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
+
+/// One independent host allocation and its exact uncovered byte ranges.
+/// All ranges of the same Shadow stay on one worker: its dirty-page
+/// tracker, snapshots and persistent mapping must not race themselves.
+struct RefreshJob {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl RefreshJob {
+    fn run(self) -> usize {
+        let mut copied = 0usize;
+        for (a, b) in self.ranges {
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            copied += self.shadow.update(a, b - a);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::range(a, b - a, started.elapsed().as_micros() as u64, 0);
+        }
+        copied
+    }
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        let Some(end) = address.checked_add(len) else { return };
+        if len == 0 {
+            return;
+        }
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if self.current.get(&key).is_some_and(|(_, ranges)| ranges.covers(address, end)) {
+            #[cfg(feature = "diagnostics")]
+            REFRESH_SAVINGS[1].fetch_add(len as u64, Ordering::Relaxed);
             return;
         }
         match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
+            Some(&i) => self.refreshes[i].1.insert(address, end),
             None => {
+                let mut ranges = RefreshRanges::default();
+                ranges.insert(address, end);
                 self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), ranges));
             }
         }
     }
@@ -1917,6 +2221,13 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    fn refresh_textures(&mut self) {
+        if !self.due.is_empty() {
+            crate::texture::refresh_many(&self.due);
+            self.due.clear();
+        }
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
@@ -1925,31 +2236,69 @@ impl Batch {
         self.current.clear();
     }
 
-    /// Does the refreshes; returns the bytes copied.
+    /// Reserve the exact uncovered ranges for one job. The caller always
+    /// waits for all jobs before any later step observes this coverage.
+    fn refresh_job(&mut self, shadow: std::sync::Arc<crate::shadow::Shadow>, ranges: RefreshRanges) -> Option<RefreshJob> {
+        #[cfg(feature = "diagnostics")]
+        REFRESH_SAVINGS[0].fetch_add(ranges.gap_bytes(), Ordering::Relaxed);
+        let key = std::sync::Arc::as_ptr(&shadow) as usize;
+        let (_, current) = self.current.entry(key)
+            .or_insert_with(|| (shadow.clone(), RefreshRanges::default()));
+        let mut jobs = Vec::new();
+        for (from, to) in ranges.0 {
+            let missing = current.missing(from, to);
+            #[cfg(feature = "diagnostics")]
+            {
+                let bytes: usize = missing.iter().map(|&(a, b)| b - a).sum();
+                REFRESH_SAVINGS[1].fetch_add((to - from - bytes) as u64, Ordering::Relaxed);
+            }
+            for (a, b) in missing {
+                current.insert(a, b);
+                jobs.push((a, b));
+            }
+        }
+        (!jobs.is_empty()).then_some(RefreshJob { shadow, ranges: jobs })
+    }
+
+    fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> usize {
+        self.refresh_textures();
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let Some(index) = self.pending.remove(&key) else { return 0 };
+        let (shadow, ranges) = self.refreshes.swap_remove(index);
+        if let Some((moved, _)) = self.refreshes.get(index) {
+            self.pending.insert(std::sync::Arc::as_ptr(moved) as usize, index);
+        }
+        let started = std::time::Instant::now();
+        let copied = self.refresh_job(shadow, ranges).map_or(0, RefreshJob::run);
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        copied
+    }
+
+    /// Does the refreshes; returns the bytes copied. Independent shadows
+    /// have distinct mapped allocations. Source memory is read-only here;
+    /// its shared page-protection registry is synchronized by watch.
+    /// Keep the original fence and title-writing barriers.
     fn flush(&mut self) -> usize {
+        self.refresh_textures();
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
-        let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
-            }
+        if self.refreshes.is_empty() {
+            return 0;
         }
+        let started = std::time::Instant::now();
+        let refreshes = std::mem::take(&mut self.refreshes);
+        let jobs: Vec<_> = refreshes.into_iter().filter_map(|(shadow, ranges)| self.refresh_job(shadow, ranges)).collect();
+        let threads = if jobs.len() >= 4 && !crate::shadow::memory_pressured() {
+            crate::texture_workers::configured_threads()
+        } else {
+            1
+        };
+        let total: usize = crate::texture_workers::ordered_map(jobs, threads, RefreshJob::run).into_iter().sum();
+        // Report elapsed wall time rather than the sum of worker times.
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(total as u64, Ordering::Relaxed);
         total
     }
 }
@@ -2216,26 +2565,26 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
+        let made = crate::upload_pool::retry_oom(|| {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of an upload buffer.
+            unsafe {
+                self.device.CreateCommittedResource(
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
                     &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
+                )?;
+                let b = buffer.ok_or_else(windows::core::Error::empty)?;
+                b.Map(0, None, Some(&mut data))?;
+                Ok((b, data.cast()))
+            }
+        });
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(pair) => Some(pair),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -2649,26 +2998,26 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
+        let made = crate::upload_pool::retry_oom(|| {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of a CPU-visible buffer.
+            unsafe {
+                self.device.CreateCommittedResource(
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
                     &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
+                )?;
+                let b = buffer.ok_or_else(windows::core::Error::empty)?;
+                b.Map(0, None, Some(&mut data))?;
+                Ok((b, data.cast()))
+            }
+        });
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(pair) => Some(pair),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
@@ -2924,6 +3273,116 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn refresh_ranges_join_only_touching_and_subtract_covered_bytes() {
+        let mut ranges = super::RefreshRanges::default();
+        for (a, b) in [(100, 200), (300, 400), (50, 80), (150, 250), (250, 275), (300, 350), (80, 100), (500, 500)] {
+            ranges.insert(a, b);
+        }
+        assert_eq!(ranges.0.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(50, 275), (300, 400)]);
+        assert_eq!(ranges.missing(0, 500), vec![(0, 50), (275, 300), (400, 500)]);
+        assert_eq!(ranges.missing(200, 320), vec![(275, 300)]);
+        assert!(ranges.missing(70, 90).is_empty());
+        assert!(ranges.missing(5, 5).is_empty());
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(ranges.gap_bytes(), 25);
+        ranges.insert(275, 300);
+        assert!(ranges.covers(50, 400));
+    }
+
+    #[test]
+    fn disjoint_buffer_reads_leave_the_gap_unrefreshed_until_requested() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(8);
+        let len = 8 * PAGE;
+        // SAFETY: the test owns this mapped pool.
+        unsafe {
+            (p as *mut u32).write_volatile(11);
+            ((p + 3 * PAGE) as *mut u32).write_volatile(22);
+            ((p + 7 * PAGE) as *mut u32).write_volatile(33);
+        }
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return;
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE);
+        batch.add(&copy, p + 7 * PAGE, PAGE);
+        assert_eq!(batch.flush(), 2 * PAGE, "only the two declared pages");
+        assert_eq!(copy.read_host(p as u64, 1)[0], 11);
+        assert_eq!(copy.read_host((p + 7 * PAGE) as u64, 1)[0], 33);
+        batch.add(&copy, p, 4 * PAGE);
+        assert_eq!(batch.flush(), 3 * PAGE, "subtract the already refreshed first page");
+        assert_eq!(copy.read_host((p + 3 * PAGE) as u64, 1)[0], 22);
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), 3 * PAGE, "fill only the remaining gap");
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), 0);
+        // SAFETY: the test's tracked pool; the next title write invalidates
+        // the per-submission range cache.
+        unsafe { ((p + 3 * PAGE) as *mut u32).write_volatile(44) };
+        batch.title_written();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), PAGE);
+        assert_eq!(copy.read_host((p + 3 * PAGE) as u64, 1)[0], 44);
+        crate::shadow::unregister(p, p as u64);
+        drop(batch);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn refresh_one_keeps_other_copies_pending_and_parallel_flush_reads_each() {
+        use crate::watch::{PAGE, tests as pools};
+        let mut copies = Vec::new();
+        for i in 0..5usize {
+            let p = pools::pool(2);
+            // SAFETY: test owns both writable pages.
+            unsafe {
+                (p as *mut u32).write_volatile((i + 11) as u32);
+                ((p + PAGE) as *mut u32).write_volatile((i + 31) as u32);
+            }
+            crate::shadow::register(p, p as u64, (2 * PAGE) as u64);
+            let Some(copy) = crate::shadow::find(p as u64, (2 * PAGE) as u64) else {
+                crate::shadow::unregister(p, p as u64);
+                pools::free(p);
+                for (p, copy) in copies {
+                    crate::shadow::unregister(p, p as u64);
+                    drop(copy);
+                    pools::free(p);
+                }
+                return;
+            };
+            copies.push((p, copy));
+        }
+        let mut batch = Batch::default();
+        for (p, copy) in &copies {
+            batch.add(copy, *p, PAGE);
+        }
+        assert_eq!(batch.flush_one(&copies[1].1), PAGE);
+        assert_eq!(batch.pending.len(), 4);
+        // The last pending entry moved into the removed slot. Adding a
+        // second page must update the right job, not the removed one.
+        batch.add(&copies[4].1, copies[4].0 + PAGE, PAGE);
+        assert_eq!(batch.flush(), 5 * PAGE);
+        for (i, (p, copy)) in copies.iter().enumerate() {
+            assert_eq!(copy.read_host(*p as u64, 1)[0], (i + 11) as u32);
+        }
+        assert_eq!(copies[4].1.read_host((copies[4].0 + PAGE) as u64, 1)[0], 35);
+        for (p, copy) in &copies {
+            batch.add(copy, *p, PAGE);
+        }
+        assert_eq!(batch.flush(), 0);
+        drop(batch);
+        for (p, copy) in copies {
+            crate::shadow::unregister(p, p as u64);
+            drop(copy);
+            pools::free(p);
+        }
     }
 
     /// A host copy of tracked title memory: a submission whose lists all ask

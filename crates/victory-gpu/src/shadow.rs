@@ -47,45 +47,250 @@ pub(crate) struct Shadow {
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Only returned snapshots may be retained or discarded here. Snapshots
+/// still needed by an in-flight copy-back remain owned by their Shadow.
+const MIB: usize = 1 << 20;
+const MAX_POOL_BYTES: usize = 2048 * MIB;
+const MAX_POOL_ENTRIES: usize = 4096;
 
-/// An empty buffer with room for `n` bytes, from the pool if it has one.
-fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+struct SnapshotPool {
+    buffers: Vec<Vec<u8>>,
+    bytes: usize,
+    limit: usize,
+    checked: Option<std::time::Instant>,
+    memory: Option<(u64, u64, u64)>,
+    pressured: bool,
+}
+
+impl SnapshotPool {
+    const fn new() -> Self {
+        Self {
+            buffers: Vec::new(),
+            bytes: 0,
+            limit: 0,
+            checked: None,
+            memory: None,
+            pressured: false,
+        }
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        if self.bytes <= self.limit && self.buffers.len() <= MAX_POOL_ENTRIES {
+            return;
+        }
+        let mut remaining = self.limit;
+        let mut count = 0;
+        self.buffers.retain(|v| {
+            let capacity = v.capacity();
+            if capacity > remaining || count == MAX_POOL_ENTRIES {
+                return false;
+            }
+            remaining -= capacity;
+            count += 1;
+            true
+        });
+        self.bytes = self.limit - remaining;
+    }
+
+    fn refresh_limit(&mut self) {
+        use std::time::{Duration, Instant};
+        if self.checked.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.checked = Some(Instant::now());
+        if let Some(memory) = system_memory() {
+            self.memory = Some(memory);
+            let (_, physical, commit) = memory;
+            let pressure = next_memory_pressure(self.pressured, physical, commit);
+            if pressure != self.pressured {
+                tracing::info!(pressure, physical_free_mib = physical >> 20,
+                    available_commit_mib = commit >> 20, "host memory pressure changed");
+            }
+            self.pressured = pressure;
+        }
+        // A failed OS query must retain the last successful observation.
+        MEMORY_PRESSURED.store(self.pressured, std::sync::atomic::Ordering::Relaxed);
+        let limit = idle_budget(self.memory, configured_pool_ceiling(), self.pressured);
+        self.set_limit(limit);
+    }
+
+    fn take(&mut self, n: usize) -> Vec<u8> {
+        // Largest first, so the last fit is the smallest adequate buffer.
+        let Some(i) = self.buffers.iter().rposition(|v| v.capacity() >= n) else {
+            return Vec::with_capacity(n);
+        };
+        let mut v = self.buffers.remove(i);
+        self.bytes -= v.capacity();
+        v.clear();
+        v
+    }
+
+    fn put(&mut self, mut v: Vec<u8>) {
+        let capacity = v.capacity();
+        if capacity == 0 || capacity > self.limit {
+            return;
+        }
+        v.clear();
+        let i = self.buffers.partition_point(|b| b.capacity() > capacity);
+        self.buffers.insert(i, v);
+        self.bytes += capacity;
+        self.trim();
+    }
+}
+
+/// Upper bound for idle snapshot allocations, not a limit on live memory.
+/// Under pressure keep at most one eighth of available RAM or commit,
+/// with a complete idle-cache release below 1 GiB of either.
+fn snapshot_limit(memory: Option<(u64, u64, u64)>, ceiling: usize) -> usize {
+    const GIB: u64 = 1 << 30;
+    let limit = match memory {
+        Some((total, available, commit)) => {
+            if available.min(commit) < GIB {
+                0
+            } else {
+                (total / 64).min(available / 8).min(commit / 8)
+            }
+        }
+        None => 512 * MIB as u64,
     };
-    v.clear();
-    v
+    usize::try_from(limit).unwrap_or(usize::MAX).min(ceiling)
 }
 
-/// Returns a snapshot buffer to the pool, which keeps the largest up to
-/// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
-/// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
-fn give_back(v: Vec<u8>) {
+fn configured_pool_ceiling() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map_or(MAX_POOL_BYTES, |mb| mb.min(2048) * MIB)
+    })
+}
+
+pub(crate) fn system_memory() -> Option<(u64, u64, u64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: a plain structure filled by GlobalMemoryStatusEx.
+    let mut memory: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    memory.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: the structure is writable and dwLength describes its size.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut memory) } != 0;
+    ok.then_some((memory.ullTotalPhys, memory.ullAvailPhys, memory.ullAvailPageFile))
+}
+
+/// Enter pressure if either reserve is low; require both reserves to
+/// recover before allowing caches to grow again. Thresholds adapted from
+/// cool_fox's residency policy (f4b48ad).
+fn next_memory_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    const GIB: u64 = 1 << 30;
+    if was {
+        physical < 5 * GIB || commit < 6 * GIB
+    } else {
+        physical <= 3 * GIB || commit <= 4 * GIB
+    }
+}
+
+fn idle_budget(memory: Option<(u64, u64, u64)>, ceiling: usize, pressure: bool) -> usize {
+    let normal = snapshot_limit(memory, ceiling);
+    if pressure { normal.min(64 * MIB) } else { normal }
+}
+
+static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool::new());
+static MEMORY_PRESSURED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn memory_pressured() -> bool {
+    MEMORY_PRESSURED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Maintain idle storage even when no snapshot was used in a submission.
+pub(crate) fn maintain_snapshot_pool() {
+    if let Ok(mut pool) = POOL.try_lock() {
+        pool.refresh_limit();
+    }
+}
+
+pub(crate) fn memory_status() -> Option<(u64, u64, u64)> {
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).memory
+}
+
+/// Emergency reclamation leaves every live snapshot and texture read
+/// intact. Keep the idle limit at zero until the next periodic sample.
+pub(crate) fn release_idle_buffers() -> usize {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
+    let bytes = pool.bytes;
+    pool.set_limit(0);
+    pool.checked = Some(std::time::Instant::now());
+    bytes
 }
 
-/// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 2 << 30;
+/// An empty temporary CPU buffer with room for n bytes. Only returned
+/// allocations count against the idle budget; live snapshots and active
+/// texture reads remain owned by their callers.
+pub(crate) fn pooled(n: usize) -> Vec<u8> {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.refresh_limit();
+    pool.take(n)
+}
 
-// SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+/// Return a completed temporary buffer to the bounded idle cache.
+pub(crate) fn give_back(v: Vec<u8>) {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.refresh_limit();
+    pool.put(v);
+}
+
+/// Logical cache accounting, not physical RAM or D3D12 residency.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cache_stats() -> (usize, usize, usize, usize, u64) {
+    let (count, bytes, limit) = {
+        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        (pool.buffers.len(), pool.bytes, pool.limit)
+    };
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    (count, bytes, limit, loose.len(), loose.values().map(|s| s.len).sum())
+}
+
+/// Merge a completed (waited-for) GPU submission. Compare blocks first:
+/// untouched GPU blocks take the CPU's bytes, untouched CPU blocks take
+/// the GPU's bytes, and genuinely mixed blocks use the original bytewise
+/// rule. GPU changes win on collision. Both buffers finish identical.
+/// Inspired by cool_fox's merge_piece; this is the synchronous variant,
+/// so writing the host mapping is safe only after the existing fence wait.
+fn merge_waited_piece(host: &mut [u8], old: &[u8], title: &mut [u8]) -> bool {
+    debug_assert_eq!(host.len(), old.len());
+    debug_assert_eq!(host.len(), title.len());
+    const BLOCK: usize = 128;
+    let mut changed = false;
+    for ((h, o), t) in host.chunks_mut(BLOCK).zip(old.chunks(BLOCK)).zip(title.chunks_mut(BLOCK)) {
+        if h == t {
+            continue;
+        }
+        if h == o {
+            h.copy_from_slice(t);
+        } else if t == o {
+            t.copy_from_slice(h);
+            changed = true;
+        } else {
+            for ((h, o), t) in h.iter_mut().zip(o).zip(t.iter_mut()) {
+                if *h != *o && *t != *h {
+                    *t = *h;
+                    changed = true;
+                }
+                *h = *t;
+            }
+        }
+    }
+    changed
+}
+
+// SAFETY: D3D12 resources are free-threaded. The persistent mapping has
+// one writer per Shadow during a synchronous submission. Batch workers
+// operate on distinct Shadow allocations; the submitting thread joins
+// them before taking snapshots, submitting GPU work or merging writes.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -173,8 +378,11 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
+        let mut title = pooled(n);
+        title.resize(n, 0);
+        let different = crate::host::read_into(from as *const u8, &mut title) && title != host;
+        give_back(title);
+        if !different {
             return 0;
         }
         {
@@ -313,7 +521,8 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+            // Unchanged shader ranges need no temporary CPU buffer at all.
+            let mut title: Option<Vec<u8>> = None;
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -322,7 +531,6 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
                 // went back.
@@ -332,25 +540,28 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+                if host != old {
+                    let scratch = title.get_or_insert_with(|| {
+                        let mut v = pooled(PIECE);
+                        v.resize(PIECE, 0);
+                        v
+                    });
+                    let scratch = &mut scratch[..n];
+                    if crate::host::read_into((start + at) as *const u8, scratch) {
+                        // Preserve CPU writes where the GPU did not write.
+                        // The common unchanged blocks can be merged in bulk.
+                        if merge_waited_piece(host, old, scratch) {
+                            let _writing = crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, scratch.as_ptr(), n);
+                            written += n;
                         }
-                        *h = *t;
+                        synced.push((start + at) / PAGE);
                     }
-                    if changed {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
+            }
+            if let Some(v) = title {
+                give_back(v);
             }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
@@ -738,6 +949,104 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_pressure_requires_both_reserves_to_recover() {
+        const GIB: u64 = 1 << 30;
+        assert!(next_memory_pressure(false, 3 * GIB, 16 * GIB));
+        assert!(next_memory_pressure(false, 12 * GIB, 4 * GIB));
+        assert!(!next_memory_pressure(false, 4 * GIB, 5 * GIB));
+        assert!(next_memory_pressure(true, 4 * GIB, 7 * GIB));
+        assert!(next_memory_pressure(true, 6 * GIB, 5 * GIB));
+        assert!(!next_memory_pressure(true, 5 * GIB, 6 * GIB));
+    }
+
+    #[test]
+    fn pressure_reduces_idle_budget_without_restricting_live_allocations() {
+        const GIB: u64 = 1 << 30;
+        let memory = Some((32 * GIB, 3 * GIB, 4 * GIB));
+        assert_eq!(idle_budget(memory, MAX_POOL_BYTES, true), 64 * MIB);
+        assert_eq!(idle_budget(memory, 16 * MIB, true), 16 * MIB);
+        assert_eq!(idle_budget(Some((32 * GIB, GIB / 2, 4 * GIB)), MAX_POOL_BYTES, true), 0);
+        assert_eq!(idle_budget(Some((32 * GIB, 8 * GIB, 8 * GIB)), MAX_POOL_BYTES, false), 512 * MIB);
+        let mut pool = SnapshotPool::new();
+        pool.set_limit(0);
+        let mut live = pool.take(4096);
+        live.resize(4096, 1);
+        assert_eq!(live[4095], 1);
+        pool.put(live);
+        assert_eq!(pool.bytes, 0);
+    }
+
+    #[test]
+    fn snapshot_budget_scales_with_ram_and_commit() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(snapshot_limit(Some((32 * GIB, 12 * GIB, 20 * GIB)), MAX_POOL_BYTES), 512 * MIB);
+        assert_eq!(snapshot_limit(Some((64 * GIB, 2 * GIB, 8 * GIB)), MAX_POOL_BYTES), 256 * MIB);
+        assert_eq!(snapshot_limit(Some((64 * GIB, 8 * GIB, GIB / 2)), MAX_POOL_BYTES), 0);
+        assert_eq!(snapshot_limit(Some((64 * GIB, GIB / 2, 8 * GIB)), MAX_POOL_BYTES), 0);
+        assert_eq!(snapshot_limit(None, MAX_POOL_BYTES), 512 * MIB);
+        assert_eq!(snapshot_limit(Some((32 * GIB, 12 * GIB, 20 * GIB)), 64 * MIB), 64 * MIB);
+        assert_eq!(snapshot_limit(None, 0), 0);
+    }
+
+    #[test]
+    fn returned_snapshots_are_bounded_and_reused_best_fit() {
+        let mut pool = SnapshotPool::new();
+        pool.set_limit(100);
+        pool.put(vec![1; 64]);
+        pool.put(vec![2; 32]);
+        pool.put(vec![3; 256]); // too large to retain
+        assert_eq!(pool.bytes, 96);
+        let reused = pool.take(20);
+        assert_eq!(reused.capacity(), 32);
+        assert!(reused.is_empty());
+        pool.put(reused);
+        pool.set_limit(40);
+        assert_eq!(pool.bytes, 32);
+        assert_eq!(pool.buffers.len(), 1);
+        pool.set_limit(0);
+        assert_eq!(pool.bytes, 0);
+        assert!(pool.buffers.is_empty());
+        // No cache budget must not prevent a live snapshot from being made.
+        assert!(pool.take(128).capacity() >= 128);
+    }
+
+    #[test]
+    fn snapshot_pool_bounds_entry_count() {
+        let mut pool = SnapshotPool::new();
+        pool.set_limit(8192);
+        for _ in 0..MAX_POOL_ENTRIES + 8 {
+            pool.put(vec![0; 1]);
+        }
+        assert_eq!(pool.buffers.len(), MAX_POOL_ENTRIES);
+        assert_eq!(pool.bytes, MAX_POOL_ENTRIES);
+    }
+
+
+    #[test]
+    fn waited_copyback_merge_matches_the_original_bytewise_rule() {
+        for n in [0, 1, 127, 128, 129, 257, PAGE] {
+            for mode in 0..5 {
+                let old: Vec<u8> = (0..n).map(|i| (i * 31 + 17) as u8).collect();
+                let mut gpu = old.clone();
+                let mut cpu = old.clone();
+                for i in 0..n {
+                    if mode == 1 || (mode >= 3 && i % 37 == 0) {
+                        gpu[i] ^= 0x51;
+                    }
+                    if mode == 2 || (mode >= 3 && i % 43 == 0) {
+                        cpu[i] ^= if mode == 4 { 0x51 } else { 0xa2 };
+                    }
+                }
+                let expected: Vec<u8> = (0..n).map(|i| if gpu[i] != old[i] { gpu[i] } else { cpu[i] }).collect();
+                let changed = expected != cpu;
+                assert_eq!(merge_waited_piece(&mut gpu, &old, &mut cpu), changed);
+                assert_eq!(gpu, expected);
+                assert_eq!(cpu, expected);
+            }
+        }
+    }
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the
