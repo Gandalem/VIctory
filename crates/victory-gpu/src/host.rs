@@ -803,7 +803,7 @@ enum Step {
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1182,7 +1182,7 @@ impl Host {
             // the title's own data (runs c1, c4).
             let missed = deferred.missed.iter().any(|check| check());
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len) = step {
+                if let Step::GpuWrite(shadow, address, len, _) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     match index.get(&key) {
                         Some(&i) => back[i].3 &= !missed,
@@ -1194,6 +1194,10 @@ impl Host {
                 }
             }
         }
+        // Process marked pages before the declared ranges disarm their copies.
+        let withheld: Vec<_> = back.iter().filter(|b| !b.3)
+            .map(|(s, a, n, _)| (s.clone(), *a, *n)).collect();
+        crate::shadow::copy_back_marks(&withheld);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -1872,9 +1876,14 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        self.defer_gpu_write_marked(shadow, address, len, false);
+    }
+
+    pub(crate) fn defer_gpu_write_marked(
+        &self, shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize, len: usize, marked: bool,
+    ) {
+        self.deferred().copies.push(Step::GpuWrite(shadow.clone(), address, len, marked));
     }
 
     /// Shaders of the list take views from the heap itself
@@ -2128,12 +2137,13 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, marked) => {
                     // The snapshot needs this copy, not every unrelated
-                    // copy in the submission. Other reads can remain
-                    // batched until the next title write or GPU submission.
-                    batch.flush_one(shadow);
-                    shadow.writing(*address, *len);
+                    // copy. Marked writes arm pages; they need no snapshot.
+                    if !marked {
+                        batch.flush_one(shadow);
+                    }
+                    shadow.writing_marked(*address, *len, *marked);
                     continue;
                 }
                 Step::Texture(staging) => {

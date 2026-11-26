@@ -518,9 +518,14 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.gpu_writes_marked(list, address, len, false);
+    }
+
+    /// Declare writes made through a shader that emits view marks.
+    pub(crate) fn gpu_writes_marked(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         self.note_possible_gpu_write();
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize);
+        list.defer_gpu_write_marked(self, address as usize, len as usize, marked && self.marked());
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -975,8 +980,9 @@ unsafe impl Send for Bitmap {}
 // SAFETY: as above.
 unsafe impl Sync for Bitmap {}
 
+static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
+
 fn bitmap() -> Option<&'static Bitmap> {
-    static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
     BITMAP
         .get_or_init(|| {
             let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
@@ -1010,7 +1016,8 @@ pub(crate) fn view_writes() -> Option<u64> {
 // another both wrote through views goes back unless the withheld list
 // declared it.
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
-    let Some(b) = bitmap() else {
+    // No bitmap allocation for unmarked submissions.
+    let Some(b) = BITMAP.get().and_then(Option::as_ref) else {
         return;
     };
     #[cfg(feature = "diagnostics")]

@@ -46,6 +46,12 @@ pub(crate) struct HostHeap {
     /// byte stride of the buffer view there, 0 for none. Mapped at the
     /// address kept beside it.
     strides: Option<(ID3D12Resource, usize)>,
+    /// View heaps: the view-mark table translated shaders read
+    /// (`victory_shader::emit`, "Write marks"), two dwords per slot as the
+    /// stride table has one: the mark bit and phase of the unordered buffer
+    /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
+    /// beside it.
+    marks: Option<(ID3D12Resource, usize)>,
     /// Per title slot, the title address of the buffer view it holds, as a
     /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
     /// address as data, `crate::memory`): the buffer, its mapping and host
@@ -155,6 +161,18 @@ impl HostHeap {
             unsafe { std::ptr::write_bytes(data, 0, views as usize * 4) };
             (heap, mirrored, dynamic, pairs_end, Some((buffer, data as usize)))
         };
+        // Match the exact capacity selected for the stride table and shaders.
+        let marks = if sampler {
+            None
+        } else {
+            let bytes = u64::from(victory_shader::emit::view_heap_capacity()) * 8;
+            host.upload_buffer(bytes).map(|(buffer, data)| {
+                crate::host::name(&buffer, || "view marks".into());
+                // SAFETY: the entire upload buffer is mapped and writable.
+                unsafe { std::ptr::write_bytes(data, 0xFF, bytes as usize) };
+                (buffer, data as usize)
+            })
+        };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -187,6 +205,7 @@ impl HostHeap {
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end,
             strides,
+            marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
         };
@@ -365,6 +384,10 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            // Clear mark entries before dynamic slots can be reused.
+            for index in first..self.count + end as u32 {
+                self.set_mark(index, None);
+            }
             slots.fill(false);
         }
     }
@@ -372,12 +395,13 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+        let (kept, mark) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
         self.set_stride(index, Some(view));
+        self.set_mark(index, mark);
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -392,8 +416,14 @@ impl HostHeap {
         if uav {
             shadow.note_possible_gpu_write();
         }
-        let owner = shadow.is_loose().then(|| shadow.clone());
+        let mark = if uav && unsafe { shadow.buffer.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0 {
+            shadow.mark_entry(shadow.range().0)
+        } else {
+            None
+        };
+        let owner = (shadow.is_loose() || mark.is_some()).then(|| shadow.clone());
         self.raw_view_with_owner(index, Some(&shadow.buffer), 0, bytes, uav, owner);
+        self.set_mark(index, mark);
     }
 
     fn raw_view_with_owner(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool,
@@ -448,6 +478,7 @@ impl HostHeap {
         }
         self.keep(index, buffer.map(|b| (b.clone(), owner)));
         self.write_stride(index, 4);
+        self.set_mark(index, None);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -459,6 +490,7 @@ impl HostHeap {
         }
         self.keep(index, None);
         self.set_stride(index, None);
+        self.set_mark(index, None);
         if index < self.count {
             self.viewed.set(index, None, false);
         }
@@ -482,6 +514,29 @@ impl HostHeap {
     /// The view-stride table, for root SRV `VIEW_STRIDES`.
     pub(crate) fn strides(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|(buffer, _)| buffer)
+    }
+
+    /// Enters slot `index`'s view-mark entry: the mark bit and phase of the
+    /// unordered buffer view there ([`crate::shadow::Shadow::mark_entry`]),
+    /// none for anything else.
+    pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32)>) {
+        let Some((_, data)) = &self.marks else { return };
+        if index >= victory_shader::emit::view_heap_capacity() {
+            return;
+        }
+        let entry = entry.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
+        // SAFETY: two dwords of the mapped table, which has two per slot
+        // below the larger of the title's count and `HEAP_VIEWS`.
+        unsafe {
+            let at = (*data as *mut u32).add(2 * index as usize);
+            at.write_volatile(entry.0);
+            at.add(1).write_volatile(entry.1);
+        }
+    }
+
+    /// The view-mark table, for the root SRV of shaders marking their writes.
+    pub(crate) fn marks(&self) -> Option<&ID3D12Resource> {
+        self.marks.as_ref().map(|(buffer, _)| buffer)
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -580,6 +635,9 @@ impl HostHeap {
         self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
         self.write_stride(index, 4);
         self.write_stride(index + 1, 4);
+        // Writes through these are title memory's, marked in its page table.
+        self.set_mark(index, None);
+        self.set_mark(index + 1, None);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -706,6 +764,7 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
                 self.keep(index, None);
                 self.set_stride(index, Some(&view));
+                self.set_mark(index, None);
                 self.note_address(index, Some(&view));
                 self.viewed.set(index, Some(&view), false);
                 return Some(view); // pending entry remains for retry
@@ -720,11 +779,12 @@ impl HostHeap {
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
             made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
+            let (kept, mark) = if later {
+                (None, None)
             } else {
-                make(&view, self.cpu(index))
+                make_marked(&view, self.cpu(index))
             };
+            self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -1170,7 +1230,24 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), (own || shadow.is_loose()).then_some(shadow))))
+    let mark = shadow.mark_entry(start);
+    MARK.with(|m| m.set(mark));
+    Some(Some((shadow.buffer.clone(), (own || shadow.is_loose() || mark.is_some()).then_some(shadow))))
+}
+
+thread_local! {
+    /// The view-mark entry of the unordered buffer view [`make`] last made
+    /// on this thread ([`make_marked`]).
+    static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`make`], and the view-mark entry of the view if it is an unordered
+/// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
+/// marks").
+fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+    MARK.with(|m| m.set(None));
+    let kept = make(view, at);
+    (kept, MARK.with(std::cell::Cell::take))
 }
 
 /// Whether the host can make a shader (or unordered access) view of

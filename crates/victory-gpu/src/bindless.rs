@@ -592,7 +592,12 @@ impl Uploads {
 /// (about 1 GB of them in the world) cost seconds per frame; the upgrade
 /// is shaders marking the pages they write (as `crate::memory` does).
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    for (shadow, address, len, _) in viewed.ranges() {
+    for (shadow, address, len, uav) in viewed.ranges() {
+        let (address, len) = if uav && shadow.marked() {
+            shadow.page_range(address, len)
+        } else {
+            (address, len)
+        };
         add(&shadow, address as usize, len as usize);
     }
 }
