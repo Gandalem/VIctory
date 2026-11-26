@@ -336,6 +336,18 @@ Required allocations are not refused merely because of a budget or
 backoff. This is not live texture eviction or deferred texture admission.
 Diagnostics count idle upload bytes, allocations/reuses and OOM hold-down.
 
+## Dirty texture source spans
+
+Tracked texture updates read and detile only retained mip and array
+subresources overlapping dirty pages. Packed tails share a conservative
+source span; volumes use the full layout. First use fills every retained
+subresource. A failed detile retries even if dirty flags were consumed.
+This adapts retained-source handling from
+[victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/texture.rs).
+Untracked memory still uses the original whole-layout hash.
+Recorded GPU uploads still copy the complete retained chain, so this
+reduces CPU read and detile work, not necessarily PCIe traffic.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

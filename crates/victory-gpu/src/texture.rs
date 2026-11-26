@@ -61,6 +61,8 @@ pub(crate) struct Staging {
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
+    // A failed detile must retry even after consuming dirty pages.
+    ready: bool,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -405,22 +407,54 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
-            if t.take(start, start + size).is_empty() {
+            let dirty = t.take(start, start + size);
+            if dirty.is_empty() && last.ready {
                 return (0, false);
             }
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            // Keep only the live read until detiling completes. Reusing
-            // the bounded CPU pool avoids one full tiled allocation per
-            // texture without changing its staging buffer or dirty tracking.
-            let mut read = crate::shadow::pooled(size);
-            read.resize(size, 0);
-            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&read);
-            crate::shadow::give_back(read);
+            // A new staging buffer has no valid clean subresources.
+            // Otherwise retain unchanged mips and array slices.
+            let mut spans = std::collections::BTreeMap::<(u64, u64), Vec<usize>>::new();
+            let mut supported = true;
+            for i in 0..self.footprints.len() {
+                let (mip, slice) = (i as u32 % self.mips + self.first_mip, i as u32 / self.mips);
+                let Some((a, b)) = self.layout.source_span(mip, slice) else {
+                    supported = false;
+                    break;
+                };
+                if !last.ready || dirty.iter().any(|&(from, to)| from < start + b as usize && to > start + a as usize) {
+                    spans.entry((a, b)).or_default().push(i);
+                }
+            }
+            let mut read_bytes = 0usize;
+            let mut ok = true;
+            if !supported {
+                // Preserve the previous whole-layout fallback.
+                let mut read = crate::shadow::pooled(size);
+                read.resize(size, 0);
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                ok = self.detile(&read);
+                crate::shadow::give_back(read);
+                read_bytes = size;
+            } else {
+                // One read per selected source span. Packed tail mips
+                // share that read; volume spans conservatively cover
+                // the full layout. The kernel copy tolerates unmapped pages.
+                for ((a, b), indices) in spans {
+                    let len = (b - a) as usize;
+                    let mut read = crate::shadow::pooled(len);
+                    read.resize(len, 0);
+                    crate::host::copy_mapped(read.as_mut_ptr(), self.memory.wrapping_add(a as usize), len, false);
+                    for i in indices {
+                        ok &= self.detile_one(&read, i, true);
+                    }
+                    crate::shadow::give_back(read);
+                    read_bytes += len;
+                }
+            }
+            last.ready = ok;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return (size, true);
+            crate::copystat::add(crate::copystat::C::TexWatched, read_bytes as u64);
+            return (read_bytes, ok && read_bytes != 0);
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -440,15 +474,15 @@ impl Staging {
         if last.hash == Some(hash) {
             return (size, false);
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        let ok = self.detile(tiled);
+        last.hash = ok.then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, true)
+        (size, ok)
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    fn detile(&self, tiled: &[u8]) -> bool {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -457,25 +491,30 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
-            let f = footprint.Footprint;
-            let pitch = f.RowPitch as usize;
-            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
-            // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
-            // keeping the slice strictly inside the mapped staging buffer even when
-            // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip + self.first_mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
-            }
+        (0..self.footprints.len()).all(|i| self.detile_one(tiled, i, false))
+    }
+
+    fn detile_one(&self, tiled: &[u8], i: usize, span: bool) -> bool {
+        let footprint = &self.footprints[i];
+        let rows = self.rows[i];
+        let (mip, slice) = (i as u32 % self.mips + self.first_mip, i as u32 / self.mips);
+        let f = footprint.Footprint;
+        let pitch = f.RowPitch as usize;
+        let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
+        // SAFETY: the length is clamped to the mapped staging allocation.
+        // Only this staging's refresh under its last lock writes it.
+        let linear = unsafe {
+            std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+        };
+        let result = if span {
+            self.layout.detile_span(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+        } else {
+            self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+        };
+        if let Err(e) = result {
+            tracing::warn!(?e, mip, slice, "texture not detiled");
         }
+        result.is_ok()
     }
 }
 
@@ -649,6 +688,43 @@ mod tests {
     }
 
     #[test]
+    fn tracked_texture_reads_only_dirty_array_slice() {
+        use crate::watch::{PAGE, tests as pools};
+        let Some(_host) = host() else { return };
+        let words: [u32; 14] = [3, 0, 0, 0, 256, 0, 256, (1 << 16) | 2, 28, 1, 0, 1, 0, 0];
+        // SAFETY: C-layout resource description.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+        let layout = crate::resource::texture_layout(&desc).unwrap();
+        let layout = &layout.planes[0].layout;
+        let size = layout.size as usize;
+        let p = pools::pool(size.div_ceil(PAGE));
+        let (a, b) = layout.source_span(0, 1).unwrap();
+        assert!((a as usize).is_multiple_of(PAGE));
+        // SAFETY: test owns the entire mapped allocation.
+        unsafe { (p as *mut u8).write_bytes(0x37, size) };
+        let mut image = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(
+            std::ptr::null(), p as u64, &desc, 0, std::ptr::null(),
+            std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
+        ), crate::object::S_OK);
+        let upload = staging(image, crate::resource::host_resource(image).unwrap()).unwrap();
+        assert!(upload.tracked.is_some());
+        assert_eq!(upload.refresh_now(), (size, true));
+        assert_eq!(upload.refresh_now(), (0, false));
+        // SAFETY: the second array slice belongs to the test allocation.
+        unsafe { ((p + a as usize) as *mut u8).write_volatile(0x91) };
+        assert_eq!(upload.refresh_now(), ((b - a) as usize, true));
+        // SAFETY: both staging subresources remain live.
+        unsafe {
+            assert_eq!(*upload.data.add(upload.footprints[0].Offset as usize), 0x37);
+            assert_eq!(*upload.data.add(upload.footprints[1].Offset as usize), 0x91);
+        }
+        drop(upload);
+        assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
+        pools::free(p);
+    }
+
+    #[test]
     fn retained_texture_staging_reads_original_mip_and_slice() {
         use windows::core::Interface;
         let Some(_host) = host() else { return };
@@ -666,7 +742,7 @@ mod tests {
         let drop = crate::resource::dropped(image);
         assert_eq!(upload.first_mip, drop);
         assert_eq!(upload.mips, 5 - drop);
-        upload.detile(&bytes);
+        assert!(upload.detile(&bytes));
         for slice in 0..2 {
             let index = (slice * upload.mips) as usize;
             let f = upload.footprints[index];
