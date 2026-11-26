@@ -985,6 +985,9 @@ impl Host {
         self.video_memory();
         crate::bindless::maintain_ready();
         crate::upload_pool::maintain();
+        if crate::tiles::enabled() {
+            crate::tiles::maintain();
+        }
         crate::shadow::reclaim_idle_loose();
         crate::texture::reclaim_idle_staging();
         crate::residency::maintain(self);

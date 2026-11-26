@@ -533,11 +533,32 @@ publication. Placed/address-backed textures and writable resources
 retain the eager path. Unused deferred textures never create a host
 allocation. Published resources retain stable identity.
 
-This implements conservative eviction, deferred initial residency,
-limited lazy resource creation and OS residency priority hints, not
-the full lazy resource recreation, tile-level eviction and descriptor
-rebuilding architecture in
-[cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/resource.rs).
+Experimental `VICTORY_TILED_TEXTURE_POOL=1` ports the physical tile
+allocator and MIP-group mapping mechanism of
+[cool_fox tiles.rs](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/tiles.rs).
+On tier-2 adapters, eligible single-slice RGBA8 sampled textures with
+multiple retained MIPs and 1–64 MiB of tile backing use reserved
+resources, 64 KiB tiles, and a pool of up to sixteen 64 MiB heaps.
+Standard MIPs are independent groups; a packed tail is indivisible.
+Free runs coalesce on return and completely free heaps are trimmed
+under memory pressure. A private COM owner retains the physical heap
+leases for the full lifetime of the resource, including descriptor
+slots, recorded lists, and retired descriptors. All allocated texels
+are initialized to zero after an aliasing barrier on a separate fenced
+queue, before the resource is published. Castable formats are
+preserved or the existing committed allocation path is used. Reserved
+resources do not participate in committed-resource Evict/MakeResident.
+
+The production path maps **all retained MIPs** up front: without
+deferred descriptor publication, exposing a view of an unmapped level
+would risk wrong sampling. The allocator's group selection is ready
+for sparse MIP mapping, but dynamic view remapping and selective live
+mapping remain unimplemented. Like the reference, mapped tiles are
+not returned while the resource lives. This option is disabled by
+default: the dedicated initialization fence and zero fill may outweigh
+pooling savings; validate both correctness and performance on Windows.
+This complements the earlier conservative eviction, deferred initial
+residency, limited lazy resource creation and OS residency priorities.
 Logical evicted allocation bytes are not a measured VRAM reduction.
 The default is off until validated on Windows hardware.
 

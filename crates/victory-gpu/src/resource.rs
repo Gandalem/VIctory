@@ -793,6 +793,8 @@ pub(crate) struct HostTexture {
     /// Logical allocation size, not resident bytes.
     pub(crate) bytes: u64,
     pub(crate) sampled: bool,
+    /// Backed by tile heap leases retained by the resource itself.
+    pub(crate) tiled: bool,
     pub(crate) residency: crate::residency::Residency,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
@@ -806,14 +808,23 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
+        Self::new_with_size(texture, state, castable, None)
+    }
+
+    fn new_with_size(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+        castable: Vec<u32>,
+        tile_bytes: Option<u64>,
+    ) -> Self {
         // SAFETY: plain query on a live resource.
         let desc = unsafe { texture.GetDesc() };
         let sampled = desc.Flags.0 & USES as i32 == 0;
-        let bytes = crate::host::host().map_or(0, |h| {
+        let bytes = tile_bytes.unwrap_or_else(|| crate::host::host().map_or(0, |h| {
             // SAFETY: valid descriptor.
             let size = unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
             if size == u64::MAX { 0 } else { size }
-        });
+        }));
         texture_kind_bytes(sampled).fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
@@ -827,6 +838,7 @@ impl HostTexture {
             twin: std::sync::OnceLock::new(),
             bytes,
             sampled,
+            tiled: tile_bytes.is_some(),
             residency: Default::default(),
             used: false.into(),
         }
@@ -1541,6 +1553,18 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<(H
     };
     let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
+    // Reserved textures have a separate heap owner, not committed
+    // residency. Preserve the castable list and fall back before any
+    // resource is published if the adapter or pool refuses the path.
+    if clear_value.is_none() && crate::tiles::enabled() {
+        // SAFETY: same host description layout as committed creation.
+        let desc = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+        let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+        if let Some((texture, bytes)) = crate::tiles::make(host, &desc, &formats) {
+            tracing::debug!(bytes, "sampled texture backed by pooled D3D12 tiles");
+            return Some((HostTexture::new_with_size(texture, 0, castable_formats, Some(bytes)), false));
+        }
+    }
     if !castable_formats.is_empty()
         && let Ok(device) = host.device.cast::<ID3D12Device10>()
     {

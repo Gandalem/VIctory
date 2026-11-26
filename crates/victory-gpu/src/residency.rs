@@ -70,6 +70,11 @@ fn cold_priority(age: u64, pressure: bool) -> bool {
 /// Register before the texture is published to its title Resource.
 /// Never register twins, render targets, depth or UAV allocations.
 pub(crate) fn register(copy: &Arc<HostTexture>, initially_nonresident: bool) {
+    // Reserved textures use explicit heap mapping, not the committed
+    // resource MakeResident/Evict policy.
+    if copy.tiled {
+        return;
+    }
     // A successfully created nonresident resource must always enter
     // the restoration gate, even if its follow-up size query failed.
     if !initially_nonresident && (!enabled() || !copy.sampled || copy.bytes < MIB) {

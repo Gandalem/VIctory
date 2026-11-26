@@ -48,6 +48,8 @@ pub mod queue;
 pub mod resource;
 #[cfg(windows)]
 mod residency;
+#[cfg(windows)]
+mod tiles;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
