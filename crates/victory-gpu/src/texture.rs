@@ -985,12 +985,16 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) -> bool {
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
-            tracing::debug!(
-                memory = ?self.memory,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
-            );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if tiled.iter().all(|&b| b == 0) {
+                tracing::debug!(
+                    memory = ?self.memory,
+                    desc = ?self.layout.desc,
+                    "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
+                );
+            } else {
+                tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
+            }
         }
         (0..self.footprints.len()).all(|i| self.detile_one(tiled, i, false))
     }
