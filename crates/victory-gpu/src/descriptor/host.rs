@@ -300,6 +300,22 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// A sampler heap of our own, for the lists that set a root signature whose
+/// sampler heap is indexed directly (`SAMPLER_HEAP_DIRECTLY_INDEXED`) while
+/// the title binds no sampler heap: D3D12 requires one to be bound first
+/// (the debug layer's id 1419), and breaking that rule removes the device on
+/// NVIDIA. Slot 0 holds a point sampler, so an indexed read of it returns
+/// something defined rather than whatever the memory held.
+pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
+    static HEAP: std::sync::OnceLock<Option<HostHeap>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| {
+        let heap = HostHeap::new(true, 1)?;
+        null_sampler(heap.cpu(0));
+        Some(heap)
+    })
+    .as_ref()
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -1541,7 +1557,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::ConsoleSampler(words) => {
-            let desc = crate::sampler::console(words);
+            let desc = crate::sampler::console(words, crate::sampler::aniso_point_mip(device));
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
