@@ -30,6 +30,17 @@ pub const HEAP_SAMPLERS: u32 = 2048;
 /// holds no buffer view where a shader reads one at an index it computes
 /// (`emit`, "Buffer views at computed heap indices").
 pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// The view-mark table's register: `t2` (a raw root SRV) in
+/// [`MEMORY_SPACE`] (`emit`, "Write marks").
+pub const VIEW_MARKS: u32 = 2;
+/// The written-pages bitmap of buffer views: `u1` (a raw root UAV) in
+/// [`MEMORY_SPACE`].
+pub const VIEW_WRITES: u32 = 1;
+/// A view-mark table entry's base for a slot whose writes are not marked.
+pub const VIEW_MARK_NONE: u32 = u32::MAX;
+/// Bits in the written-pages bitmap of buffer views; marks past it go to
+/// the last bit.
+pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 
 static VIEW_HEAP_CAPACITY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 

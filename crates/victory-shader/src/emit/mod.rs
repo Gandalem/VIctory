@@ -207,7 +207,7 @@ pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, LARGE_HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE,
     SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDES, configure_view_heap_capacity, null_buffer_view,
-    view_heap_capacity,
+    view_heap_capacity, VIEW_MARKS, VIEW_WRITES, VIEW_MARK_NONE, VIEW_WRITE_BITS,
 };
 
 /// The loop limit without an override: 2^20.
