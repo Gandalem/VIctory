@@ -466,9 +466,19 @@ transitions per second are attempted; unsupported eviction falls back to
 a resident resource. Restore failure stops rather than submitting an
 unresident resource.
 
-This implements conservative eviction and OS residency priority hints,
-not the full lazy resource recreation, tile-level eviction and
-descriptor rebuilding architecture in
+With `VICTORY_TEXTURE_RESIDENCY=1` and `VICTORY_LAZY_RESIDENCY=1`,
+eligible sampled DEFAULT textures of at least 1 MiB are created with
+`D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT` where the driver accepts it.
+The existing resource identity and compatible-format creation path are
+retained, with a resident creation fallback on unsupported drivers.
+The same exposure gate makes the texture resident before a pointer or
+descriptor is published. Logical explicitly nonresident bytes are
+tracked through creation, eviction, restoration and destruction; this
+is not a measurement of actual physical VRAM.
+
+This implements conservative eviction, deferred initial residency and OS
+residency priority hints, not the full lazy resource recreation,
+tile-level eviction and descriptor rebuilding architecture in
 [cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/resource.rs).
 Logical evicted allocation bytes are not a measured VRAM reduction.
 The default is off until validated on Windows hardware.

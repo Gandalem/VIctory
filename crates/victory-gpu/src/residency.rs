@@ -17,6 +17,14 @@ const EXPOSED: u8 = 3;
 const MIB: u64 = 1 << 20;
 static COPIES: Mutex<BTreeMap<usize, Weak<HostTexture>>> = Mutex::new(BTreeMap::new());
 
+/// Logical bytes of committed sampled textures explicitly made nonresident,
+/// not a measurement of physical VRAM or the driver's implicit paging.
+static NONRESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn nonresident_bytes() -> u64 {
+    NONRESIDENT_BYTES.load(Relaxed)
+}
+
 #[derive(Default)]
 pub(crate) struct Residency {
     phase: AtomicU8,
@@ -30,9 +38,19 @@ fn now() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
-fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_RESIDENCY").as_deref() == Ok("1"))
+}
+
+/// Adapt lazy texture admission without changing eager resource identity.
+pub(crate) fn lazy_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    enabled() && *ON.get_or_init(|| std::env::var("VICTORY_LAZY_RESIDENCY").as_deref() == Ok("1"))
+}
+
+pub(crate) fn lazy_candidate(sampled: bool, bytes: u64, enabled: bool) -> bool {
+    enabled && sampled && bytes >= MIB && bytes != u64::MAX
 }
 
 fn may_evict(phase: u8, age: u64, pressure: bool) -> bool {
@@ -45,17 +63,33 @@ fn cold_priority(age: u64, pressure: bool) -> bool {
 
 /// Register before the texture is published to its title Resource.
 /// Never register twins, render targets, depth or UAV allocations.
-pub(crate) fn register(copy: &Arc<HostTexture>) {
-    if !enabled() || !copy.sampled || copy.bytes < MIB {
+pub(crate) fn register(copy: &Arc<HostTexture>, initially_nonresident: bool) {
+    // A successfully created nonresident resource must always enter
+    // the restoration gate, even if its follow-up size query failed.
+    if !initially_nonresident && (!enabled() || !copy.sampled || copy.bytes < MIB) {
         return;
     }
     copy.residency.last.store(now(), Relaxed);
-    copy.residency.phase.store(UNPUBLISHED, Release);
+    if initially_nonresident {
+        NONRESIDENT_BYTES.fetch_add(copy.bytes, Relaxed);
+        copy.residency.phase.store(EVICTED, Release);
+    } else {
+        copy.residency.phase.store(UNPUBLISHED, Release);
+    }
     COPIES.lock().unwrap_or_else(|e| e.into_inner())
         .insert(Arc::as_ptr(copy) as usize, Arc::downgrade(copy));
 }
 
 impl Residency {
+    /// HostTexture owns the allocation and drops only after all owners
+    /// have gone. Balance an eviction or nonresident creation that was
+    /// never restored. No raw GPU pointer is published by this path.
+    pub(crate) fn released(&self, bytes: u64) {
+        if self.phase.swap(OFF, Relaxed) == EVICTED {
+            NONRESIDENT_BYTES.fetch_sub(bytes, Relaxed);
+        }
+    }
+
     pub(crate) fn touch(&self) {
         if self.phase.load(Relaxed) != OFF {
             self.last.store(now(), Relaxed);
@@ -66,7 +100,7 @@ impl Residency {
     /// whose identity ever escaped may be held by a recorded command or
     /// descriptor that our older renderer cannot enumerate exhaustively.
     /// Therefore it stays explicitly resident for its remaining lifetime.
-    pub(crate) fn expose(&self, texture: &ID3D12Resource) {
+    pub(crate) fn expose(&self, texture: &ID3D12Resource, bytes: u64) {
         let phase = self.phase.load(Acquire);
         if phase == OFF {
             return;
@@ -90,6 +124,7 @@ impl Residency {
             if let Err(e) = result {
                 crate::host::fail(format_args!("could not restore sampled texture residency: {e}"));
             }
+            NONRESIDENT_BYTES.fetch_sub(bytes, Relaxed);
         }
         self.phase.store(EXPOSED, Release);
         self.touch();
@@ -139,6 +174,7 @@ pub(crate) fn maintain(host: &crate::host::Host) {
             // Every host pointer/Arc publication passes through expose,
             // which shares this gate. No recorded GPU command can name it.
             if unsafe { host.device.Evict(&[Some(pageable)]) }.is_ok() {
+                NONRESIDENT_BYTES.fetch_add(copy.bytes, Relaxed);
                 r.phase.store(EVICTED, Release);
                 evicted += 1;
                 bytes = bytes.saturating_add(copy.bytes);
@@ -166,7 +202,8 @@ pub(crate) fn maintain(host: &crate::host::Host) {
         }
     }
     if evicted != 0 || lowered != 0 || raised != 0 {
-        tracing::info!(evicted, logical_evicted_mib = bytes >> 20, lowered, raised, pressure,
+        tracing::info!(evicted, logical_evicted_mib = bytes >> 20,
+            logical_nonresident_mib = nonresident_bytes() >> 20, lowered, raised, pressure,
             "sampled texture residency sweep");
     }
 }
@@ -174,6 +211,15 @@ pub(crate) fn maintain(host: &crate::host::Host) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_residency_excludes_small_writable_or_unknown_allocations() {
+        assert!(!lazy_candidate(true, MIB, false));
+        assert!(!lazy_candidate(false, MIB, true));
+        assert!(!lazy_candidate(true, MIB - 1, true));
+        assert!(!lazy_candidate(true, u64::MAX, true));
+        assert!(lazy_candidate(true, MIB, true));
+    }
 
     #[test]
     fn only_unpublished_textures_may_be_explicitly_evicted() {

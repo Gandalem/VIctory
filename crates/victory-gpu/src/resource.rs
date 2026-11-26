@@ -884,6 +884,7 @@ pub(crate) fn texture_counts() -> (u64, u64, u64, u64, u64, u64) {
 #[cfg(windows)]
 impl Drop for HostTexture {
     fn drop(&mut self) {
+        self.residency.released(self.bytes);
         TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         texture_kind_bytes(self.sampled).fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
@@ -994,7 +995,7 @@ pub(crate) mod life {
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let host = resource(this).host.as_ref()?;
-    host.residency.expose(&host.texture);
+    host.residency.expose(&host.texture, host.bytes);
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -1010,7 +1011,7 @@ pub(crate) fn host_resource<'a>(
         return None;
     }
     let copy = resource(this).host.as_deref()?;
-    copy.residency.expose(&copy.texture);
+    copy.residency.expose(&copy.texture, copy.bytes);
     Some(&copy.texture)
 }
 
@@ -1021,7 +1022,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     let copy = resource(this).host.clone()?;
-    copy.residency.expose(&copy.texture);
+    copy.residency.expose(&copy.texture, copy.bytes);
     Some(copy)
 }
 
@@ -1399,8 +1400,9 @@ fn shared_texture(
         tracing::debug!(baseline, selected, width = desc.width, height = desc.height,
             "texture allocation reduced by soft VRAM budget");
     }
-    let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
-    crate::residency::register(&t);
+    let (texture, nonresident) = make_texture(&d, state, clear)?;
+    let t = std::sync::Arc::new(texture);
+    crate::residency::register(&t, nonresident);
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1449,7 +1451,7 @@ fn current(this: This) -> bool {
 /// [`castable`]'s formats (colour textures, through the enhanced-barrier
 /// creation; it starts in the common state) where the host takes that.
 #[cfg(windows)]
-fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
+fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<(HostTexture, bool)> {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     use windows::core::Interface;
@@ -1468,6 +1470,22 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
+    let mut initially_nonresident = false;
+    // Only sampled DEFAULT allocations can defer residency. A resource
+    // must exist now because the eager renderer compares its shape and
+    // shares aliases before the first descriptor is published.
+    let allocation = if crate::residency::lazy_enabled() && d.flags & USES == 0 {
+        // SAFETY: the converted description has the D3D12 layout.
+        unsafe { host.device.GetResourceAllocationInfo(0,
+            &[std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned()]) }.SizeInBytes
+    } else { 0 };
+    let defer = crate::residency::lazy_candidate(d.flags & USES == 0, allocation,
+        crate::residency::lazy_enabled());
+    let flags = if defer {
+        D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT
+    } else {
+        D3D12_HEAP_FLAG_NONE
+    };
     let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     if !castable_formats.is_empty()
@@ -1492,10 +1510,10 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
         // SAFETY: a host description and our out pointer; the list and the
         // clear value live through the call.
-        let made = unsafe {
+        let mut make = |flags| unsafe {
             device.CreateCommittedResource3(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                flags,
                 &desc1,
                 D3D12_BARRIER_LAYOUT_COMMON,
                 clear_value,
@@ -1503,6 +1521,21 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
                 Some(&formats),
                 &mut texture,
             )
+        };
+        let first = make(flags);
+        drop(make);
+        let made = if defer && (first.is_err() || texture.is_none()) {
+            texture = None;
+            // Unsupported CREATE_NOT_RESIDENT must not change the
+            // existing castable-format fallback decision.
+            unsafe {
+                device.CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc1,
+                    D3D12_BARRIER_LAYOUT_COMMON, clear_value, None::<&ID3D12ProtectedResourceSession>,
+                    Some(&formats), &mut texture)
+            }
+        } else {
+            initially_nonresident = defer && first.is_ok() && texture.is_some();
+            first
         };
         if let Err(e) = made {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1519,15 +1552,28 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         castable_formats.clear();
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
+        initially_nonresident = false;
         let made = unsafe {
             host.device.CreateCommittedResource(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                flags,
                 std::ptr::from_ref(d).cast(),
                 D3D12_RESOURCE_STATES(initial as i32),
                 clear_value,
                 &mut texture,
             )
+        };
+        let made = if defer && (made.is_err() || texture.is_none()) {
+            texture = None;
+            // SAFETY: identical description, resident fallback.
+            unsafe {
+                host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+                    std::ptr::from_ref(d).cast(), D3D12_RESOURCE_STATES(initial as i32),
+                    clear_value, &mut texture)
+            }
+        } else {
+            initially_nonresident = defer && made.is_ok() && texture.is_some();
+            made
         };
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no host texture");
@@ -1539,7 +1585,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
     let initial = crate::host::legal_state(&texture, initial);
-    Some(HostTexture::new(texture, initial, castable_formats))
+    Some((HostTexture::new(texture, initial, castable_formats), initially_nonresident))
 }
 
 /// A texture's console memory and description; `None` for buffers.
