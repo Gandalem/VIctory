@@ -205,8 +205,8 @@ textures are unsupported. Texture-to-buffer readback is not implemented
 in this older runtime. Full title-memory layout and tracking remain
 intact; the CPU may still read the full tiled allocation.
 
-DXGI local and nonlocal process usage and budget are sampled once per
-second. `VICTORY_TEXTURE_ROOM_PERCENT` (50–97, default 90) is a pressure
+DXGI local and nonlocal process usage and budget are sampled at most
+once per 100 ms. `VICTORY_TEXTURE_ROOM_PERCENT` (50–97, default 90) is a pressure
 threshold for reducing completed-list idle scratch retention, with a
 10-percentage-point recovery margin. This is **not** a hard VRAM cap:
 the older runtime creates textures eagerly and cannot safely reject
@@ -473,8 +473,18 @@ The existing resource identity and compatible-format creation path are
 retained, with a resident creation fallback on unsupported drivers.
 The same exposure gate makes the texture resident before a pointer or
 descriptor is published. Logical explicitly nonresident bytes are
-tracked through creation, eviction, restoration and destruction; this
-is not a measurement of actual physical VRAM.
+tracked through creation, eviction, restoration and destruction.
+DXGI headroom uses the greater of reported local usage and the logical
+resident estimate (sampled bytes minus explicitly nonresident bytes,
+plus targets), including the outstanding target reserve. The explicit
+allocation cap still counts all logical sampled allocations, so deferred
+creation cannot evade it; residency pressure instead counts the
+logical resident estimate. Under pressure, the oldest eligible
+unpublished textures are evicted first, stopping at the requested
+recovery margin or the sweep limit rather than evicting the whole
+registry. Non-local-only pressure does not trigger local eviction.
+Diagnostics separate these estimates from driver-reported usage; none
+is a measurement of actual physical VRAM residency.
 
 This implements conservative eviction, deferred initial residency and OS
 residency priority hints, not the full lazy resource recreation,

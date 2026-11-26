@@ -1102,22 +1102,66 @@ pub(crate) fn texture_budget_pressure(video: Option<[u64; 4]>, was: bool) -> boo
     // used by adaptive allocation to residency even before DXGI's raw
     // usage threshold is crossed. Hysteresis avoids priority oscillation.
     let reserve = if adaptive_texture_budget() { configured_target_reserve() } else { 0 };
-    budget_pressure(limit, video.filter(|_| adaptive_texture_budget()), sampled, targets,
-        reserve, crate::host::video_room_percent(), was)
+    budget_pressure(limit, video.filter(|_| adaptive_texture_budget()), sampled,
+        crate::residency::nonresident_bytes(), targets, reserve, crate::host::video_room_percent(), was)
 }
 
 #[cfg(windows)]
 fn budget_pressure(limit: Option<u64>, video: Option<[u64; 4]>, sampled: u64,
-    targets: u64, reserve: u64, percent: u64, was: bool) -> bool
+    nonresident: u64, targets: u64, reserve: u64, percent: u64, was: bool) -> bool
 {
-    let margin = |budget: u64| if was { (budget / 20).min(256 << 20) } else { 0 };
-    if limit.is_some_and(|limit| sampled >= limit.saturating_sub(margin(limit))) {
+    let margin = |budget: u64| if was { recovery_margin(budget) } else { 0 };
+    let resident = sampled.saturating_sub(nonresident);
+    if limit.is_some_and(|limit| resident >= limit.saturating_sub(margin(limit))) {
         return true;
     }
     video.filter(|v| v[0] != 0).is_some_and(|v| {
-        let room = sampled_room(None, Some(v), sampled, targets, reserve, percent);
+        let room = sampled_room(None, Some(v), sampled, nonresident, targets, reserve, percent);
         if was { room <= margin(v[0]) } else { room == 0 }
     })
+}
+
+#[cfg(windows)]
+fn recovery_margin(budget: u64) -> u64 {
+    (budget / 20).min(256 << 20)
+}
+
+#[cfg(windows)]
+fn local_used(budget: u64, usage: u64, sampled: u64, nonresident: u64, targets: u64, reserve: u64) -> u64 {
+    // DXGI usage is authoritative. Do not subtract nonresident bytes from
+    // it: the driver can report stale residency or count allocation costs
+    // differently. Only subtract them from our logical lower-bound estimate.
+    usage.max(sampled.saturating_sub(nonresident).saturating_add(targets))
+        .saturating_add(reserve.min(budget / 3).saturating_sub(targets))
+}
+
+#[cfg(windows)]
+fn local_ceiling(budget: u64, percent: u64) -> u64 {
+    (u128::from(budget) * u128::from(percent.min(100)) / 100) as u64
+}
+
+/// Requested logical bytes to evict from unpublished sampled textures.
+/// A non-local-only DXGI pressure event must not trigger a blanket move
+/// of local allocations into already pressured system memory.
+#[cfg(windows)]
+pub(crate) fn texture_reclaim_goal(video: Option<[u64; 4]>) -> u64 {
+    let (sampled, targets) = texture_budget_usage();
+    let reserve = if adaptive_texture_budget() { configured_target_reserve() } else { 0 };
+    reclaim_goal(configured_texture_budget(), video, sampled,
+        crate::residency::nonresident_bytes(), targets, reserve, crate::host::video_room_percent())
+}
+
+#[cfg(windows)]
+fn reclaim_goal(limit: Option<u64>, video: Option<[u64; 4]>, sampled: u64,
+    nonresident: u64, targets: u64, reserve: u64, percent: u64) -> u64
+{
+    let resident = sampled.saturating_sub(nonresident);
+    let own = limit.map_or(0, |limit| resident.saturating_sub(limit.saturating_sub(recovery_margin(limit))));
+    let local = video.filter(|v| v[0] != 0).map_or(0, |[budget, usage, ..]| {
+        local_used(budget, usage, sampled, nonresident, targets, reserve)
+            .saturating_sub(local_ceiling(budget, percent).saturating_sub(recovery_margin(budget)))
+    });
+    own.max(local).min(resident)
 }
 
 #[cfg(windows)]
@@ -1128,18 +1172,18 @@ fn configured_target_reserve() -> u64 {
         .unwrap_or(3072).min(8192) << 20)
 }
 
-/// Soft headroom: avoid double-counting logical texture allocations
-/// already included in DXGI usage. Reserve the outstanding target room.
+/// Soft allocation headroom. The explicit allocation cap counts total
+/// logical sampled bytes, including not-yet-resident allocations, to
+/// avoid unlimited deferred growth. DXGI headroom only uses the logical
+/// resident estimate and actual driver usage, whichever is greater.
 #[cfg(windows)]
 fn sampled_room(limit: Option<u64>, video: Option<[u64; 4]>, sampled: u64,
-    targets: u64, reserve: u64, percent: u64) -> u64
+    nonresident: u64, targets: u64, reserve: u64, percent: u64) -> u64
 {
     let own = limit.unwrap_or(u64::MAX).saturating_sub(sampled);
     let Some([budget, usage, ..]) = video.filter(|v| v[0] != 0) else { return own };
-    let reserved = reserve.min(budget / 3).saturating_sub(targets);
-    let used = usage.max(sampled.saturating_add(targets));
-    let ceiling = (u128::from(budget) * u128::from(percent.min(100)) / 100) as u64;
-    own.min(ceiling.saturating_sub(used).saturating_sub(reserved))
+    own.min(local_ceiling(budget, percent).saturating_sub(
+        local_used(budget, usage, sampled, nonresident, targets, reserve)))
 }
 
 #[cfg(windows)]
@@ -1151,7 +1195,7 @@ fn budgeted_drop(desc: &ResourceDesc, baseline: u32) -> u32 {
     let Some(host) = crate::host::host() else { return baseline };
     let (sampled, targets) = texture_budget_usage();
     let room = sampled_room(configured_texture_budget(), host.video_memory(), sampled,
-        targets, configured_target_reserve(), crate::host::video_room_percent());
+        crate::residency::nonresident_bytes(), targets, configured_target_reserve(), crate::host::video_room_percent());
     let mut smallest = baseline;
     for drop in baseline..=4 {
         if drop != 0 && mip_drop_for(desc, drop) != drop {
@@ -1510,7 +1554,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<(H
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
         // SAFETY: a host description and our out pointer; the list and the
         // clear value live through the call.
-        let mut make = |flags| unsafe {
+        let first = unsafe {
             device.CreateCommittedResource3(
                 &heap,
                 flags,
@@ -1522,8 +1566,6 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<(H
                 &mut texture,
             )
         };
-        let first = make(flags);
-        drop(make);
         let made = if defer && (first.is_err() || texture.is_none()) {
             texture = None;
             // Unsupported CREATE_NOT_RESIDENT must not change the
@@ -2545,10 +2587,10 @@ mod tests {
     fn texture_budget_accounts_for_target_headroom() {
         let mb = 1u64 << 20;
         let video = Some([8000 * mb, 2000 * mb, 0, 0]);
-        assert_eq!(sampled_room(None, video, 1000 * mb, 500 * mb, 2000 * mb, 90), 3700 * mb);
-        assert_eq!(sampled_room(Some(1500 * mb), video, 1000 * mb, 500 * mb, 2000 * mb, 90), 500 * mb);
-        assert_eq!(sampled_room(None, video, 6000 * mb, 2000 * mb, 2000 * mb, 90), 0);
-        assert_eq!(sampled_room(Some(1024 * mb), None, 512 * mb, 0, 3072 * mb, 90), 512 * mb);
+        assert_eq!(sampled_room(None, video, 1000 * mb, 0, 500 * mb, 2000 * mb, 90), 3700 * mb);
+        assert_eq!(sampled_room(Some(1500 * mb), video, 1000 * mb, 0, 500 * mb, 2000 * mb, 90), 500 * mb);
+        assert_eq!(sampled_room(None, video, 6000 * mb, 0, 2000 * mb, 2000 * mb, 90), 0);
+        assert_eq!(sampled_room(Some(1024 * mb), None, 512 * mb, 0, 0, 3072 * mb, 90), 512 * mb);
     }
 
     #[cfg(windows)]
@@ -2556,15 +2598,35 @@ mod tests {
     fn reserved_target_room_triggers_pressure_before_raw_dxgi_limit() {
         let mb = 1u64 << 20;
         let video = Some([8000 * mb, 6000 * mb, 0, 0]);
-        assert!(budget_pressure(None, video, 5000 * mb, 500 * mb, 2000 * mb, 90, false));
-        assert!(!budget_pressure(None, video, 5000 * mb, 1500 * mb, 2000 * mb, 90, false));
+        assert!(budget_pressure(None, video, 5000 * mb, 0, 500 * mb, 2000 * mb, 90, false));
+        assert!(!budget_pressure(None, video, 5000 * mb, 0, 1500 * mb, 2000 * mb, 90, false));
         let near = Some([8000 * mb, 6000 * mb, 0, 0]);
-        assert!(!budget_pressure(None, near, 5000 * mb, 500 * mb, 1500 * mb, 90, false));
-        assert!(budget_pressure(None, near, 5000 * mb, 500 * mb, 1500 * mb, 90, true));
-        assert!(!budget_pressure(None, None, 9000 * mb, 0, 2000 * mb, 90, false));
-        assert!(budget_pressure(Some(1000 * mb), None, 1000 * mb, 0, 0, 90, false));
-        assert!(budget_pressure(Some(1000 * mb), None, 980 * mb, 0, 0, 90, true));
-        assert!(!budget_pressure(Some(1000 * mb), None, 940 * mb, 0, 0, 90, true));
+        assert!(!budget_pressure(None, near, 5000 * mb, 0, 500 * mb, 1500 * mb, 90, false));
+        assert!(budget_pressure(None, near, 5000 * mb, 0, 500 * mb, 1500 * mb, 90, true));
+        assert!(!budget_pressure(None, None, 9000 * mb, 0, 0, 2000 * mb, 90, false));
+        assert!(budget_pressure(Some(1000 * mb), None, 1000 * mb, 0, 0, 0, 90, false));
+        assert!(budget_pressure(Some(1000 * mb), None, 980 * mb, 0, 0, 0, 90, true));
+        assert!(!budget_pressure(Some(1000 * mb), None, 940 * mb, 0, 0, 0, 90, true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nonresident_allocations_do_not_count_as_resident_but_still_count_against_allocation_cap() {
+        let mb = 1u64 << 20;
+        let video = Some([8000 * mb, 2000 * mb, 16000 * mb, 0]);
+        assert_eq!(sampled_room(None, video, 7000 * mb, 5000 * mb, 500 * mb, 2000 * mb, 90), 3200 * mb);
+        assert_eq!(sampled_room(Some(7500 * mb), video, 7000 * mb, 5000 * mb, 500 * mb, 2000 * mb, 90), 500 * mb);
+        assert!(!budget_pressure(Some(3000 * mb), video, 7000 * mb, 5000 * mb, 500 * mb, 2000 * mb, 90, false));
+        assert!(budget_pressure(Some(2000 * mb), video, 7000 * mb, 5000 * mb, 500 * mb, 2000 * mb, 90, false));
+        // Never subtract our estimates from the actual driver's usage.
+        let high = Some([8000 * mb, 7100 * mb, 16000 * mb, 0]);
+        assert_eq!(sampled_room(None, high, 7000 * mb, 5000 * mb, 500 * mb, 2000 * mb, 90), 0);
+        assert_eq!(reclaim_goal(None, high, 7000 * mb, 5000 * mb, 500 * mb, 2000 * mb, 90), 1656 * mb);
+        // High non-local usage alone does not justify moving local
+        // allocations into system RAM.
+        let nonlocal = Some([8000 * mb, 2000 * mb, 16000 * mb, 15900 * mb]);
+        assert_eq!(reclaim_goal(None, nonlocal, 7000 * mb, 5000 * mb, 500 * mb, 2000 * mb, 90), 0);
+        assert_eq!(reclaim_goal(Some(1000 * mb), None, 7000 * mb, 5000 * mb, 0, 0, 90), 1050 * mb);
     }
 
     #[cfg(windows)]

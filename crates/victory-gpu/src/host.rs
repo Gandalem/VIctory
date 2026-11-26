@@ -266,7 +266,7 @@ fn create() -> windows::core::Result<Host> {
 }
 
 /// DXGI process-local accounting: local budget/usage and nonlocal
-/// budget/usage. Sample at most once per second, preserving the last good
+/// budget/usage. Sample at most once per 100 ms, preserving the last good
 /// sample if the driver cannot answer.
 #[derive(Default)]
 struct VideoBudget {

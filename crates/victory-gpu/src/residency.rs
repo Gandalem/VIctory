@@ -57,6 +57,12 @@ fn may_evict(phase: u8, age: u64, pressure: bool) -> bool {
     phase == UNPUBLISHED && pressure && age >= 2000
 }
 
+/// Prefer the oldest eligible texture. This is the age ordering from
+/// cool_fox's vram_keep sweep, not its tile-level allocator.
+fn oldest_first(last_used: u64, key: usize) -> (u64, usize) {
+    (last_used, key)
+}
+
 fn cold_priority(age: u64, pressure: bool) -> bool {
     pressure && age >= 5000
 }
@@ -145,30 +151,38 @@ pub(crate) fn maintain(host: &crate::host::Host) {
     }
     NEXT.store(now.saturating_add(1000), Relaxed);
     static BUDGET_PRESSURE: AtomicBool = AtomicBool::new(false);
-    let budget_pressure = crate::resource::texture_budget_pressure(host.video_memory(), BUDGET_PRESSURE.load(Relaxed));
+    let video = host.video_memory();
+    let budget_pressure = crate::resource::texture_budget_pressure(video, BUDGET_PRESSURE.load(Relaxed));
     BUDGET_PRESSURE.store(budget_pressure, Relaxed);
     let pressure = crate::host::video_memory_pressured() || budget_pressure;
-    let owners: Vec<_> = {
+    let reclaim_goal = if pressure { crate::resource::texture_reclaim_goal(video) } else { 0 };
+    let mut owners: Vec<_> = {
         let mut registry = COPIES.lock().unwrap_or_else(|e| e.into_inner());
         registry.retain(|_, copy| copy.strong_count() > 0);
-        registry.values().cloned().collect()
+        registry.iter().filter_map(|(&key, owner)| {
+            let copy = owner.upgrade()?;
+            Some((oldest_first(copy.residency.last.load(Relaxed), key), owner.clone()))
+        }).collect()
     };
+    if reclaim_goal != 0 {
+        owners.sort_unstable_by_key(|(age, _)| *age);
+    }
     let device1 = host.device.cast::<ID3D12Device1>().ok();
     let (mut changes, mut evicted, mut bytes, mut lowered, mut raised) = (0, 0, 0u64, 0, 0);
-    for owner in owners {
+    for (_, owner) in owners {
         if changes == 128 { break }
         let Some(copy) = owner.upgrade() else { continue };
         let r = &copy.residency;
         let phase = r.phase.load(Acquire);
         let age = now.saturating_sub(r.last.load(Relaxed));
         let cold = cold_priority(age, pressure);
-        if !may_evict(phase, age, pressure) && !(phase == EXPOSED && cold != r.low.load(Relaxed)) {
+        if !may_evict(phase, age, bytes < reclaim_goal) && !(phase == EXPOSED && cold != r.low.load(Relaxed)) {
             continue;
         }
         let Ok(_guard) = r.gate.try_lock() else { continue };
         let phase = r.phase.load(Acquire);
         let age = now.saturating_sub(r.last.load(Relaxed));
-        if may_evict(phase, age, pressure) {
+        if may_evict(phase, age, bytes < reclaim_goal) {
             let Ok(pageable) = copy.texture.cast::<ID3D12Pageable>() else { continue };
             // SAFETY: this committed allocation has never been exposed.
             // Every host pointer/Arc publication passes through expose,
@@ -202,7 +216,7 @@ pub(crate) fn maintain(host: &crate::host::Host) {
         }
     }
     if evicted != 0 || lowered != 0 || raised != 0 {
-        tracing::info!(evicted, logical_evicted_mib = bytes >> 20,
+        tracing::info!(evicted, logical_evicted_mib = bytes >> 20, requested_reclaim_mib = reclaim_goal >> 20,
             logical_nonresident_mib = nonresident_bytes() >> 20, lowered, raised, pressure,
             "sampled texture residency sweep");
     }
@@ -211,6 +225,13 @@ pub(crate) fn maintain(host: &crate::host::Host) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reclaim_order_prefers_oldest_and_breaks_ties_by_key() {
+        let mut keys = [oldest_first(500, 1), oldest_first(100, 3), oldest_first(100, 2)];
+        keys.sort_unstable();
+        assert_eq!(keys, [(100, 2), (100, 3), (500, 1)]);
+    }
 
     #[test]
     fn lazy_residency_excludes_small_writable_or_unknown_allocations() {
