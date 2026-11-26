@@ -285,6 +285,9 @@ pub(crate) fn log(frames: f64) {
     let (snapshots, cached, limit, loose, loose_bytes) = crate::shadow::cache_stats();
     let memory = crate::shadow::memory_status();
     let video = crate::host::host().and_then(|h| h.video_memory());
+    let [gaps, covered] = crate::host::take_refresh_savings();
+    tracing::info!(refresh_gap_scope_bytes = gaps, refresh_already_covered_bytes = covered,
+        "buffer refresh scope avoided (logical bytes since last report)");
     tracing::info!(
         working_set_mib = ?process.map(|m| m[0] >> 20),
         private_commit_mib = ?process.map(|m| m[1] >> 20),

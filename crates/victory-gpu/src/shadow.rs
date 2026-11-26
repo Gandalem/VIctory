@@ -245,6 +245,39 @@ pub(crate) fn cache_stats() -> (usize, usize, usize, usize, u64) {
     (count, bytes, limit, loose.len(), loose.values().map(|s| s.len).sum())
 }
 
+/// Merge a completed (waited-for) GPU submission. Compare blocks first:
+/// untouched GPU blocks take the CPU's bytes, untouched CPU blocks take
+/// the GPU's bytes, and genuinely mixed blocks use the original bytewise
+/// rule. GPU changes win on collision. Both buffers finish identical.
+/// Inspired by cool_fox's merge_piece; this is the synchronous variant,
+/// so writing the host mapping is safe only after the existing fence wait.
+fn merge_waited_piece(host: &mut [u8], old: &[u8], title: &mut [u8]) -> bool {
+    debug_assert_eq!(host.len(), old.len());
+    debug_assert_eq!(host.len(), title.len());
+    const BLOCK: usize = 128;
+    let mut changed = false;
+    for ((h, o), t) in host.chunks_mut(BLOCK).zip(old.chunks(BLOCK)).zip(title.chunks_mut(BLOCK)) {
+        if h == t {
+            continue;
+        }
+        if h == o {
+            h.copy_from_slice(t);
+        } else if t == o {
+            t.copy_from_slice(h);
+            changed = true;
+        } else {
+            for ((h, o), t) in h.iter_mut().zip(o).zip(t.iter_mut()) {
+                if *h != *o && *t != *h {
+                    *t = *h;
+                    changed = true;
+                }
+                *h = *t;
+            }
+        }
+    }
+    changed
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -334,8 +367,11 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
+        let mut title = pooled(n);
+        title.resize(n, 0);
+        let different = crate::host::read_into(from as *const u8, &mut title) && title != host;
+        give_back(title);
+        if !different {
             return 0;
         }
         {
@@ -474,7 +510,8 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+            // Unchanged shader ranges need no temporary CPU buffer at all.
+            let mut title: Option<Vec<u8>> = None;
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -483,7 +520,6 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
                 // went back.
@@ -493,25 +529,28 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+                if host != old {
+                    let scratch = title.get_or_insert_with(|| {
+                        let mut v = pooled(PIECE);
+                        v.resize(PIECE, 0);
+                        v
+                    });
+                    let scratch = &mut scratch[..n];
+                    if crate::host::read_into((start + at) as *const u8, scratch) {
+                        // Preserve CPU writes where the GPU did not write.
+                        // The common unchanged blocks can be merged in bulk.
+                        if merge_waited_piece(host, old, scratch) {
+                            let _writing = crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, scratch.as_ptr(), n);
+                            written += n;
                         }
-                        *h = *t;
+                        synced.push((start + at) / PAGE);
                     }
-                    if changed {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
+            }
+            if let Some(v) = title {
+                give_back(v);
             }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
@@ -973,6 +1012,30 @@ mod tests {
         assert_eq!(pool.bytes, MAX_POOL_ENTRIES);
     }
 
+
+    #[test]
+    fn waited_copyback_merge_matches_the_original_bytewise_rule() {
+        for n in [0, 1, 127, 128, 129, 257, PAGE] {
+            for mode in 0..5 {
+                let old: Vec<u8> = (0..n).map(|i| (i * 31 + 17) as u8).collect();
+                let mut gpu = old.clone();
+                let mut cpu = old.clone();
+                for i in 0..n {
+                    if mode == 1 || (mode >= 3 && i % 37 == 0) {
+                        gpu[i] ^= 0x51;
+                    }
+                    if mode == 2 || (mode >= 3 && i % 43 == 0) {
+                        cpu[i] ^= if mode == 4 { 0x51 } else { 0xa2 };
+                    }
+                }
+                let expected: Vec<u8> = (0..n).map(|i| if gpu[i] != old[i] { gpu[i] } else { cpu[i] }).collect();
+                let changed = expected != cpu;
+                assert_eq!(merge_waited_piece(&mut gpu, &old, &mut cpu), changed);
+                assert_eq!(gpu, expected);
+                assert_eq!(cpu, expected);
+            }
+        }
+    }
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the

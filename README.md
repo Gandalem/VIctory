@@ -255,6 +255,28 @@ handling in [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nv
 (commit `c09a44e97df4170ef0caa8cc236f7cb46fd1ce90`), with independent changes to
 this repository's older snapshot and scratch implementations.
 
+## Exact buffer refresh and completed-submission merge
+
+Within a submission, refreshes now maintain disjoint byte intervals per
+host buffer. Overlapping or adjacent views join; unrelated views do not
+cause the bytes between them to be refreshed. Subsequent flushes subtract
+the already refreshed intervals until a title-memory write invalidates
+them. This uses the joined/outside range approach of
+[cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/shadow.rs)
+and [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/shadow.rs),
+adapted to synchronous submissions.
+
+Copy-back still waits for GPU completion and preserves concurrent title
+writes using the original bytewise merge rule. Equal blocks are skipped,
+unmixed blocks copied in bulk, and mixed blocks merged byte by byte.
+Temporary CPU read buffers reuse the bounded pool and are allocated only
+when needed. The mapped-memory checks and write tracking are unchanged.
+
+Diagnostics report the logical refresh gap and already-covered bytes
+avoided since the last report. These counters are not physical PCIe
+transfer measurements. No new GPU-local mirror, shared-heap mapping,
+or asynchronous submission lifetime is introduced here.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
