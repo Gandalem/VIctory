@@ -888,6 +888,7 @@ impl HostTexture {
     pub(crate) fn used_recently(&self) -> bool {
         let frame = self.last[0].load(std::sync::atomic::Ordering::Relaxed);
         frame != NEVER && frame.saturating_add(1) >= crate::queue::presented()
+    }
 
     /// A list uses it: counted the first time (diagnostics of how much of
     /// the host textures' memory the GPU ever touches).
