@@ -462,6 +462,23 @@ fn smem_dwords(name: &str) -> Option<u32> {
     }
 }
 
+/// Where a program's constant table starts in its code: where its
+/// instructions end, unless a load at a fixed offset reads below that (then
+/// at `lowest`, the lowest offset any load or descriptor names). The
+/// program's constants follow its instructions, and a load at a computed
+/// offset reads them, not instruction bytes.
+fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Address], lowest: u32) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below { lowest } else { lowest.max(code_end & !3) }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -656,22 +673,22 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -9602,9 +9619,14 @@ impl<'a> Lower<'a> {
                         regs.insert(r);
                         tainted.insert(w);
                     }
-                } else if guard.is_none() {
-                    for w in &inst.writes {
-                        regs.remove(&w.0);
+                } else {
+                    // Only VGPR writes keep their old value under a lane guard;
+                    // SGPR and SCC writes (e.g. `v_readfirstlane_b32`, `v_cmp_*`)
+                    // always overwrite the register unconditionally.
+                    for &(r, _) in &inst.writes {
+                        if guard.is_none() || !matches!(r, Reg::V(_)) {
+                            regs.remove(&r);
+                        }
                     }
                 }
             }
@@ -9704,25 +9726,41 @@ impl<'a> Lower<'a> {
         r
     }
 
-    /// The instruction writing `v`.
-    fn def_inst(&self, v: Value) -> Option<&'a Inst> {
+    /// The block, instruction index, and instruction writing `v`.
+    fn def_site(&self, v: Value) -> Option<(usize, usize, &'a Inst)> {
         let b = *self.def_block.get(&v)?;
-        let p = self.x.p;
-        p.blocks[b]
+        let (i, inst) = self.x.p.blocks[b]
             .insts
             .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == v))
+            .enumerate()
+            .find(|(_, inst)| inst.writes.iter().any(|w| w.1 == v))?;
+        Some((b, i, inst))
     }
 
-    /// The constant `v` holds, `env` giving phi values: moves of constants.
+    /// The instruction writing `v`.
+    fn def_inst(&self, v: Value) -> Option<&'a Inst> {
+        self.def_site(v).map(|(_, _, inst)| inst)
+    }
+
+    /// The constant `v` holds, `env` giving phi values: unguarded moves of
+    /// unmodified constants.
     fn konst(&self, env: &HashMap<Value, u32>, v: Value) -> Option<u32> {
         if let Some(&k) = env.get(&v) {
             return Some(k);
         }
-        let inst = self.def_inst(v)?;
+        let (b, i, inst) = self.def_site(v)?;
+        if self.x.st.guards[b][i].is_some() {
+            return None;
+        }
         let op = match &inst.fields {
             Fields::Valu(w)
-                if inst.name() == "v_mov_b32" && w.sdwa.is_none() && w.dpp.is_none() =>
+                if inst.name() == "v_mov_b32"
+                    && w.sdwa.is_none()
+                    && w.dpp.is_none()
+                    && w.abs == 0
+                    && w.neg == 0
+                    && !w.clamp
+                    && w.omod == 0 =>
             {
                 w.src.first()?
             }
@@ -9912,13 +9950,38 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, packed_half};
+    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// A program's constant table starts after its instructions, unless a
+    /// load at a fixed offset reads below that.
+    #[test]
+    fn the_code_table_starts_after_the_instructions() {
+        // s_nop 0, s_endpgm, then 1,000 dwords of constants.
+        let mut words = vec![0xBF80_0000, S_ENDPGM];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset: u32, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+        };
+        let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+        // A load at a computed offset from the code's start: the table is
+        // the constants only, not the whole program.
+        assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
+        // A load at a fixed offset inside the instructions keeps the start.
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
+        // Loads past the instructions only: from the lowest of them.
+        assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
+    }
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
@@ -10537,6 +10600,74 @@ mod tests {
     }
 
     #[test]
+    fn guarded_or_modified_v_mov_b32_is_not_folded_as_constant() {
+        let group_ids_xy = 3 << 7;
+        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        assert!(refusal(&direct).is_some());
+
+        // Guarded `v_mov_b32 v1, 0`: inactive lanes (v0 != 0) preserve v1 = -1,
+        // so they pass the compare after the join and read s6 (`s_memtime`).
+        let mut guarded = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0x7E02_0280, // v_mov_b32 v1, 0 (guarded)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+            0xBF86_0003, // s_cbranch_vccz -> end
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&guarded), refusal(&direct));
+        // Without the EXEC guard, `v_mov_b32 v1, 0` writes every lane and s6 is dead.
+        guarded[3] = 0xBF80_0000; // s_nop 0
+        guarded[5] = 0xBF80_0000; // s_nop 0
+        lowers(&guarded, group_ids_xy).expect("unguarded v_mov_b32 still folds");
+
+        // VOP3 `v_mov_b32_e64 v1, -(1.0)`: neg modifier flips 1.0f to -1.0f,
+        // matching the compare after the join so s6 is live.
+        let mut negated = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xD581_0001,
+            0x2000_00F2, // v_mov_b32_e64 v1, -(1.0)
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02F3, // v_mov_b32 v1, -1.0
+            0x7D84_02F3, // join: v_cmp_eq_u32 vcc_lo, -1.0, v1
+            0xBF86_0003, // s_cbranch_vccz -> end
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&negated), refusal(&direct));
+        // Clearing the neg bit yields unmodified 1.0f (!= -1.0f), so s6 is dead.
+        negated[3] = 0x0000_00F2; // v_mov_b32_e64 v1, 1.0
+        lowers(&negated, group_ids_xy).expect("unmodified v_mov_b32_e64 still folds");
+    }
+
+    #[test]
     fn a_missing_value_on_a_path_no_lane_takes_is_dead() {
         let refusal = |code: &[u32]| match lowers(code, 1 << 7) {
             Ok(()) => None,
@@ -10583,6 +10714,43 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(refusal(&kept), None);
+    }
+
+    #[test]
+    fn a_guarded_scalar_write_kills_a_stale_sgpr() {
+        // s6 holds a missing value (timestamp) where s0 == 0 and 5 where
+        // s0 != 0; the flag in v1 skips the first read on the s0 == 0 path.
+        // After that, inside a guarded region (EXEC narrowed without a
+        // branch), `v_readfirstlane_b32` overwrites s6 unconditionally before
+        // s6 is read again.
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+            0xBF86_0003, // s_cbranch_vccz -> after
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> after
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0x7DA4_0080, // after: v_cmpx_eq_u32 exec_lo, 0, v0 (narrows EXEC)
+            0x7E0C_0500, // v_readfirstlane_b32 s6, v0 (guarded, writes SGPR)
+            0x7DA4_0006, // v_cmpx_eq_u32 exec_lo, s6, v0 (reads new s6)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        lowers(&words, group_ids_xy).expect("guarded v_readfirstlane overwrites stale s6");
+        // Without the overwrite, the guarded compare reads the stale s6.
+        let mut no_kill = words;
+        no_kill[13] = 0xBF80_0000; // s_nop 0
+        assert!(lowers(&no_kill, group_ids_xy).is_err());
+        // With the flag set on both paths, the earlier read sees the stale s6.
+        words[2] = 0x7E02_02C1; // v_mov_b32 v1, -1
+        assert!(lowers(&words, group_ids_xy).is_err());
     }
 
     #[test]

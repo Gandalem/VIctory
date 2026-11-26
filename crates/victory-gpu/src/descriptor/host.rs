@@ -1213,15 +1213,19 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && (!unordered || typed_store(own));
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
         return false;
     }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
-        once!(view, own, "an unordered view in a format the host cannot store");
+    // Check the format actually used for the UAV, not merely the requested
+    // format. Unsupported typed UAVs (including B5G5R5A1_UNORM on NVIDIA)
+    // must remain null rather than remove the host device.
+    let typed = if !typeless && !cast { own } else { view };
+    if unordered && !typed_store(typed) {
+        once!(view = typed, own, "an unordered view in a format the host cannot store");
         return false;
     }
     if let Some(format) = format
