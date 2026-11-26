@@ -82,6 +82,12 @@ pub(crate) fn try_add_ref(this: This) -> bool {
         (n != 0).then(|| n.checked_add(1)).flatten()).is_ok()
 }
 
+/// An object's reference count.
+pub(crate) fn refs(this: This) -> u32 {
+    // SAFETY: `this` is one of our objects.
+    unsafe { &*this }.refs.load(Ordering::Acquire)
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
