@@ -263,10 +263,12 @@ fn finish_uploads(list: &HostList, pending: &mut Vec<(usize, Arc<crate::texture:
         return 0;
     }
     let staging: Vec<_> = pending.iter().map(|(_, s)| s.clone()).collect();
-    let changed = crate::texture::refresh_many(&staging);
+    crate::texture::refresh_many(&staging);
     let mut recorded = 0;
-    for ((r, staging), changed) in pending.drain(..).zip(changed) {
-        if changed && crate::texture::record_heap_upload(list, r as This, &staging) {
+    for (r, staging) in pending.drain(..) {
+        // Pending staging changes can predate this refresh (an explicit
+        // list prepared them). A clean refresh does not discard them.
+        if crate::texture::record_heap_upload(list, r as This, &staging) {
             crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
             recorded += 1;
         }

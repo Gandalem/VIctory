@@ -10,7 +10,9 @@
 //! same physical pages) in the runtime's memory; elsewhere, a content hash
 //! of the whole memory at every submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! Tracked writes refresh the affected retained subresources. Heap
+//! uploads copy those subresources; pre-recorded explicit uploads keep
+//! their original whole-chain copies.
 //! Textures read through descriptor tables are brought up to date, and for
 //! shaders that index the heap themselves every texture with a resource
 //! object the heap views (`crate::bindless`); textures the title placed in
@@ -64,6 +66,23 @@ struct Last {
     hash: Option<blake3::Hash>,
     // A failed detile must retry even after consuming dirty pages.
     ready: bool,
+    // Accumulate successful staging changes until a heap upload records
+    // them. Explicit lists may also refresh staging, so a clean refresh
+    // must not discard changes not yet acknowledged by a heap upload.
+    pending: Vec<bool>,
+}
+
+impl Last {
+    fn mark(&mut self, count: usize, indices: impl IntoIterator<Item = usize>) {
+        self.pending.resize(count, false);
+        for i in indices {
+            self.pending[i] = true;
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.ready && self.pending.iter().any(|&dirty| dirty)
+    }
 }
 
 #[cfg(feature = "diagnostics")]
@@ -292,7 +311,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
-    record(list, resource, texture, &staging);
+    record(list, resource, texture, &staging, None);
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);
 }
@@ -315,17 +334,28 @@ pub(crate) fn record_heap_upload(list: &HostList, resource: This, staging: &Arc<
     let Some(texture) = crate::resource::host_resource(resource) else {
         return false;
     };
-    record(list, resource, texture, staging);
+    let mut last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
+    if !last.has_pending() {
+        return false;
+    }
+    record(list, resource, texture, staging, Some(&last.pending));
+    // Recording and execution are serialized by the submission lock.
+    // If submission fails, the host stops instead of using stale data.
+    last.pending.fill(false);
     list.keep_staging(staging);
     true
 }
 
-/// Records the copy of every subresource of `staging` into `texture`,
-/// moving it to the copy destination state first.
-fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging) {
+/// Record selected subresources, or every one for pre-recorded lists.
+/// The latter must keep all copies because their future dirty ranges
+/// cannot be known at recording time.
+fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging, selected: Option<&[bool]>) {
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if selected.is_some_and(|mask| !mask[i]) {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -486,6 +516,9 @@ impl Staging {
                 ok = self.detile(&read);
                 crate::shadow::give_back(read);
                 read_bytes = size;
+                if ok {
+                    last.mark(self.footprints.len(), 0..self.footprints.len());
+                }
             } else {
                 // One read per selected source span. Packed tail mips
                 // share that read; volume spans conservatively cover
@@ -495,9 +528,14 @@ impl Staging {
                     let mut read = crate::shadow::pooled(len);
                     read.resize(len, 0);
                     crate::host::copy_mapped(read.as_mut_ptr(), self.memory.wrapping_add(a as usize), len, false);
-                    for i in indices {
-                        ok &= self.detile_one(&read, i, true);
+                    let mut span_ok = true;
+                    for &i in &indices {
+                        span_ok &= self.detile_one(&read, i, true);
                     }
+                    if span_ok {
+                        last.mark(self.footprints.len(), indices);
+                    }
+                    ok &= span_ok;
                     crate::shadow::give_back(read);
                     read_bytes += len;
                 }
@@ -526,7 +564,11 @@ impl Staging {
             return (size, false);
         }
         let ok = self.detile(tiled);
+        last.ready = ok;
         last.hash = ok.then_some(hash);
+        if ok {
+            last.mark(self.footprints.len(), 0..self.footprints.len());
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, ok)
@@ -562,7 +604,7 @@ impl Staging {
         } else {
             self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
         };
-        if let Err(e) = result {
+        if let Err(ref e) = result {
             tracing::warn!(?e, mip, slice, "texture not detiled");
         }
         result.is_ok()
@@ -710,6 +752,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pending_upload_mask_survives_clean_refresh_and_failed_detile() {
+        let mut last = Last { ready: true, ..Default::default() };
+        last.mark(4, [1, 3]);
+        last.mark(4, [2]);
+        assert_eq!(last.pending, [false, true, true, true]);
+        assert!(last.has_pending());
+        last.ready = false;
+        assert!(!last.has_pending());
+        last.mark(4, 0..4);
+        last.ready = true;
+        assert_eq!(last.pending, [true; 4]);
+        last.pending.fill(false);
+        assert!(!last.has_pending());
+    }
+
+    #[test]
     fn staging_reclaim_never_drops_recorded_owners() {
         assert!(!idle_staging(2, u64::MAX, true));
         assert!(!idle_staging(1, 999, true));
@@ -792,9 +850,17 @@ mod tests {
         assert!(upload.tracked.is_some());
         assert_eq!(upload.refresh_now(), (size, true));
         assert_eq!(upload.refresh_now(), (0, false));
+        {
+            let mut last = upload.last.lock().unwrap();
+            assert_eq!(last.pending, [true, true]);
+            // Acknowledge the initial full upload for this mask test.
+            last.pending.fill(false);
+        }
         // SAFETY: the second array slice belongs to the test allocation.
         unsafe { ((p + a as usize) as *mut u8).write_volatile(0x91) };
         assert_eq!(upload.refresh_now(), ((b - a) as usize, true));
+        assert_eq!(upload.refresh_now(), (0, false));
+        assert_eq!(upload.last.lock().unwrap().pending, [false, true]);
         // SAFETY: both staging subresources remain live.
         unsafe {
             assert_eq!(*upload.data.add(upload.footprints[0].Offset as usize), 0x37);

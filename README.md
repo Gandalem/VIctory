@@ -345,8 +345,13 @@ subresource. A failed detile retries even if dirty flags were consumed.
 This adapts retained-source handling from
 [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/texture.rs).
 Untracked memory still uses the original whole-layout hash.
-Recorded GPU uploads still copy the complete retained chain, so this
-reduces CPU read and detile work, not necessarily PCIe traffic.
+Bindless GPU uploads record only pending retained subresources.
+Pending changes accumulate across refreshes and are acknowledged on
+recording under the synchronous submission lock. Explicit pre-recorded
+lists still copy the complete retained chain because the later dirty
+ranges are not known at record time. Untracked hash changes also keep
+the conservative full-chain path. This reduces logical copy traffic
+for tracked bindless resources; actual PCIe savings require profiling.
 
 ## Memory-pressure admission and idle staging reclamation
 
