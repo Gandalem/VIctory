@@ -53,6 +53,7 @@ pub(crate) struct Staging {
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
     last: Mutex<Last>,
+    used_ms: std::sync::atomic::AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -80,6 +81,55 @@ impl Drop for Staging {
         // All recorded uploads hold the staging Arc, not only its buffer.
         // The last owner releases an idle allocation, never a live slice.
         crate::upload_pool::put(self.buffer.clone(), self.data, self.capacity);
+    }
+}
+
+/// Weak owners of staging allocations. Register only on staging creation,
+/// so the registry never prolongs a texture's lifetime.
+static STAGED: Mutex<std::collections::BTreeMap<usize, std::sync::Weak<crate::resource::HostTexture>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+fn idle_staging(owners: usize, age: u64, pressure: bool) -> bool {
+    owners == 1 && age >= if pressure { 1000 } else { 10000 }
+}
+
+/// Reclaim uploads held only by their texture, not by any recorded list.
+/// The next use recreates and fully refreshes the staging contents. Never
+/// remove the host texture, its descriptors or GPU-authored contents.
+pub(crate) fn reclaim_idle_staging() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    let next = NEXT.load(Relaxed);
+    if now < next || NEXT.compare_exchange(next, now.saturating_add(1000), Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let pressure = crate::shadow::memory_pressured() || crate::host::video_memory_pressured();
+    let owners: Vec<_> = {
+        let mut registry = STAGED.lock().unwrap_or_else(|e| e.into_inner());
+        registry.retain(|_, owner| owner.strong_count() > 0);
+        registry.values().cloned().collect()
+    };
+    let mut reclaimed = 0u64;
+    for owner in owners {
+        let Some(copy) = owner.upgrade() else { continue };
+        let Ok(mut staging) = copy.staging.try_lock() else { continue };
+        let idle = staging.as_ref().is_some_and(|s| {
+            idle_staging(Arc::strong_count(s), now.saturating_sub(s.used_ms.load(Relaxed)), pressure)
+        });
+        if idle {
+            if let Some(s) = staging.take() {
+                reclaimed = reclaimed.saturating_add(s.capacity);
+            }
+        }
+    }
+    if reclaimed != 0 {
+        tracing::debug!(bytes = reclaimed, pressure, "released idle texture staging owners");
     }
 }
 
@@ -252,11 +302,11 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// records its copy into `list` only if the memory changed since (or was
 /// never uploaded). True if it recorded; the texture is then in the copy
 /// destination state.
-pub(crate) fn prepare_heap_upload(resource: This) -> Option<Arc<Staging>> {
+pub(crate) fn prepare_heap_upload(resource: This, admission: &mut crate::upload_pool::Admission) -> Option<Arc<Staging>> {
     if is_host_written(resource) {
         return None;
     }
-    staging(resource, crate::resource::host_resource(resource)?)
+    staging_with_admission(resource, crate::resource::host_resource(resource)?, Some(admission))
 }
 
 /// Record only after all CPU preparation jobs have joined. The heap lock
@@ -402,6 +452,7 @@ impl Staging {
 
     /// Returns the bytes of title memory read, and whether it detiled.
     fn refresh_now(&self) -> (usize, bool) {
+        self.used_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -562,9 +613,18 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// The staging state of a title texture's host texture, made on first use
 /// (one for all title textures of its memory).
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    staging_with_admission(resource, texture, None)
+}
+
+fn staging_with_admission(
+    resource: This,
+    texture: &ID3D12Resource,
+    mut admission: Option<&mut crate::upload_pool::Admission>,
+) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = held.as_ref() {
+        s.used_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -604,7 +664,16 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
+    let estimate = total.saturating_add((64 << 10) - 1);
+    if let Some(limit) = admission.as_mut() {
+        if !limit.admit(estimate) {
+            return None;
+        }
+    }
     let (buffer, data, capacity) = crate::upload_pool::take(host, total)?;
+    if let Some(limit) = admission {
+        limit.consume(capacity);
+    }
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -626,16 +695,28 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
+        used_ms: std::sync::atomic::AtomicU64::new(now_ms()),
     });
     #[cfg(feature = "diagnostics")]
     STAGING_BYTES.fetch_add(s.size, std::sync::atomic::Ordering::Relaxed);
     *held = Some(s.clone());
+    STAGED.lock().unwrap_or_else(|e| e.into_inner())
+        .insert(Arc::as_ptr(&copy) as usize, Arc::downgrade(&copy));
     Some(s)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_reclaim_never_drops_recorded_owners() {
+        assert!(!idle_staging(2, u64::MAX, true));
+        assert!(!idle_staging(1, 999, true));
+        assert!(idle_staging(1, 1000, true));
+        assert!(!idle_staging(1, 9999, false));
+        assert!(idle_staging(1, 10000, false));
+    }
 
     #[test]
     fn refresh_chunks_bound_temporary_reads_without_dropping_large_textures() {

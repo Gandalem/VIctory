@@ -33,8 +33,54 @@ fn elapsed_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
-fn recent_oom() -> bool {
+pub(crate) fn recent_oom() -> bool {
     elapsed_ms() < RETRY_UNTIL.load(Relaxed)
+}
+
+/// Bindless heaps may contain speculative references that are not read
+/// by this submission. Limit only *new* heap staging allocations under
+/// memory pressure; existing staging refreshes and explicit uploads stay
+/// on their original path. Deferred descriptors are retried next submit.
+pub(crate) struct Admission {
+    commit_left: u64,
+    batch_left: u64,
+    admitted: bool,
+}
+
+impl Admission {
+    pub(crate) fn new() -> Self {
+        let commit = crate::shadow::memory_status().map_or(u64::MAX, |(_, _, c)| c);
+        let pressure = crate::shadow::memory_pressured() || crate::host::video_memory_pressured();
+        Self::from_status(commit, pressure)
+    }
+
+    fn from_status(commit: u64, pressure: bool) -> Self {
+        let batch_left = if commit < 1536 * MIB {
+            16 * MIB
+        } else if pressure {
+            64 * MIB
+        } else {
+            u64::MAX
+        };
+        Self { commit_left: commit, batch_left, admitted: false }
+    }
+
+    fn fits(&self, bytes: u64) -> bool {
+        // Allow one larger allocation in a batch if commit headroom
+        // permits it; otherwise large textures could wait forever.
+        self.commit_left.saturating_sub(512 * MIB) >= bytes
+            && (self.batch_left >= bytes || !self.admitted)
+    }
+
+    pub(crate) fn admit(&self, bytes: u64) -> bool {
+        !recent_oom() && self.fits(bytes)
+    }
+
+    pub(crate) fn consume(&mut self, bytes: u64) {
+        self.commit_left = self.commit_left.saturating_sub(bytes);
+        self.batch_left = self.batch_left.saturating_sub(bytes);
+        self.admitted = true;
+    }
 }
 
 fn configured_limit() -> u64 {
@@ -163,6 +209,20 @@ pub(crate) fn stats() -> (u64, usize, u64, u64, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_preserves_commit_and_allows_oversized_first_texture() {
+        let mut limit = Admission::from_status(1024 * MIB, true);
+        assert!(!limit.fits(513 * MIB));
+        assert!(limit.fits(32 * MIB));
+        limit.consume(32 * MIB);
+        assert!(!limit.fits(MIB));
+        assert!(!Admission::from_status(512 * MIB, false).fits(1));
+        let mut limit = Admission::from_status(4 * 1024 * MIB, true);
+        assert!(limit.fits(64 * MIB));
+        limit.consume(64 * MIB);
+        assert!(!limit.fits(1));
+    }
 
     #[test]
     fn staging_classes_do_not_inflate_large_or_unpooled_allocations() {

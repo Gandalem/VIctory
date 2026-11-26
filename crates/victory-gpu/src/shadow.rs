@@ -213,7 +213,6 @@ pub(crate) fn maintain_snapshot_pool() {
     }
 }
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn memory_status() -> Option<(u64, u64, u64)> {
     POOL.lock().unwrap_or_else(|e| e.into_inner()).memory
 }

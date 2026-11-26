@@ -943,6 +943,7 @@ impl Host {
         crate::shadow::maintain_snapshot_pool();
         self.video_memory();
         crate::upload_pool::maintain();
+        crate::texture::reclaim_idle_staging();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1045,9 +1046,14 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        let result = WaitForSingleObject(self.event, INFINITE);
+                        if result != windows::Win32::Foundation::WAIT_OBJECT_0
+                            || self.fence.GetCompletedValue() < *submitted
+                        {
+                            fail(format_args!("host submission fence wait failed: {result:?}"));
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => fail(format_args!("host submission fence could not be armed: {e}")),
                 }
             }
             #[cfg(feature = "diagnostics")]

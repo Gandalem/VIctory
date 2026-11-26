@@ -348,6 +348,24 @@ Untracked memory still uses the original whole-layout hash.
 Recorded GPU uploads still copy the complete retained chain, so this
 reduces CPU read and detile work, not necessarily PCIe traffic.
 
+## Memory-pressure admission and idle staging reclamation
+
+A weak registry of staging owners is swept once per second. A staging
+allocation with no recorded-list owner becomes reclaimable after ten
+seconds of disuse (one second under RAM/DXGI pressure). Host textures
+and descriptor identities are unchanged; the next use rebuilds staging.
+
+New speculative bindless staging allocations reserve at least 512 MiB
+of system commit, use a 16 MiB submission budget below 1536 MiB of
+available commit or 64 MiB under memory pressure, and pause during the
+500 ms OOM hold-down. A single larger first allocation may cross the
+soft budget only if commit permits. Existing uploads and explicitly
+recorded texture uploads are not throttled. Unserved descriptors are
+checked again on later submissions. This is a conservative admission
+policy inspired by cool_fox residency.rs, not its full asynchronous
+prefetch queue. A fence wait failure now stops submission processing
+rather than releasing storage without confirmed GPU completion.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

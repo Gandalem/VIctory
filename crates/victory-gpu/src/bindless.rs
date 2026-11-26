@@ -229,6 +229,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     let list = guard.0.as_ref()?;
     let mut recorded = false;
     let mut done = std::collections::HashSet::new();
+    let mut admission = crate::upload_pool::Admission::new();
     for viewed in heaps {
         // Held while uploading: the title releasing a texture (and its
         // memory) waits in `forget`.
@@ -238,7 +239,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
             if !done.insert(r) {
                 continue;
             }
-            let Some(staging) = crate::texture::prepare_heap_upload(r as This) else {
+            let Some(staging) = crate::texture::prepare_heap_upload(r as This, &mut admission) else {
                 continue;
             };
             // Keep shared staging aliases in their original order.
