@@ -604,6 +604,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // shortcut: root UAV writes of such a list still go back (their
         // bytes, `Shadow::gpu_writes`).
         let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
+        if withheld > 0 {
+            for &(_, at) in &writes {
+                crate::watch::retake(at as usize, 1 << 16);
+            }
+        }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
             let n = copies[k].copy_back_page(at as usize);

@@ -44,7 +44,7 @@ pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, and what it saves
 /// of pages it armed.
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, bool);
 
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
@@ -260,13 +260,22 @@ fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
 /// streamed textures and video planes through a pool view and maps the
 /// pages into its tiled heap, where a guard sees none of it).
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    track_as(start, len, views, false)
+}
+
+/// A host buffer copy tracker: a retake of its memory marks it.
+pub(crate) fn track_copy(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    track_as(start, len, views, true)
+}
+
+fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked> {
     if len == 0 || !runtime_memory(start, views) {
         return None;
     }
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default()));
+    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default(), copy));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -653,6 +662,29 @@ pub fn title_memory_remapped(at: usize, len: usize) {
                     g.alias_of.remove(&other);
                 }
             }
+        }
+    }
+}
+
+/// Mark the host buffer copies of withheld title memory to be retaken,
+/// without opening guarded pages or marking texture staging trackers.
+pub(crate) fn retake(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let g = guards();
+    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    mark(&g, first, last);
+    for page in others {
+        mark(&g, page, page + 1);
+    }
+}
+
+/// Pages `[first, last)` count as changed in every host buffer copy's
+/// tracker holding them.
+fn mark(g: &Guards, first: usize, last: usize) {
+    for (&page, holders) in g.holders.range(first..last) {
+        for c in holders.iter().filter(|c| c.2) {
+            let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
+            set.insert(page);
         }
     }
 }

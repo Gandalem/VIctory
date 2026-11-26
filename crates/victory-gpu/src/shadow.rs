@@ -445,7 +445,7 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, loose: bool) -> Arc<Shadow> {
-        let tracked = crate::watch::track(start as usize, len as usize, true);
+        let tracked = crate::watch::track_copy(start as usize, len as usize, true);
         let mark_base = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
             buffer,
@@ -1133,6 +1133,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
         {
+            // The page was written through a withheld view. Retake its
+            // title bytes at the next refresh (upstream ec9e750e).
+            crate::watch::retake(page, PAGE);
             continue;
         }
         let written = copy.copy_back_marked(page);

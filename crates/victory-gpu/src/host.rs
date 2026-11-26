@@ -779,6 +779,9 @@ pub(crate) struct HostList {
     rebind: std::sync::atomic::AtomicBool,
     /// A list of ours (uploads), whose uses are no use of the title's.
     ours: std::sync::atomic::AtomicBool,
+    /// The draw or dispatch being recorded runs a program using title
+    /// memory ([`HostList::writer_uses_memory`]).
+    memory_writer: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -974,8 +977,11 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
+    /// Shaders write a range (address, bytes) of a buffer's host copy;
+    /// whether they mark the pages they write (no snapshot then), and
+    /// whether their program uses title memory (then the range is withheld
+    /// when such a list misses, `crate::memory::withholding`).
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1134,6 +1140,7 @@ impl Host {
                 twins: Mutex::default(),
                 rebind: false.into(),
                 ours: false.into(),
+                memory_writer: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 id,
@@ -1365,17 +1372,31 @@ impl Host {
             // the title's own data (runs c1, c4).
             let missed = deferred.missed.iter().any(|check| check());
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len, _) = step {
+                if let Step::GpuWrite(shadow, address, len, _, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+                    // A range both kinds declare is withheld whole.
+                    let goes_back = !(missed && *memory);
                     match index.get(&key) {
-                        Some(&i) => back[i].3 &= !missed,
+                        Some(&i) => back[i].3 &= goes_back,
                         None => {
                             index.insert(key, back.len());
-                            back.push((shadow.clone(), *address, *len, !missed));
+                            back.push((shadow.clone(), *address, *len, goes_back));
                         }
                     }
                 }
             }
+        }
+        // A range overlapping a withheld one of the same copy is withheld
+        // too: its copy-back would take the other's bytes along (pages a
+        // program using title memory and another both wrote).
+        let held: Vec<(usize, usize, usize)> = back
+            .iter()
+            .filter(|b| !b.3)
+            .map(|(s, a, n, _)| (std::sync::Arc::as_ptr(s) as usize, *a, *n))
+            .collect();
+        for b in back.iter_mut().filter(|b| b.3) {
+            let copy = std::sync::Arc::as_ptr(&b.0) as usize;
+            b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
         }
         // Process marked pages before the declared ranges disarm their copies.
         let withheld: Vec<_> = back.iter().filter(|b| !b.3)
@@ -1395,6 +1416,12 @@ impl Host {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
             }
+        }
+        // A missed submission's withheld bytes leave the host copies at
+        // their next refresh (upstream ec9e750e). Do this after the range
+        // copy-backs, so a successful one cannot clear the retake mark.
+        for (_, address, len) in &withheld {
+            crate::watch::retake(*address, *len);
         }
         for list in runs {
             for work in &list.deferred().after {
@@ -1885,6 +1912,19 @@ impl HostList {
         self.ours.store(true, Ordering::Relaxed);
     }
 
+    /// What the list's shaders write from now until the guard goes is
+    /// written by a program using title memory (`uses`) or not.
+    pub(crate) fn writer_uses_memory(&self, uses: bool) -> impl Drop + '_ {
+        struct Reset<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
+        self.memory_writer.store(uses, Ordering::Relaxed);
+        Reset(&self.memory_writer)
+    }
+
     /// A copy of ours replaced the compute root signature and pipeline.
     pub(crate) fn need_rebind(&self) {
         self.rebind.store(true, Ordering::Relaxed);
@@ -2082,7 +2122,8 @@ impl HostList {
         &self, shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize, len: usize, marked: bool,
     ) {
-        self.deferred().copies.push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        let memory = self.memory_writer.load(Ordering::Relaxed);
+        self.deferred().copies.push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
     }
 
     /// Shaders of the list take views from the heap itself
@@ -2363,7 +2404,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len, marked) => {
+                Step::GpuWrite(shadow, address, len, marked, _) => {
                     // The snapshot needs this copy, not every unrelated
                     // copy. Marked writes arm pages; they need no snapshot.
                     if !marked {
@@ -3802,5 +3843,58 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod withholding {
+    /// A list in which a program using title memory missed memory: what
+    /// that program wrote is withheld from title memory and leaves the
+    /// copies at once; what an ordinary program wrote in the same list goes
+    /// back and stays in its copy (run light13: the imposter transforms in
+    /// the BVH builder's list); an ordinary range overlapping a withheld one
+    /// is withheld with it, since its copy-back would take the other's bytes
+    /// along.
+    #[test]
+    fn only_programs_using_title_memory_are_withheld() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let pools = [crate::watch::tests::pool(1), crate::watch::tests::pool(1)];
+        for &p in &pools {
+            // SAFETY: our pool, not guarded yet.
+            unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
+            crate::shadow::register(p, p as u64, PAGE as u64);
+        }
+        let copies: Vec<_> = pools.iter().map(|&p| crate::shadow::find(p as u64, PAGE as u64).unwrap()).collect();
+        let list = host.new_list().unwrap();
+        // (copy, start, bytes, the writer uses title memory, byte written at +0 and +16)
+        let writes = [(0, 0, 32, false, 0x22), (1, 16, 16, true, 0x33), (1, 0, 32, false, 0x44)];
+        for &(k, at, len, memory, value) in &writes {
+            let _writer = list.writer_uses_memory(memory);
+            let (copy, address) = (copies[k].clone(), (pools[k] + at) as u64);
+            copy.refresh(&list, address, len);
+            copy.gpu_writes_marked(&list, address, len, false);
+            // The shader's write, after the step that keeps the range's bytes.
+            list.defer_host(move || copy.write_host(address, &[value]));
+        }
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pools.
+        let title = |k: usize, at: usize| unsafe { ((pools[k] + at) as *const u8).read_volatile() };
+        let copy = |k: usize, at: usize| {
+            copies[k].update(pools[k], PAGE);
+            copies[k].read_host((pools[k] + at) as u64, 1)[0] & 0xff
+        };
+        assert_eq!((title(0, 0), copy(0, 0)), (0x22, 0x22), "an ordinary program's write goes back and stays");
+        assert_eq!((title(1, 16), copy(1, 16)), (0x11, 0x11), "withheld, then dropped from the copy");
+        assert_eq!((title(1, 0), copy(1, 0)), (0, 0), "overlapping a withheld range: withheld with it");
+        for (&p, copy) in pools.iter().zip(copies) {
+            crate::shadow::unregister(p, p as u64);
+            drop(copy);
+            crate::watch::tests::free(p);
+        }
     }
 }
