@@ -11,8 +11,9 @@
 //! of the whole memory at every submission that samples it.
 //!
 //! Tracked writes refresh the affected retained subresources. Heap
-//! uploads copy those subresources; pre-recorded explicit uploads keep
-//! their original whole-chain copies.
+//! uploads copy those subresources. Eligible explicit first-use uploads
+//! can use submission-time preludes; other explicit uploads keep their
+//! original whole-chain copies.
 //! Textures read through descriptor tables are brought up to date, and for
 //! shaders that index the heap themselves every texture with a resource
 //! object the heap views (`crate::bindless`); textures the title placed in
@@ -86,6 +87,16 @@ impl Last {
 
     fn has_pending(&self) -> bool {
         self.ready && self.pending.iter().any(|&dirty| dirty)
+    }
+
+    // The full-copy fallback preserves the old recording if refresh
+    // failed, the staging has never been filled, or the GPU may have
+    // written the texture in another recorded list.
+    fn explicit_indices(&self, count: usize, host_written: bool) -> Vec<usize> {
+        if host_written || !self.ready || self.pending.len() != count {
+            return (0..count).collect();
+        }
+        self.pending.iter().enumerate().filter_map(|(i, &dirty)| dirty.then_some(i)).collect()
     }
 }
 
@@ -314,11 +325,60 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if !list.first_use(texture.as_raw() as usize) {
         return;
     }
+    // Move only a first-use read-only upload to the submission prelude.
+    // A list that already uses the resource (including a bindless draw)
+    // may observe its earlier contents, so preserve its original copy.
+    if explicit_partial_uploads()
+        && let Some(copy) = crate::resource::host_copy(resource)
+        && list.defer_first_texture_upload(&copy, &staging)
+    {
+        return;
+    }
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     record(list, resource, texture, &staging, None);
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);
+}
+
+pub(crate) fn explicit_partial_uploads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EXPLICIT_PARTIAL_UPLOADS").as_deref() == Ok("1"))
+}
+
+/// Recorded-list owners of an upload whose commands can run in the
+/// list's first-state prelude, after all staging refreshes have joined.
+pub(crate) struct ExplicitUpload {
+    pub(crate) copy: Arc<crate::resource::HostTexture>,
+    pub(crate) staging: Arc<Staging>,
+}
+
+impl ExplicitUpload {
+    pub(crate) fn indices(&self) -> Vec<usize> {
+        let last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
+        last.explicit_indices(self.staging.footprints.len(),
+            self.copy.host_written.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The state prelude has already transitioned this texture to COPY_DEST.
+    pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList, indices: &[usize]) {
+        for &i in indices {
+            copy_subresource(list, &self.copy.texture, &self.staging, i);
+        }
+    }
+
+    /// Acknowledge only after the submission fence completed. Keeping the
+    /// mask through recording also handles the same list being named twice
+    /// and conservatively repeats dirty copies across lists in one batch.
+    pub(crate) fn completed(&self) {
+        if self.copy.host_written.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mut last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
+        if last.ready {
+            last.pending.fill(false);
+        }
+    }
 }
 
 /// For textures shaders reach through the heap itself, at submission
@@ -370,18 +430,18 @@ pub(crate) fn record_heap_upload(list: &HostList, resource: This, staging: &Arc<
     true
 }
 
-/// Record selected subresources, or every one for pre-recorded lists.
-/// The latter must keep all copies because their future dirty ranges
-/// cannot be known at recording time.
+/// Record selected subresources, or every one for explicit uploads that
+/// cannot safely be moved to the first-state prelude.
 fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging, selected: Option<&[bool]>) {
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
-    for (i, footprint) in staging.footprints.iter().enumerate() {
+    for i in 0..staging.footprints.len() {
         if selected.is_some_and(|mask| !mask[i]) {
             continue;
         }
         #[cfg(feature = "diagnostics")]
         {
+            let footprint = &staging.footprints[i];
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
@@ -407,28 +467,33 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
                 (gpu + staging.offset + footprint.Offset, len),
             );
         }
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
-            },
-        };
-        let mut placed = *footprint;
-        placed.Offset += staging.offset;
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above. The block lease holds the GPU resource,
-            // and its 64 KiB-aligned slice preserves footprint alignment.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: placed,
-            },
-        };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        copy_subresource(&list.list, texture, staging, i);
     }
+}
+
+fn copy_subresource(list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, staging: &Staging, i: usize) {
+    let footprint = &staging.footprints[i];
+    let to = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: i as u32,
+        },
+    };
+    let mut placed = *footprint;
+    placed.Offset += staging.offset;
+    let from = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above. The block lease holds the GPU resource,
+        // and its 64 KiB-aligned slice preserves footprint alignment.
+        pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: placed,
+        },
+    };
+    // SAFETY: an open list; both locations name live resources.
+    unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
 }
 
 /// Bound the simultaneous tiled reads rather than multiplying the size of
@@ -813,6 +878,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_upload_selection_preserves_full_fallback_and_clean_subresources() {
+        let mut last = Last::default();
+        assert_eq!(last.explicit_indices(4, false), [0, 1, 2, 3]);
+        last.ready = true;
+        last.mark(4, [1, 3]);
+        assert_eq!(last.explicit_indices(4, false), [1, 3]);
+        // Planning must not acknowledge before the GPU fence.
+        assert_eq!(last.explicit_indices(4, false), [1, 3]);
+        assert_eq!(last.explicit_indices(4, true), [0, 1, 2, 3]);
+        last.pending.fill(false);
+        assert!(last.explicit_indices(4, false).is_empty());
+        last.ready = false;
+        assert_eq!(last.explicit_indices(4, false), [0, 1, 2, 3]);
+        last.ready = true;
+        assert_eq!(last.explicit_indices(5, false), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
     fn pending_upload_mask_survives_clean_refresh_and_failed_detile() {
         let mut last = Last { ready: true, ..Default::default() };
         last.mark(4, [1, 3]);
@@ -924,6 +1007,100 @@ mod tests {
         for image in images {
             assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
         }
+    }
+
+    #[test]
+    fn explicit_prelude_upload_rechecks_dirty_array_on_each_submission() {
+        use crate::watch::{PAGE, tests as pools};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let Some(host) = host() else { return };
+        let words: [u32; 14] = [3, 0, 0, 0, 256, 0, 256, (1 << 16) | 2, 28, 1, 0, 1, 0, 0];
+        // SAFETY: the C-layout resource description consists of these words.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+        let layout = crate::resource::texture_layout(&desc).unwrap();
+        let layout = &layout.planes[0].layout;
+        let size = layout.size as usize;
+        let p = pools::pool(size.div_ceil(PAGE));
+        let (second, _) = layout.source_span(0, 1).unwrap();
+        // SAFETY: the test owns this mapped title pool.
+        unsafe { (p as *mut u8).write_bytes(0x37, size) };
+        let mut image = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(
+            std::ptr::null(), p as u64, &desc, 0, std::ptr::null(),
+            std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
+        ), crate::object::S_OK);
+        let copy = crate::resource::host_copy(image).unwrap();
+        let upload = staging(image, &copy.texture).unwrap();
+        assert!(upload.tracked.is_some());
+        let list = host.new_list().unwrap();
+        // Force the eligible path without mutating process-wide switches.
+        assert!(list.defer_first_texture_upload(&copy, &upload));
+        assert!(!list.defer_first_texture_upload(&copy, &upload));
+        // A prior bindless use also makes moving a copy unsafe.
+        let other = host.new_list().unwrap();
+        other.defer_heap(&Arc::new(crate::bindless::Viewed::default()));
+        assert!(!other.defer_first_texture_upload(&copy, &upload));
+        drop(other);
+        crate::list::ensure_state(&list, image, 0x800); // COPY_SOURCE
+        let properties = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: upload.size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: valid descriptor and read-back heap; the list retains its
+        // source and the read-back allocation is held until the test ends.
+        unsafe {
+            host.device.CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE,
+                &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback).unwrap();
+        }
+        let readback = readback.unwrap();
+        for (i, &footprint) in upload.footprints.iter().enumerate() {
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed live resource.
+                pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed live resource.
+                pResource: unsafe { std::mem::transmute_copy(&readback) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            // SAFETY: the main list begins in COPY_SOURCE after the upload.
+            unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+        list.close();
+        for value in [0x37u8, 0x91, 0x91] {
+            // SAFETY: write to the first byte of the second tracked slice.
+            unsafe { ((p + second as usize) as *mut u8).write_volatile(value) };
+            host.execute(&[&list]);
+            assert!(!upload.last.lock().unwrap().has_pending());
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the fence has completed and both read-back offsets
+            // are within the buffer allocated from GetCopyableFootprints.
+            unsafe {
+                readback.Map(0, None, Some(&mut data)).unwrap();
+                assert_eq!(*data.cast::<u8>().add(upload.footprints[0].Offset as usize), 0x37);
+                assert_eq!(*data.cast::<u8>().add(upload.footprints[1].Offset as usize), value);
+                readback.Unmap(0, None);
+            }
+        }
+        drop(list);
+        drop(upload);
+        drop(copy);
+        assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
+        pools::free(p);
     }
 
     #[test]

@@ -380,11 +380,17 @@ This adapts retained-source handling from
 Untracked memory still uses the original whole-layout hash.
 Bindless GPU uploads record only pending retained subresources.
 Pending changes accumulate across refreshes and are acknowledged on
-recording under the synchronous submission lock. Explicit pre-recorded
-lists still copy the complete retained chain because the later dirty
-ranges are not known at record time. Untracked hash changes also keep
-the conservative full-chain path. This reduces logical copy traffic
-for tracked bindless resources; actual PCIe savings require profiling.
+recording under the synchronous submission lock. Experimental
+`VICTORY_EXPLICIT_PARTIAL_UPLOADS=1` also selects pending subresources
+for explicit sampled-texture uploads that are the resource's first state
+use in a list with no preceding bindless heap use. Those copies move to
+the first-state prelude after all submission-time refreshes have joined.
+Recorded-list owners retain both texture and staging; dirty masks are
+acknowledged only after successful fence completion. Ineligible lists,
+failed refreshes, uninitialized staging and GPU-authored textures retain
+full-chain copies. Untracked hash changes also keep the conservative
+full-chain path. This reduces logical copy traffic, not measured PCIe
+traffic. The explicit option is off by default pending GPU validation.
 
 ## Memory-pressure admission and idle staging reclamation
 

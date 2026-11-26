@@ -827,6 +827,8 @@ struct Deferred {
     /// Staging ownership, not just COM references: an upload allocation
     /// must not enter the idle pool while this recording can still read it.
     staging_kept: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// First-use sampled texture copies recorded in the state prelude.
+    explicit_uploads: Vec<crate::texture::ExplicitUpload>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1044,8 +1046,20 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        // The original main lists read their staging bytes only when the
+        // GPU executes, after all CPU steps have run. Select partial
+        // prelude copies at that same point, not from an earlier snapshot.
+        let partial = runs.iter().any(|list| !list.deferred().explicit_uploads.is_empty());
+        if partial {
+            for list in runs {
+                list.run_deferred(&mut batch);
+            }
+            batch.flush();
+        }
         for list in runs {
-            list.run_deferred(&mut batch);
+            if !partial {
+                list.run_deferred(&mut batch);
+            }
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1054,7 +1068,9 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        batch.flush();
+        if !partial {
+            batch.flush();
+        }
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1135,6 +1151,13 @@ impl Host {
                 last_notes(runs),
                 removed_during(runs, removed_in)
             ));
+        }
+        if partial {
+            for list in runs {
+                for upload in &list.deferred().explicit_uploads {
+                    upload.completed();
+                }
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -1673,6 +1696,14 @@ impl HostList {
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let copies = crate::twin::at_submission(twins.values());
         drop(twins);
+        // Clone neither raw title pointers nor mutable staging state into
+        // the prelude. The deferred owners remain locked during recording.
+        let deferred = self.deferred();
+        let uploads: Vec<_> = deferred.explicit_uploads.iter()
+            .filter_map(|upload| {
+                let indices = upload.indices();
+                (!indices.is_empty()).then_some((upload, indices))
+            }).collect();
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
@@ -1688,7 +1719,7 @@ impl HostList {
                 })
             })
             .collect();
-        if barriers.is_empty() && copies.is_empty() {
+        if barriers.is_empty() && copies.is_empty() && uploads.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -1719,6 +1750,9 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                for (upload, indices) in &uploads {
+                    upload.record(list, indices);
                 }
                 list.Close()
             })
@@ -1945,6 +1979,37 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// Register a sampled texture upload only if no preceding operation
+    /// in this recording could have observed the old contents. All later
+    /// main-list barriers still begin from COPY_DEST, as for the old copy.
+    pub(crate) fn defer_first_texture_upload(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        staging: &std::sync::Arc<crate::texture::Staging>,
+    ) -> bool {
+        if !copy.sampled || copy.twin.get().is_some_and(Option::is_some) {
+            return false;
+        }
+        let mut deferred = self.deferred();
+        if deferred.copies.iter().any(|step| matches!(step, Step::Heap(_))) {
+            return false;
+        }
+        let key = std::sync::Arc::as_ptr(copy) as usize;
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let std::collections::hash_map::Entry::Vacant(entry) = states.entry(key) else {
+            return false;
+        };
+        const COPY_DEST: u32 = 0x400;
+        copy.note_used();
+        entry.insert((COPY_DEST, COPY_DEST, copy.clone()));
+        deferred.explicit_uploads.push(crate::texture::ExplicitUpload {
+            copy: copy.clone(),
+            staging: staging.clone(),
+        });
+        deferred.copies.push(Step::Texture(staging.clone()));
+        true
     }
 
     /// Keeps `object` alive until the list is reset.
