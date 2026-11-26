@@ -385,6 +385,29 @@ Diagnostics distinguish logical sampled/target allocation bytes from
 actual DXGI usage. This is allocation-time quality and headroom
 management, not physical VRAM reservation or live tiled residency.
 
+## Experimental sampled-texture residency
+
+`VICTORY_TEXTURE_RESIDENCY=1` enables an opt-in residency sweep. Under
+DXGI or configured sampled-texture budget pressure, committed sampled
+textures of at least 1 MiB that have **never exposed** their host resource
+can be evicted after two seconds and made resident synchronously before
+their first host access. Every host pointer/Arc publication and transition
+passes a per-texture residency gate. Published resources cannot be
+explicitly evicted in this renderer: existing recorded commands and
+descriptor slots may still name them. Their paging priority can instead
+be reduced after five seconds of inactivity and restored when active or
+pressure clears. Writable textures and twins are excluded. At most 128
+transitions per second are attempted; unsupported eviction falls back to
+a resident resource. Restore failure stops rather than submitting an
+unresident resource.
+
+This implements conservative eviction and OS residency priority hints,
+not the full lazy resource recreation, tile-level eviction and
+descriptor rebuilding architecture in
+[cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/resource.rs).
+Logical evicted allocation bytes are not a measured VRAM reduction.
+The default is off until validated on Windows hardware.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

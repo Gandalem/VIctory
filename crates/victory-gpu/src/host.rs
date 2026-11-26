@@ -944,6 +944,7 @@ impl Host {
         self.video_memory();
         crate::upload_pool::maintain();
         crate::texture::reclaim_idle_staging();
+        crate::residency::maintain(self);
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1637,6 +1638,7 @@ impl HostList {
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
+                copy.note_used();
                 let real = copy.state.swap(*last, Ordering::Relaxed);
                 (real != *first).then(|| {
                     transition(

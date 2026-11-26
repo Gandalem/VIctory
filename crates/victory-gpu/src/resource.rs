@@ -783,8 +783,9 @@ pub(crate) struct HostTexture {
     /// unordered access view; `None` inside if it has none.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
     /// Logical allocation size, not resident bytes.
-    bytes: u64,
-    sampled: bool,
+    pub(crate) bytes: u64,
+    pub(crate) sampled: bool,
+    pub(crate) residency: crate::residency::Residency,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
 }
@@ -817,6 +818,7 @@ impl HostTexture {
             twin: std::sync::OnceLock::new(),
             bytes,
             sampled,
+            residency: Default::default(),
             used: false.into(),
         }
     }
@@ -824,6 +826,7 @@ impl HostTexture {
     /// A list uses it: counted the first time (diagnostics of how much of
     /// the host textures' memory the GPU ever touches).
     pub(crate) fn note_used(&self) {
+        self.residency.touch();
         if !self.used.swap(true, std::sync::atomic::Ordering::Relaxed) {
             USED.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
@@ -991,6 +994,7 @@ pub(crate) mod life {
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let host = resource(this).host.as_ref()?;
+    host.residency.expose(&host.texture);
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -1005,7 +1009,9 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    let copy = resource(this).host.as_deref()?;
+    copy.residency.expose(&copy.texture);
+    Some(&copy.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1014,7 +1020,9 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    let copy = resource(this).host.clone()?;
+    copy.residency.expose(&copy.texture);
+    Some(copy)
 }
 
 /// Opt-in low-VRAM texture profile. The choice is fixed for the process:
@@ -1083,6 +1091,11 @@ fn configured_texture_budget() -> Option<u64> {
     *LIMIT.get_or_init(|| std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&v| v > 0).map(|v| v.min(65536) << 20))
+}
+
+#[cfg(windows)]
+pub(crate) fn texture_budget_pressure() -> bool {
+    configured_texture_budget().is_some_and(|limit| texture_budget_usage().0 >= limit)
 }
 
 #[cfg(windows)]
@@ -1366,6 +1379,7 @@ fn shared_texture(
             "texture allocation reduced by soft VRAM budget");
     }
     let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    crate::residency::register(&t);
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
