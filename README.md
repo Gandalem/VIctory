@@ -155,6 +155,19 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+## GPU descriptor compatibility (experimental)
+
+The runtime probes for a 2,097,152-entry shader-visible view heap; otherwise
+it selects the portable 1,000,000-entry capacity. The capacity is fixed
+before shader translation and included in shader cache keys and prebuilt
+pipeline tags. Mirrored slots, dynamic tables, persistent pairs and null
+descriptors occupy separate regions. Oversized title heaps are clipped;
+complete remapping of all oversized heaps remains unimplemented.
+
+This follows the heap capacity and cache-key design in
+[DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox/tree/f4b48ad766ddbec1a1867022cd42f7645b0dd55e),
+adapted to the earlier runtime.
+
 ## Memory retention (experimental)
 
 The idle snapshot cache is bounded by installed RAM, available physical RAM,
