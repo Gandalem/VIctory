@@ -61,6 +61,10 @@ pub(crate) struct Staging {
     tracked: Option<crate::watch::Tracked>,
     last: Mutex<Last>,
     used_ms: std::sync::atomic::AtomicU64,
+    /// Heap uploads recorded, and the subresources they
+    /// copied.
+    uploads: std::sync::atomic::AtomicU64,
+    copied: std::sync::atomic::AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -487,6 +491,22 @@ impl ExplicitUpload {
     }
 }
 
+/// The heap uploads recorded into `resource`'s host texture
+/// (tests: counts of their own texture, whatever other tests upload
+/// meanwhile).
+#[cfg(test)]
+pub(crate) fn uploads(resource: This) -> u64 {
+    let staging = crate::resource::made_copy(resource).and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    staging.map_or(0, |s| s.uploads.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The subresources those uploads copied (tests, as [`uploads`]).
+#[cfg(test)]
+pub(crate) fn copied(resource: This) -> u64 {
+    let staging = crate::resource::made_copy(resource).and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    staging.map_or(0, |s| s.copied.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// For textures shaders reach through the heap itself, at submission
 /// (`crate::bindless::uploads`): brings the staging buffer up to date and
 /// records its copy into `list` only if the memory changed since (or was
@@ -586,6 +606,8 @@ impl AheadUpload {
         let mut last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
         debug_assert!(same_pending(&self.mask, last.ready, &last.pending));
         last.acknowledge(&self.mask);
+        self.staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.staging.copied.fetch_add(self.mask.iter().filter(|&&dirty| dirty).count() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -640,6 +662,8 @@ pub(crate) fn record_heap_upload_mips(list: &HostList, resource: This, staging: 
     // refreshes, descriptor rewrites and a later full-copy request.
     last.acknowledge(&selected);
     list.keep_staging(staging);
+    staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    staging.copied.fetch_add(selected.iter().filter(|&&dirty| dirty).count() as u64, std::sync::atomic::Ordering::Relaxed);
     true
 }
 
@@ -1169,6 +1193,8 @@ fn staging_with_admission(
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
         used_ms: std::sync::atomic::AtomicU64::new(now_ms()),
+        uploads: 0.into(),
+        copied: 0.into(),
     });
     STAGING_BYTES.fetch_add(s.size, std::sync::atomic::Ordering::Relaxed);
     // A new staging allocation can supersede the digest. Never leave

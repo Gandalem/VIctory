@@ -372,11 +372,15 @@ pub(crate) fn prepare_ahead(viewed: &Arc<Viewed>) {
     let record_ready = ready_enabled() && !crate::texture::srv_ranges_enabled();
     let mut list = None;
     let mut entries: Vec<crate::texture::AheadUpload> = Vec::new();
+    let recent_only = crate::resource::eviction_enabled();
     for key in keys {
         if left == 0 || started.elapsed().as_millis() >= AHEAD_MS || ahead_pressured() {
             break;
         }
         *cursor = Some(key);
+        if !heap_upload_due(key as This, recent_only) {
+            continue;
+        }
         // The heap lock prevents resource destruction, as in uploads().
         // Oversized textures remain on the mandatory submission path.
         if let Some((bytes, staging)) = crate::texture::prepare_ahead(key as This, &mut admission, left) {
@@ -405,6 +409,12 @@ pub(crate) fn prepare_ahead(viewed: &Arc<Viewed>) {
     }
 }
 
+/// Whether a heap-viewed texture is due for refresh under the upstream
+/// recent-use rule. Do not create a host texture just to inspect its stamp.
+fn heap_upload_due(resource: This, recent_only: bool) -> bool {
+    !recent_only || crate::resource::made_copy(resource).is_some_and(|texture| texture.used_recently())
+}
+
 /// At submission, before anything else of it: the textures the heaps of its
 /// heap-indexing lists view are brought up to date, those whose title
 /// memory changed copied into their host textures by a list of ours, which
@@ -413,6 +423,14 @@ pub(crate) fn prepare_ahead(viewed: &Arc<Viewed>) {
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
 pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
+    uploads_with_recent(heaps, crate::resource::eviction_enabled())
+}
+
+/// The caller holds the submission lock. Read-mark coverage is required
+/// for the recent-only pass; the default unmarked translation keeps the
+/// previous full refresh. The explicit argument also lets tests exercise
+/// the upstream filter without changing process-wide settings.
+pub(crate) fn uploads_with_recent(heaps: &[Arc<Viewed>], recent_only: bool) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
     match &guard.0 {
@@ -444,6 +462,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
             && ready_live(ready.made.elapsed().as_millis(), true, false)
             && ready.entries.iter().all(|entry| {
                 !done.contains(&entry.key) && inner.textures.contains_key(&entry.key)
+                    && heap_upload_due(entry.key as This, recent_only)
                     && entry.revalidate(entry.key as This)
             })
         {
@@ -457,6 +476,17 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
         }
         let mut pending = Vec::with_capacity(32);
         for &r in inner.textures.keys() {
+            // Only what shaders read lately (the eviction pass's stamps):
+            // the heaps view thousands of textures a frame never reads, and
+            // bringing each up whenever its pages change re-uploaded about
+            // 4 GB in 30-46 world frames (runs evict2, noevict1).
+            // shortcut: a texture read again after a gap is brought up after
+            // the submission that read it, which can see bytes one refresh
+            // old (a slot the title rewrites is made fresh anyway); upload on
+            // the mark itself if that shows.
+            if !heap_upload_due(r as This, recent_only) {
+                continue;
+            }
             // Distinct heaps can show different MIPs of the same
             // texture. In range mode process every heap's union; the
             // pending mask avoids repeated copies of overlapping levels.
