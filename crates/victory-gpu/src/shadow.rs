@@ -540,7 +540,7 @@ impl Shadow {
     }
 
     /// Marked writes arm pages instead of retaining a full range snapshot.
-    /// Until the shader/HostList ABI is connected, existing callers use the snapshot path.
+    /// Unmarked callers continue to use the snapshot path.
     pub(crate) fn writing_marked(&self, address: usize, len: usize, marked: bool) {
         self.note_possible_gpu_write();
         self.touch_loose();
@@ -785,53 +785,59 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        if self.tracked.is_some() {
+            return self.update_tracked(from, to, !busy.is_empty());
+        }
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame). Under them, what the title
-            // wrote since it was taken (`update_busy`).
+            // gaps whole cost ~1 s per frame). Under them nothing: what the
+            // title wrote there is not known.
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 let (a, e) = (a.max(from), e.min(to));
                 if a > at {
-                    bytes += self.update_free(at, a);
-                }
-                if e > a.max(at) {
-                    bytes += self.update_busy(a.max(at), e);
+                    bytes += self.update_untracked(at, a);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_untracked(at, to);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_untracked(from, to)
     }
 
-    /// [`Shadow::update`] of `[from, to)` where a list submitted earlier
-    /// declared that shaders write. A submission waits for the one before it,
-    /// so none of this submission's shaders has run yet: the pages the title
-    /// wrote since they were taken are copied as anywhere else. Skipped, the
-    /// title's constants there stayed stale for the whole submission (a
-    /// dispatch read its sizes as zeros and looped until the device was
-    /// removed). The same bytes go into the snapshot `writing` took, so
-    /// copy-back neither takes them for the GPU's nor puts them back over a
-    /// later title write.
-    fn update_busy(&self, from: usize, to: usize) -> usize {
+    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where the
+    /// memory is tracked: the pages the title wrote since they were taken,
+    /// in one [`crate::watch::Tracked::take`], so that a page wholly in the
+    /// range is guarded even where shaders write part of it (split at those
+    /// ranges it stayed changed, and [`Shadow::copy_back_marked`] dropped
+    /// what they wrote).
+    ///
+    /// `busy`: a list submitted earlier declared that shaders write in the
+    /// range. A submission waits for the one before it, so none of this
+    /// submission's shaders has run yet: the pages the title wrote are
+    /// copied as anywhere else. Skipped, the title's constants there stayed
+    /// stale for the whole submission (a dispatch read its sizes as zeros
+    /// and looped until the device was removed). The same bytes go into the
+    /// snapshot `writing` took, so copy-back neither takes them for the
+    /// GPU's nor puts them back over a later title write.
+    fn update_tracked(&self, from: usize, to: usize, busy: bool) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let runs = t.take(from, to);
-        if runs.is_empty() {
-            return 0;
-        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
         let start = self.start as usize;
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let mut copied = 0;
-        for (a, b) in runs {
-            copied += self.copy(a, b);
+        let mut before = busy.then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut sync_before = |a: usize, b: usize| {
+            let Some(before) = &mut before else { return };
             let (a, b) = (a - start, b - start);
             for (at, bytes) in before.0.iter_mut() {
                 let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
@@ -841,31 +847,24 @@ impl Shadow {
                     bytes[s - *at..e - *at].copy_from_slice(host);
                 }
             }
+        };
+        let mut copied = 0;
+        for (a, b) in runs {
+            copied += self.copy(a, b);
+            sync_before(a, b);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::Checked, (to - from) as u64);
+            add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
         }
         copied
     }
 
-    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
-    /// shader writes: the pages changed since taken, or all of it where the
-    /// memory is not tracked.
-    fn update_free(&self, from: usize, to: usize) -> usize {
-        if let Some(t) = &self.tracked {
-            #[cfg(feature = "diagnostics")]
-            let started = std::time::Instant::now();
-            let runs = t.take(from, to);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
-            // Cut to the range: next to it shaders may be writing the copy.
-            let copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::Watches, 1);
-                add(C::Checked, (to - from) as u64);
-                add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-            }
-            return copied;
-        }
+    /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer).
+    fn update_untracked(&self, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
@@ -1026,8 +1025,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
     // SAFETY: the mapped bitmap; the GPU is done with it (one submission
     // runs at a time).
     let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
-    // Marks of offsets past the bitmap land in its last bit, no copy's.
-    bits[words - 1] = 0;
+    // The final bit alone is reserved for out-of-range offsets; other
+    // bits in this word may belong to live copies.
+    bits[words - 1] &= !(1u32 << 31);
     let mut marked = Vec::new();
     let used = (marks().end as usize).div_ceil(32).min(words);
     for (w, word) in bits[..used].iter_mut().enumerate() {
