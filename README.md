@@ -295,8 +295,13 @@ fewer than six logical CPUs and two to four otherwise. RAM pressure
 forces serial processing. Batches contain at most 32 textures and up to
 128 MiB of logical tiled read sizes; an oversized texture runs alone.
 The bound is on these temporary reads, not on all process memory.
-Texture preparation timing measures elapsed wall time. This stage does
-not yet parallelize bindless uploads or make GPU submissions asynchronous.
+Texture preparation timing measures elapsed wall time.
+
+Stage 2 uses the same workers for bindless texture preparation under the
+existing view lock, checking shared staging aliases in order. Only
+changed textures record copies. Bindless buffer coverage is the exact
+union of live descriptor ranges, cached per copy and access kind rather
+than a single enclosing hull. GPU submission remains synchronous.
 
 ## Debugging
 

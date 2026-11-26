@@ -243,17 +243,20 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// records its copy into `list` only if the memory changed since (or was
 /// never uploaded). True if it recorded; the texture is then in the copy
 /// destination state.
-pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
+pub(crate) fn prepare_heap_upload(resource: This) -> Option<Arc<Staging>> {
     if is_host_written(resource) {
-        return false;
+        return None;
     }
-    let Some(staging) = staging(resource, texture) else {
+    staging(resource, crate::resource::host_resource(resource)?)
+}
+
+/// Record only after all CPU preparation jobs have joined. The heap lock
+/// still protects the title resource; command recording stays serial.
+pub(crate) fn record_heap_upload(list: &HostList, resource: This, staging: &Staging) -> bool {
+    let Some(texture) = crate::resource::host_resource(resource) else {
         return false;
     };
-    if !staging.refresh() {
-        return false;
-    }
-    record(list, resource, texture, &staging);
+    record(list, resource, texture, staging);
     list.keep(&staging.buffer);
     true
 }
@@ -336,6 +339,9 @@ fn chunk_len(sizes: impl Iterator<Item = u64>, limit: u64, count: usize) -> usiz
 /// its existing serial hash path. Each worker owns a distinct staging
 /// mapping, and no job survives this call or a submission boundary.
 pub(crate) fn refresh_many(stagings: &[Arc<Staging>]) -> Vec<bool> {
+    if let [staging] = stagings {
+        return vec![staging.refresh()];
+    }
     use std::sync::atomic::Ordering::Relaxed;
     let started = std::time::Instant::now();
     let mut flags = Vec::with_capacity(stagings.len());

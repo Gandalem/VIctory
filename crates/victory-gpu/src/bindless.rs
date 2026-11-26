@@ -63,7 +63,37 @@ struct Inner {
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
-type Ends = (Arc<Shadow>, BTreeMap<u64, u32>, BTreeMap<u64, u32>);
+type Ends = (Arc<Shadow>, BTreeMap<u64, u32>, BTreeMap<u64, u32>, Option<Vec<(u64, u64)>>);
+
+/// Sweep the already sorted endpoint counts. Emit the exact union,
+/// preserving gaps and merging touching or overlapping intervals.
+fn exact_ranges(starts: &BTreeMap<u64, u32>, ends: &BTreeMap<u64, u32>) -> Vec<(u64, u64)> {
+    let (mut starts, mut ends) = (starts.iter().peekable(), ends.iter().peekable());
+    let (mut active, mut from) = (0i64, 0u64);
+    let mut out = Vec::new();
+    loop {
+        let a = starts.peek().map(|p| *p.0);
+        let b = ends.peek().map(|p| *p.0);
+        let at = match (a, b) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        let opened = if a == Some(at) { i64::from(*starts.next().unwrap().1) } else { 0 };
+        let closed = if b == Some(at) { i64::from(*ends.next().unwrap().1) } else { 0 };
+        let next = active + opened - closed;
+        debug_assert!(next >= 0);
+        if active == 0 && next > 0 {
+            from = at;
+        } else if active > 0 && next == 0 && from < at {
+            out.push((from, at));
+        }
+        active = next;
+    }
+    debug_assert_eq!(active, 0);
+    out
+}
 
 /// One more (`add`) or one fewer of `at` in `counts`.
 fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
@@ -93,9 +123,10 @@ impl Inner {
                     let ends = self
                         .ends
                         .entry((key.0, key.3))
-                        .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
+                        .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new(), None));
                     tally(&mut ends.1, key.1, now > 0);
                     tally(&mut ends.2, key.2, now > 0);
+                    ends.3 = None;
                     if ends.1.is_empty() {
                         self.ends.remove(&(key.0, key.3));
                     }
@@ -135,14 +166,11 @@ impl Viewed {
         if let Some(hulls) = &inner.hulls {
             return hulls.clone();
         }
-        let hulls: Vec<Hull> = inner
-            .ends
-            .iter()
-            .filter_map(|(&(_, uav), (shadow, starts, ends))| {
-                let (&from, &to) = (starts.keys().next()?, ends.keys().next_back()?);
-                Some((shadow.clone(), from, to - from, uav))
-            })
-            .collect();
+        let mut hulls = Vec::new();
+        for (&(_, uav), (shadow, starts, ends, cached)) in &mut inner.ends {
+            let ranges = cached.get_or_insert_with(|| exact_ranges(starts, ends));
+            hulls.extend(ranges.iter().map(|&(from, to)| (shadow.clone(), from, to - from, uav)));
+        }
         inner.hulls = Some(hulls.clone());
         hulls
     }
@@ -191,7 +219,6 @@ fn left_kind(view: &View) -> usize {
 /// submission shows from the next one on.
 pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
     match &guard.0 {
         // Closed by the last submission, which has run.
@@ -206,24 +233,46 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
         // Held while uploading: the title releasing a texture (and its
         // memory) waits in `forget`.
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = Vec::with_capacity(32);
         for &r in inner.textures.keys() {
             if !done.insert(r) {
                 continue;
             }
-            let Some(texture) = crate::resource::host_resource(r as This) else {
+            let Some(staging) = crate::texture::prepare_heap_upload(r as This) else {
                 continue;
             };
-            if crate::texture::upload_changed(list, r as This, texture) {
-                crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
-                recorded = true;
-                #[cfg(feature = "diagnostics")]
-                UPLOADED.fetch_add(1, Relaxed);
+            // Keep shared staging aliases in their original order.
+            if pending.len() == 32 || pending.iter().any(|(_, s)| Arc::ptr_eq(s, &staging)) {
+                recorded |= finish_uploads(list, &mut pending) != 0;
             }
+            pending.push((r, staging));
         }
+        recorded |= finish_uploads(list, &mut pending) != 0;
+        drop(inner);
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
     recorded.then_some(Uploads(guard))
+}
+
+/// Complete CPU jobs before recording changed textures in input order.
+fn finish_uploads(list: &HostList, pending: &mut Vec<(usize, Arc<crate::texture::Staging>)>) -> usize {
+    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    if pending.is_empty() {
+        return 0;
+    }
+    let staging: Vec<_> = pending.iter().map(|(_, s)| s.clone()).collect();
+    let changed = crate::texture::refresh_many(&staging);
+    let mut recorded = 0;
+    for ((r, staging), changed) in pending.drain(..).zip(changed) {
+        if changed && crate::texture::record_heap_upload(list, r as This, &staging) {
+            crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
+            recorded += 1;
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    UPLOADED.fetch_add(recorded as u64, Relaxed);
+    recorded
 }
 
 /// The upload list, used under its lock only.
@@ -468,8 +517,23 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     const LINEAR: u32 = 0x100;
 
-    /// A copy's hull is its live ranges' first start to last end, kept as
-    /// slots come and go; a copy no slot views any more has none.
+    #[test]
+    fn exact_endpoint_union_preserves_gaps_and_touching_ranges() {
+        let mut starts = BTreeMap::new();
+        let mut ends = BTreeMap::new();
+        for (a, b) in [(10, 20), (15, 30), (30, 40), (80, 90), (15, 20)] {
+            tally(&mut starts, a, true);
+            tally(&mut ends, b, true);
+        }
+        assert_eq!(exact_ranges(&starts, &ends), vec![(10, 40), (80, 90)]);
+        tally(&mut starts, 30, false);
+        tally(&mut ends, 40, false);
+        assert_eq!(exact_ranges(&starts, &ends), vec![(10, 30), (80, 90)]);
+        assert!(exact_ranges(&BTreeMap::new(), &BTreeMap::new()).is_empty());
+    }
+
+    /// A copy's exact interval union is kept as slots come and go;
+    /// a copy no slot views any more has none.
     #[test]
     fn hulls_follow_the_ranges() {
         let memory = vec![0u8; 0x1000];
@@ -495,7 +559,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         set(0, Some((0x100, 0x100)));
         set(1, Some((0x800, 0x200)));
         set(2, Some((0x100, 0x100)));
-        assert_eq!(hull(), [(0x100, 0x900)]);
+        assert_eq!(hull(), [(0x100, 0x100), (0x800, 0x200)]);
         set(1, None);
         assert_eq!(hull(), [(0x100, 0x100)], "the far range gone");
         set(0, None);
