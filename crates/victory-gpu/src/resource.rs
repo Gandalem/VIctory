@@ -1023,6 +1023,39 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
     (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
+/// Eligible independent sampled texture, whether or not another access
+/// has already materialized its host copy. The caller holds a live title
+/// resource reference. This query must not force creation.
+#[cfg(windows)]
+pub(crate) fn has_lazy_host(this: This) -> bool {
+    !this.is_null() && resource(this).host_lazy_state.is_some()
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn test_lazy_host() -> This {
+    let desc = ResourceDesc {
+        dimension: 3, alignment: 0, width: 1024, height: 1024,
+        depth_or_array_size: 1, mip_levels: 1, format: 28, sample_count: 1,
+        sample_quality: 0, layout: 0, flags: 0,
+    };
+    let properties = HeapProperties {
+        kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 0, visible_nodes: 0,
+    };
+    let memory = Memory::for_resource(footprint(&desc).unwrap(), properties.kind)
+        .unwrap_or_else(|hr| panic!("test memory allocation failed: {hr:?}"));
+    let mut r = Box::new(Resource {
+        object: Object::new(&RESOURCE_FUNCTIONS), desc, heap: properties, heap_flags: 0,
+        backing: Backing::Committed(memory), host: std::sync::OnceLock::new(),
+        host_lazy_state: None,
+    });
+    r.initialize_host(0, std::ptr::null(), true);
+    assert!(r.host.get().is_none());
+    let mut out = std::ptr::null();
+    assert_eq!(object::hand_out(RESOURCE, r, &RESOURCE_IIDS[0], &RESOURCE_IIDS, &mut out),
+        crate::object::S_OK);
+    out
+}
+
 /// The host GPU's copy of a title resource, if it has one.
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(

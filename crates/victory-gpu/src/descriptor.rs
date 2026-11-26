@@ -189,6 +189,62 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// With deferred publication, keep the title heap (including its slot
+/// backing and host bookkeeping), not just the GPU descriptor heap.
+#[cfg(windows)]
+pub(crate) struct HeldHeap(usize);
+
+#[cfg(windows)]
+impl HeldHeap {
+    pub(crate) fn new(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HeldHeap {
+    fn drop(&mut self) {
+        release(self.0 as This);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn deferred_texture_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DEFER_TEXTURE_VIEWS").as_deref() == Ok("1"))
+}
+
+/// The submitter holds its submission lock (previous GPU work has
+/// completed). Publish only heaps the new batch actually indexes, and
+/// return the closed upload list which must run before their draws.
+#[cfg(windows)]
+pub(crate) fn publish_pending(device: &crate::host::Host,
+    used: &[std::sync::Arc<crate::bindless::Viewed>]) -> Option<crate::host::HostList>
+{
+    if !deferred_texture_views() || used.is_empty() {
+        return None;
+    }
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let due: Vec<_> = heaps.iter().filter_map(|&(_, _, at)| {
+        // SAFETY: the registry lock keeps each heap alive.
+        let h = unsafe { &*(at as *const Heap) }.host.get()?.as_ref()?;
+        (used.iter().any(|v| std::sync::Arc::ptr_eq(v, &h.viewed)) && h.has_pending_views())
+            .then_some(h)
+    }).collect();
+    if due.is_empty() {
+        return None;
+    }
+    let list = device.new_list().unwrap_or_else(|e|
+        crate::host::fail(format_args!("could not allocate deferred view upload list: {e}")));
+    let mut admission = crate::upload_pool::Admission::new();
+    for h in due {
+        h.publish_pending_views(&list, &mut admission);
+    }
+    list.close();
+    Some(list)
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
@@ -448,6 +504,40 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
+}
+
+/// A short-lived pin for a shader view. A resource's destructor removes
+/// its VIEWS entries before freeing its allocation; acquiring the pin
+/// under that lock therefore cannot dereference a freed object or revive
+/// a zero-refcount resource.
+#[cfg(windows)]
+struct ShaderPin(usize);
+
+#[cfg(windows)]
+impl Drop for ShaderPin {
+    fn drop(&mut self) {
+        let this = self.0 as This;
+        object::slot::<extern "system" fn(This) -> u32>(this, 0x10)(this);
+    }
+}
+
+#[cfg(windows)]
+fn pinned_view_at(i: u32, generation: u32) -> Option<(View, Option<ShaderPin>)> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let (view, current) = views.list.get(i as usize)?;
+    if *current != generation {
+        return None;
+    }
+    let pin = match *view {
+        View::Shader(resource, _) if resource != 0 => {
+            if !object::try_add_ref(resource as This) {
+                return None;
+            }
+            Some(ShaderPin(resource))
+        }
+        _ => None,
+    };
+    Some((view.clone(), pin))
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).

@@ -71,6 +71,17 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Acquire a reference only while an external registry guarantees the
+/// object allocation still exists. Never resurrect a zero-count object
+/// whose destructor has started and is waiting to remove its records.
+#[cfg(windows)]
+pub(crate) fn try_add_ref(this: This) -> bool {
+    // SAFETY: the caller holds the registry lock that protects allocation lifetime.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n|
+        (n != 0).then(|| n.checked_add(1)).flatten()).is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
@@ -407,6 +418,19 @@ mod tests {
             S_OK
         );
         this
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_pin_never_resurrects_a_zero_count_object() {
+        static TABLE: Table<1> = Table([std::ptr::null()]);
+        let empty = Object::new(&TABLE);
+        assert!(!try_add_ref(&raw const empty));
+        let live = new_test_object();
+        assert!(try_add_ref(live));
+        let release = slot::<extern "system" fn(This) -> u32>(live, 0x10);
+        assert_eq!(release(live), 1);
+        assert_eq!(release(live), 0);
     }
 
     #[test]

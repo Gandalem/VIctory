@@ -806,6 +806,9 @@ impl State {
             self.heaps
         };
         if self.host_heaps != want {
+            for &heap in &self.heaps {
+                list.keep_title_heap(heap);
+            }
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()

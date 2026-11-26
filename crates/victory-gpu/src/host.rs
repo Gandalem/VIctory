@@ -833,6 +833,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Title heaps whose deferred slots may still need publication.
+    title_heaps: std::collections::HashMap<usize, crate::descriptor::HeldHeap>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1014,6 +1016,7 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let publishing = crate::descriptor::publish_pending(self, &heaps);
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty())
@@ -1021,10 +1024,8 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
-        let runs: Vec<&HostList> = uploads
-            .as_ref()
-            .into_iter()
-            .flat_map(|u| u.lists())
+        let runs: Vec<&HostList> = publishing.iter()
+            .chain(uploads.as_ref().into_iter().flat_map(|u| u.lists()))
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];
@@ -2015,6 +2016,15 @@ impl HostList {
         });
         deferred.copies.push(Step::Texture(staging.clone()));
         true
+    }
+
+    /// Keep descriptor records and their host slot owners until reset,
+    /// not just the shader-visible D3D12 heap object.
+    pub(crate) fn keep_title_heap(&self, heap: usize) {
+        if crate::descriptor::deferred_texture_views() && heap != 0 {
+            self.deferred().title_heaps.entry(heap)
+                .or_insert_with(|| crate::descriptor::HeldHeap::new(heap as crate::object::This));
+        }
     }
 
     /// Keeps `object` alive until the list is reset.

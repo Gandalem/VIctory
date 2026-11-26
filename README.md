@@ -337,10 +337,26 @@ identity and the complete dirty mask after a refresh. A stale batch
 falls back to normal submission-time recording without losing pending
 changes. Accepted lists run ahead of the synchronous fallback and title
 lists, with their state preludes and the existing submission fence.
-Neither switch is on by default pending Windows tests. This is
-asynchronous recording and ready-list handoff, not asynchronous GPU
-execution or delayed descriptor publication: the reference's late-wait
-and deferred descriptor architecture is still absent.
+Neither switch is on by default pending Windows tests.
+
+Experimental `VICTORY_DEFER_TEXTURE_VIEWS=1` (with
+`VICTORY_LAZY_TEXTURES=1`) ports a conservative subset of the reference's
+[deferred descriptor publication](https://github.com/fxceless/victory-fork/blob/main/crates/victory-gpu/src/descriptor/host.rs).
+Mirroring an eligible lazy committed SRV queues its slot instead of
+creating or replacing the host descriptor on the title thread. Rewrites
+of queued slots coalesce. The submitter re-reads current records of
+heaps that its lists actually index; the current resource is briefly
+pinned through the view registry and an initial upload is recorded
+before its descriptor is made. The closed publication list runs before
+the bindless refresh and title lists. Throttled or failed preparation
+leaves a dimension-correct null descriptor and retries on the next
+relevant submission. Table draws retain their eager path; other view
+types retain their existing behavior. Recorded lists retain title heap
+ownership, not just the host descriptor heap, through reset.
+Publication is still synchronous under the existing submission lock;
+it is not yet the reference's worker-owned publication or late-wait
+asynchronous GPU execution. Both options remain off by default pending
+Windows validation.
 
 ## Parallel buffer refresh
 

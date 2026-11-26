@@ -24,6 +24,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Slot records waiting for submission-time publication. All edits
+    /// take made first; no queued title resource pointer is retained.
+    pending_views: Mutex<std::collections::BTreeMap<u32, u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -178,6 +181,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            pending_views: Mutex::new(std::collections::BTreeMap::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -598,6 +602,28 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_impl(index, handle, for_draw, super::deferred_texture_views(), None)
+    }
+
+    pub(crate) fn has_pending_views(&self) -> bool {
+        !self.pending_views.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
+    /// Read the latest slot, not the stale record that originally queued
+    /// it. Rewrites and table uses may have superseded the pending work.
+    pub(crate) fn publish_pending_views(&self, list: &crate::host::HostList,
+        admission: &mut crate::upload_pool::Admission)
+    {
+        let due: Vec<_> = self.pending_views.lock().unwrap_or_else(|e| e.into_inner())
+            .iter().map(|(&index, &handle)| (index, handle)).collect();
+        for (index, handle) in due {
+            self.mirror_impl(index, handle, false, true, Some((list, admission)));
+        }
+    }
+
+    fn mirror_impl(&self, index: u32, handle: u64, for_draw: bool, defer: bool,
+        publication: Option<(&crate::host::HostList, &mut crate::upload_pool::Admission)>) -> Option<View>
+    {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -612,13 +638,53 @@ impl HostHeap {
             }
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        // Generations start at 1, so a made slot's key is never 0.
-        let key = u64::from(generation) << 32 | u64::from(i);
+        // Declare the pin before the guards so its Release runs after
+        // they unlock, including when destruction calls bindless::forget.
+        let _pin;
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        let mut pending = self.pending_views.lock().unwrap_or_else(|e| e.into_inner());
+        if publication.is_some() && pending.get(&index) != Some(&handle) {
+            return None;
+        }
+        let [tag, i, generation] = if publication.is_some() {
+            let mut record = [0u8; 12];
+            // A copied or unmapped title descriptor page can disappear.
+            // Do not dereference it directly from the submission thread.
+            if !crate::host::read_into(handle as *const u8, &mut record) {
+                if made[index as usize] != 0 {
+                    made[index as usize] = 0;
+                    self.make_null(index);
+                    self.note_address(index, None);
+                }
+                return None; // retry while the slot remains pending
+            }
+            std::array::from_fn(|i| u32::from_le_bytes(record[i * 4..i * 4 + 4].try_into().unwrap()))
+        } else {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            unsafe { (handle as *const [u32; 3]).read_unaligned() }
+        };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        let (view, pin) = if tag != VIEW_TAG {
+            (None, None)
+        } else if defer {
+            super::pinned_view_at(i, generation).map_or((None, None), |(v, p)| (Some(v), p))
+        } else {
+            (view_at(i, generation), None)
+        };
+        _pin = pin;
+        let lazy = matches!(&view, Some(View::Shader(r, _))
+            if crate::resource::has_lazy_host(*r as crate::object::This));
+        if defer && !for_draw && publication.is_none()
+            && (pending.contains_key(&index) || (lazy && made[index as usize] != key))
+        {
+            // Do not overwrite a GPU-visible slot from the title thread.
+            // Keep its prior owner until a fenced submission can settle
+            // the current record. A table draw can still make it eagerly.
+            pending.insert(index, handle);
+            return view;
+        }
         let Some(view) = view else {
+            pending.remove(&index);
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
@@ -629,6 +695,21 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            if let Some((list, admission)) = publication
+                && lazy
+                && let View::Shader(resource, _) = &view
+                && !crate::texture::prepare_deferred_view(list, *resource as crate::object::This, admission)
+            {
+                // Failed or throttled initial uploads must not expose a
+                // stale descriptor of a different texture or dimension.
+                made[index as usize] = 0;
+                null_for(&view, self.cpu(index));
+                self.keep(index, None);
+                self.set_stride(index, Some(&view));
+                self.note_address(index, Some(&view));
+                self.viewed.set(index, Some(&view), false);
+                return Some(view); // pending entry remains for retry
+            }
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -652,6 +733,7 @@ impl HostHeap {
             }
             self.keep(index, kept.flatten());
         }
+        pending.remove(&index);
         Some(view)
     }
 
@@ -1492,6 +1574,56 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_view_uses_current_record_and_publishes_after_preparing_upload() {
+        let Some(device) = host() else { return };
+        let Some(heap) = HostHeap::new(false, 2) else { return };
+        let a = crate::resource::test_lazy_host();
+        let b = crate::resource::test_lazy_host();
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        super::super::create_srv(std::ptr::null(), a, std::ptr::null(), handle);
+        heap.mirror_impl(0, handle, false, true, None);
+        assert!(!heap.made(0));
+        assert!(heap.has_pending_views());
+        // The queued resource is not retained. A rewrite and release
+        // must not materialize or publish the obsolete view.
+        super::super::create_srv(std::ptr::null(), b, std::ptr::null(), handle);
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(a, 0x10)(a);
+        let list = device.new_list().unwrap();
+        heap.publish_pending_views(&list, &mut crate::upload_pool::Admission::new());
+        if heap.has_pending_views() {
+            // Speculative admission is allowed to decline on a low-memory
+            // test machine, but it must never mark the slot made.
+            assert!(!heap.made(0));
+        } else {
+            assert!(heap.made(0));
+            assert_eq!(heap.mirror_impl(0, handle, true, true, None), Some(View::Shader(b as usize, None)));
+        }
+        list.close();
+        device.execute(&[&list]);
+        // A draw forces publication of a queued view even if a separate
+        // bindless submission never occurs. This uses the eager fallback.
+        let c = crate::resource::test_lazy_host();
+        super::super::create_srv(std::ptr::null(), c, std::ptr::null(), handle);
+        heap.mirror_impl(1, handle, false, true, None);
+        assert!(heap.has_pending_views());
+        heap.mirror_impl(1, handle, true, true, None);
+        assert!(heap.made(1));
+        // Stale queue entries may not revive a destroyed resource.
+        let mut other = [0u64; 4];
+        let h = other.as_mut_ptr() as u64;
+        super::super::create_srv(std::ptr::null(), b, std::ptr::null(), h);
+        heap.mirror_impl(0, h, false, true, None);
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(b, 0x10)(b);
+        let list = device.new_list().unwrap();
+        heap.publish_pending_views(&list, &mut crate::upload_pool::Admission::new());
+        assert!(!heap.made(0));
+        list.close();
+        device.execute(&[&list]);
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(c, 0x10)(c);
+    }
 
     #[test]
     fn structured_raw_view_preserves_byte_extent_and_alignment() {

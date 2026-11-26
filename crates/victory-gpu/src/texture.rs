@@ -460,7 +460,33 @@ pub(crate) fn prepare_heap_upload(resource: This, admission: &mut crate::upload_
     if is_host_written(resource) {
         return None;
     }
-    staging_with_admission(resource, crate::resource::host_resource(resource)?, Some(admission))
+    staging_with_admission(resource, crate::resource::host_resource(resource)?, Some(admission), true)
+}
+
+/// Prepare and record the initial image before publishing a deferred
+/// view. Admission can decline; no descriptor should be exposed then.
+/// Unlike the ordinary speculative path, obtain staging even when a
+/// reclaimed digest would have skipped the allocation.
+pub(crate) fn prepare_deferred_view(list: &HostList, resource: This,
+    admission: &mut crate::upload_pool::Admission) -> bool
+{
+    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    if is_host_written(resource) {
+        return true;
+    }
+    let Some(texture) = crate::resource::host_resource(resource) else { return false };
+    let Some(staging) = staging_with_admission(resource, texture, Some(admission), false)
+        else { return false };
+    staging.refresh_now_with(true);
+    {
+        let last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
+        if !last.ready || last.pending.len() != staging.footprints.len() {
+            return false;
+        }
+    }
+    record_heap_upload(list, resource, &staging);
+    crate::list::ensure_state(list, resource, SHADER_RESOURCE);
+    true
 }
 
 /// Bounded ahead-of-submission preparation for the optional heap
@@ -992,13 +1018,14 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// The staging state of a title texture's host texture, made on first use
 /// (one for all title textures of its memory).
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    staging_with_admission(resource, texture, None)
+    staging_with_admission(resource, texture, None, false)
 }
 
 fn staging_with_admission(
     resource: This,
     texture: &ID3D12Resource,
     admission: Option<&mut crate::upload_pool::Admission>,
+    allow_same: bool,
 ) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
@@ -1022,7 +1049,7 @@ fn staging_with_admission(
     // Only speculative heap uploads may return None for unchanged
     // GPU content. Explicit pre-recorded commands need actual staging,
     // including a full-copy fallback, so never skip those allocations.
-    if admission.is_some() && same_texture_enabled() && copy.sampled
+    if allow_same && admission.is_some() && same_texture_enabled() && copy.sampled
         && !copy.host_written.load(std::sync::atomic::Ordering::Relaxed)
         && let Some(digest) = *copy.uploaded_digest.lock().unwrap_or_else(|e| e.into_inner())
         && usize::try_from(layout.size).ok().is_some_and(|size| digest.matches(memory, size))
