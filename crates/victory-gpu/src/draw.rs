@@ -586,6 +586,13 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
+            // Fresh tables enter addresses in dynamic slots. Make the
+            // mapped address table before constructing a stage's tables.
+            if stage.view_addresses.is_some() && self.heaps[0] != 0 {
+                let _ = crate::descriptor::heap(self.heaps[0] as This)
+                    .host()
+                    .and_then(|h| h.view_addresses());
+            }
             let made = self.tables(list, &t.used, compute, t.host.view_marks);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
