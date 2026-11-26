@@ -874,6 +874,16 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is not committed"
             );
+            // Reused heap ranges do not start zeroed. Keep prior valid staging;
+            // initialize a new staging through the existing bounded scratch pool.
+            if crate::placement::enabled() && !last.ready {
+                let mut zeros = crate::shadow::pooled(size);
+                zeros.resize(size, 0);
+                zeros.fill(0);
+                let (_, changed) = self.refresh_untracked_impl(last, &zeros, false);
+                crate::shadow::give_back(zeros);
+                return (0, changed);
+            }
             return (0, false);
         }
         if checked_untracked {

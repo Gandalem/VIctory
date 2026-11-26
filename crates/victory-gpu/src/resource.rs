@@ -795,6 +795,7 @@ pub(crate) struct HostTexture {
     pub(crate) sampled: bool,
     /// Backed by tile heap leases retained by the resource itself.
     pub(crate) tiled: bool,
+    placement: Option<crate::placement::Placement>,
     pub(crate) residency: crate::residency::Residency,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
@@ -839,6 +840,7 @@ impl HostTexture {
             bytes,
             sampled,
             tiled: tile_bytes.is_some(),
+            placement: None,
             residency: Default::default(),
             used: false.into(),
         }
@@ -905,6 +907,9 @@ pub(crate) fn texture_counts() -> (u64, u64, u64, u64, u64, u64) {
 #[cfg(windows)]
 impl Drop for HostTexture {
     fn drop(&mut self) {
+        if let Some(p) = self.placement.take() {
+            crate::placement::free(self.texture.clone(), p);
+        }
         self.residency.released(self.bytes);
         TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
@@ -1601,7 +1606,51 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<(H
             return Some((HostTexture::new_with_size(texture, 0, castable_formats, Some(bytes)), false));
         }
     }
-    if !castable_formats.is_empty()
+    let mut placement = None;
+    // Heap placement is mutually exclusive with explicit residency and tiles.
+    if crate::placement::enabled() && clear_value.is_none() && !defer {
+        // SAFETY: the description has the host layout (checked size).
+        let plain = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+        if crate::placement::fits(&host.device, &plain)
+            && let Some((placed_heap, p)) = crate::placement::place(&host.device, &plain)
+        {
+            let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+            let made = match host.device.cast::<ID3D12Device10>() {
+                Ok(device) if !formats.is_empty() => {
+                    let desc1 = D3D12_RESOURCE_DESC1 {
+                        Dimension: plain.Dimension, Alignment: plain.Alignment,
+                        Width: plain.Width, Height: plain.Height,
+                        DepthOrArraySize: plain.DepthOrArraySize, MipLevels: plain.MipLevels,
+                        Format: plain.Format, SampleDesc: plain.SampleDesc,
+                        Layout: plain.Layout, Flags: plain.Flags,
+                        SamplerFeedbackMipRegion: Default::default(),
+                    };
+                    // SAFETY: the heap range fits the description; output and formats live through the call.
+                    unsafe { device.CreatePlacedResource2(&placed_heap, p.offset(), &desc1,
+                        D3D12_BARRIER_LAYOUT_COMMON, None, Some(&formats), &mut texture) }.map(|()| 0)
+                }
+                _ => {
+                    // SAFETY: the heap range fits the description and the output is ours.
+                    unsafe { host.device.CreatePlacedResource(&placed_heap, p.offset(), &plain,
+                        D3D12_RESOURCE_STATES(initial as i32), None, &mut texture) }.map(|()| initial)
+                }
+            };
+            match made {
+                Ok(state) if texture.is_some() => {
+                    if host.device.cast::<ID3D12Device10>().is_err() {
+                        castable_formats.clear();
+                    }
+                    initial = state;
+                    placement = Some(p);
+                }
+                _ => {
+                    texture = None;
+                    crate::placement::unplace(p);
+                }
+            }
+        }
+    }
+    if texture.is_none() && !castable_formats.is_empty()
         && let Ok(device) = host.device.cast::<ID3D12Device10>()
     {
         // SAFETY: the description has the host layout (checked size).
@@ -1696,7 +1745,9 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<(H
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
     let initial = crate::host::legal_state(&texture, initial);
-    Some((HostTexture::new(texture, initial, castable_formats), initially_nonresident))
+    let mut copy = HostTexture::new(texture, initial, castable_formats);
+    copy.placement = placement;
+    Some((copy, initially_nonresident))
 }
 
 /// A texture's console memory and description; `None` for buffers.

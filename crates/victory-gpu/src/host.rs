@@ -2840,6 +2840,7 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
+            let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
                 "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
                  copies between textures of one memory {:.1}/frame, depth twin copies {:.1}/frame",
@@ -2849,6 +2850,9 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
             );
+            if heaps != 0 {
+                tracing::info!(heaps, used_mib = heap_used >> 20, free_mib = heap_free >> 20, "placed texture heaps");
+            }
             #[cfg(feature = "diagnostics")]
             {
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
