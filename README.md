@@ -392,8 +392,13 @@ Numeric mip profiles without a budget keep their previous behavior.
 Required allocations are not refused to enforce a soft budget.
 
 Diagnostics distinguish logical sampled/target allocation bytes from
-actual DXGI usage. This is allocation-time quality and headroom
-management, not physical VRAM reservation or live tiled residency.
+actual DXGI usage. DXGI observations are cached for 100 ms and retain
+the last good local/non-local segment independently on query failure.
+When adaptive texture budgeting and experimental residency are enabled,
+the outstanding target reserve also triggers cold-resource residency
+maintenance before the raw DXGI usage threshold is crossed. Recovery
+requires a headroom margin (5% of budget, at most 256 MiB). This is soft
+headroom management, not physical VRAM reservation or live tiled residency.
 
 ## Experimental sampled-texture residency
 

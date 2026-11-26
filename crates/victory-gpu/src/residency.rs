@@ -109,7 +109,10 @@ pub(crate) fn maintain(host: &crate::host::Host) {
         return;
     }
     NEXT.store(now.saturating_add(1000), Relaxed);
-    let pressure = crate::host::video_memory_pressured() || crate::resource::texture_budget_pressure();
+    static BUDGET_PRESSURE: AtomicBool = AtomicBool::new(false);
+    let budget_pressure = crate::resource::texture_budget_pressure(host.video_memory(), BUDGET_PRESSURE.load(Relaxed));
+    BUDGET_PRESSURE.store(budget_pressure, Relaxed);
+    let pressure = crate::host::video_memory_pressured() || budget_pressure;
     let owners: Vec<_> = {
         let mut registry = COPIES.lock().unwrap_or_else(|e| e.into_inner());
         registry.retain(|_, copy| copy.strong_count() > 0);

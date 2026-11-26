@@ -294,6 +294,19 @@ fn next_video_pressure(was: bool, budget: u64, usage: u64, percent: u64) -> bool
     u128::from(usage) * 100 >= u128::from(budget) * u128::from(threshold)
 }
 
+// Local and non-local queries fail independently. Keep the last good
+// segment rather than losing a current local budget because the other
+// segment failed. A zero local budget is not a usable local observation.
+fn merge_video_memory(previous: Option<[u64; 4]>, local: Option<(u64, u64)>,
+    nonlocal: Option<(u64, u64)>) -> Option<[u64; 4]>
+{
+    let (budget, usage) = local.filter(|&(budget, _)| budget != 0)
+        .or_else(|| previous.map(|[b, u, ..]| (b, u)))?;
+    let (shared_budget, shared_usage) = nonlocal
+        .or_else(|| previous.map(|[_, _, b, u]| (b, u))).unwrap_or((0, 0));
+    Some([budget, usage, shared_budget, shared_usage])
+}
+
 impl Host {
     pub(crate) fn dedicated_video_memory(&self) -> Option<u64> {
         let adapter = self.adapter.as_ref()?;
@@ -304,7 +317,9 @@ impl Host {
 
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
         let mut state = self.video_budget.lock().unwrap_or_else(|e| e.into_inner());
-        if state.checked.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+        // Adapt the reference renderer's 100 ms room-query cache. A
+        // large streaming sweep may outlast a whole one-second interval.
+        if state.checked.is_some_and(|at| at.elapsed() < Duration::from_millis(100)) {
             return state.memory;
         }
         state.checked = Some(Instant::now());
@@ -312,22 +327,27 @@ impl Host {
         let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         let mut nonlocal = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         // SAFETY: the structures are valid writable DXGI outputs.
-        let ok = unsafe {
+        let local_ok = unsafe {
             adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).is_ok()
-                && adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal).is_ok()
         };
-        if !ok || local.Budget == 0 {
+        let nonlocal_ok = unsafe {
+            adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal).is_ok()
+        };
+        let memory = merge_video_memory(state.memory,
+            local_ok.then_some((local.Budget, local.CurrentUsage)),
+            nonlocal_ok.then_some((nonlocal.Budget, nonlocal.CurrentUsage)));
+        let Some([local_budget, local_usage, nonlocal_budget, nonlocal_usage]) = memory else {
             return state.memory;
-        }
-        let pressure = next_video_pressure(state.pressure, local.Budget, local.CurrentUsage, video_room_percent())
-            || next_video_pressure(state.pressure, nonlocal.Budget, nonlocal.CurrentUsage, video_room_percent());
+        };
+        let pressure = next_video_pressure(state.pressure, local_budget, local_usage, video_room_percent())
+            || next_video_pressure(state.pressure, nonlocal_budget, nonlocal_usage, video_room_percent());
         if pressure != state.pressure {
-            tracing::info!(pressure, local_budget_mib = local.Budget >> 20,
-                local_usage_mib = local.CurrentUsage >> 20, nonlocal_budget_mib = nonlocal.Budget >> 20,
-                nonlocal_usage_mib = nonlocal.CurrentUsage >> 20, "DXGI memory pressure changed");
+            tracing::info!(pressure, local_budget_mib = local_budget >> 20,
+                local_usage_mib = local_usage >> 20, nonlocal_budget_mib = nonlocal_budget >> 20,
+                nonlocal_usage_mib = nonlocal_usage >> 20, "DXGI memory pressure changed");
         }
         state.pressure = pressure;
-        state.memory = Some([local.Budget, local.CurrentUsage, nonlocal.Budget, nonlocal.CurrentUsage]);
+        state.memory = memory;
         VIDEO_PRESSURE.store(pressure, Ordering::Relaxed);
         state.memory
     }
@@ -391,6 +411,17 @@ mod tests {
         assert!(next_video_pressure(true, 100, 80, 90));
         assert!(!next_video_pressure(true, 100, 79, 90));
         assert!(next_video_pressure(false, 80, 75, 90));
+    }
+
+    #[test]
+    fn dxgi_keeps_each_last_good_segment_independently() {
+        assert_eq!(merge_video_memory(None, None, Some((100, 50))), None);
+        assert_eq!(merge_video_memory(None, Some((100, 20)), None), Some([100, 20, 0, 0]));
+        let old = Some([100, 20, 200, 30]);
+        assert_eq!(merge_video_memory(old, Some((80, 75)), None), Some([80, 75, 200, 30]));
+        assert_eq!(merge_video_memory(old, None, Some((150, 60))), Some([100, 20, 150, 60]));
+        assert_eq!(merge_video_memory(old, Some((0, 0)), Some((0, 0))), Some([100, 20, 0, 0]));
+        assert_eq!(merge_video_memory(old, None, None), old);
     }
 
     #[test]

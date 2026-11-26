@@ -1094,8 +1094,29 @@ fn configured_texture_budget() -> Option<u64> {
 }
 
 #[cfg(windows)]
-pub(crate) fn texture_budget_pressure() -> bool {
-    configured_texture_budget().is_some_and(|limit| texture_budget_usage().0 >= limit)
+pub(crate) fn texture_budget_pressure(video: Option<[u64; 4]>, was: bool) -> bool {
+    let (sampled, targets) = texture_budget_usage();
+    let limit = configured_texture_budget();
+    // Keep explicit budget enforcement, and connect the target reserve
+    // used by adaptive allocation to residency even before DXGI's raw
+    // usage threshold is crossed. Hysteresis avoids priority oscillation.
+    let reserve = if adaptive_texture_budget() { configured_target_reserve() } else { 0 };
+    budget_pressure(limit, video.filter(|_| adaptive_texture_budget()), sampled, targets,
+        reserve, crate::host::video_room_percent(), was)
+}
+
+#[cfg(windows)]
+fn budget_pressure(limit: Option<u64>, video: Option<[u64; 4]>, sampled: u64,
+    targets: u64, reserve: u64, percent: u64, was: bool) -> bool
+{
+    let margin = |budget: u64| if was { (budget / 20).min(256 << 20) } else { 0 };
+    if limit.is_some_and(|limit| sampled >= limit.saturating_sub(margin(limit))) {
+        return true;
+    }
+    video.filter(|v| v[0] != 0).is_some_and(|v| {
+        let room = sampled_room(None, Some(v), sampled, targets, reserve, percent);
+        if was { room <= margin(v[0]) } else { room == 0 }
+    })
 }
 
 #[cfg(windows)]
@@ -2482,6 +2503,22 @@ mod tests {
         assert_eq!(sampled_room(Some(1500 * mb), video, 1000 * mb, 500 * mb, 2000 * mb, 90), 500 * mb);
         assert_eq!(sampled_room(None, video, 6000 * mb, 2000 * mb, 2000 * mb, 90), 0);
         assert_eq!(sampled_room(Some(1024 * mb), None, 512 * mb, 0, 3072 * mb, 90), 512 * mb);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reserved_target_room_triggers_pressure_before_raw_dxgi_limit() {
+        let mb = 1u64 << 20;
+        let video = Some([8000 * mb, 6000 * mb, 0, 0]);
+        assert!(budget_pressure(None, video, 5000 * mb, 500 * mb, 2000 * mb, 90, false));
+        assert!(!budget_pressure(None, video, 5000 * mb, 1500 * mb, 2000 * mb, 90, false));
+        let near = Some([8000 * mb, 6000 * mb, 0, 0]);
+        assert!(!budget_pressure(None, near, 5000 * mb, 500 * mb, 1500 * mb, 90, false));
+        assert!(budget_pressure(None, near, 5000 * mb, 500 * mb, 1500 * mb, 90, true));
+        assert!(!budget_pressure(None, None, 9000 * mb, 0, 2000 * mb, 90, false));
+        assert!(budget_pressure(Some(1000 * mb), None, 1000 * mb, 0, 0, 90, false));
+        assert!(budget_pressure(Some(1000 * mb), None, 980 * mb, 0, 0, 90, true));
+        assert!(!budget_pressure(Some(1000 * mb), None, 940 * mb, 0, 0, 90, true));
     }
 
     #[cfg(windows)]
