@@ -381,6 +381,20 @@ impl HostHeap {
     /// (both multiples of 4), which it holds; a null one for no buffer, or
     /// for unordered access to a buffer shaders cannot write.
     pub(crate) fn raw_view_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool) {
+        self.raw_view_with_owner(index, buffer, first, bytes, uav, None);
+    }
+
+    pub(crate) fn raw_shadow_at(&self, index: u32, shadow: &std::sync::Arc<crate::shadow::Shadow>, bytes: u64, uav: bool) {
+        if uav {
+            shadow.note_possible_gpu_write();
+        }
+        let owner = shadow.is_loose().then(|| shadow.clone());
+        self.raw_view_with_owner(index, Some(&shadow.buffer), 0, bytes, uav, owner);
+    }
+
+    fn raw_view_with_owner(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool,
+        owner: Option<std::sync::Arc<crate::shadow::Shadow>>)
+    {
         let Some(host) = host() else { return };
         let writable = |b: &ID3D12Resource| {
             // SAFETY: a live buffer.
@@ -428,7 +442,7 @@ impl HostHeap {
                     .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index));
             }
         }
-        self.keep(index, buffer.map(|b| (b.clone(), None)));
+        self.keep(index, buffer.map(|b| (b.clone(), owner)));
         self.write_stride(index, 4);
     }
 
@@ -486,8 +500,8 @@ impl HostHeap {
             // one of its shaders may hold the old descriptor (or read the
             // slot at an index from wrong data): what it views is freed
             // only once that work has run.
-            if let Some((old, _)) = old {
-                crate::host::retire(old);
+            if let Some((old, owner)) = old {
+                crate::host::retire(old, owner);
             }
         }
     }
@@ -897,8 +911,8 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 }
 
 /// The host resource a slot made by [`make`] views, if any, and the view's
-/// own copy of title memory ([`crate::shadow::for_view`]): the slot holds
-/// it, so that draws reading the view find and refresh that copy.
+/// own or loose copy of title memory: the slot holds it, so draws find
+/// and refresh that exact copy, including across idle-window sweeps.
 type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>)>;
 
 /// Buffer views refused so far (diagnostics: the first are logged).
@@ -959,7 +973,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((shadow.buffer.clone(), (own || shadow.is_loose()).then_some(shadow))))
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -1003,6 +1017,7 @@ fn buffer_uav(
     let structured = buffer.StructureByteStride > 0;
     let raw = structured || buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
     let (shadow, own) = crate::shadow::for_view(start, bytes, view_alignment(raw, element))?;
+    shadow.note_possible_gpu_write();
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1031,7 +1046,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((shadow.buffer.clone(), (own || shadow.is_loose()).then_some(shadow))))
 }
 
 /// Whether the host can make a shader (or unordered access) view of

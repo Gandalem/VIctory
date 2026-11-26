@@ -16,7 +16,8 @@
 //! themselves, every buffer range the heap's views reach
 //! (`crate::bindless`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -42,6 +43,11 @@ pub(crate) struct Shadow {
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
     before: Mutex<Snapshot>,
+    loose: bool,
+    // GPU-only changes cannot always be reconstructed from title memory.
+    may_have_gpu_writes: AtomicBool,
+    used_ms: AtomicU64,
+    used_submission: AtomicU64,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -251,7 +257,7 @@ pub(crate) fn cache_stats() -> (usize, usize, usize, usize, u64) {
         (pool.buffers.len(), pool.bytes, pool.limit)
     };
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    (count, bytes, limit, loose.len(), loose.values().map(|s| s.len).sum())
+    (count, bytes, limit, loose.live.len(), loose.live.values().map(|s| s.len).sum())
 }
 
 /// Merge a completed (waited-for) GPU submission. Compare blocks first:
@@ -413,6 +419,27 @@ impl Shadow {
             tracked: crate::watch::track(start as usize, len as usize, true),
             pending: Mutex::default(),
             before: Mutex::default(),
+            loose: false,
+            may_have_gpu_writes: AtomicBool::new(false),
+            used_ms: AtomicU64::new(loose_now_ms()),
+            used_submission: AtomicU64::new(LOOSE_SUBMISSIONS.load(Relaxed)),
+        }
+    }
+
+    pub(crate) fn is_loose(&self) -> bool {
+        self.loose
+    }
+
+    pub(crate) fn note_possible_gpu_write(&self) {
+        if self.loose {
+            self.may_have_gpu_writes.store(true, Relaxed);
+        }
+    }
+
+    fn touch_loose(&self) {
+        if self.loose {
+            self.used_ms.fetch_max(loose_now_ms(), Relaxed);
+            self.used_submission.fetch_max(LOOSE_SUBMISSIONS.load(Relaxed), Relaxed);
         }
     }
 
@@ -433,6 +460,7 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.note_possible_gpu_write();
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -445,6 +473,8 @@ impl Shadow {
     /// heap), in reused memory (fresh snapshots cost ~2.3 million page
     /// faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        self.note_possible_gpu_write();
+        self.touch_loose();
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -589,6 +619,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.touch_loose();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -795,20 +826,114 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
+/// Read-only idle windows may be released by the opt-in submission sweep.
 const WINDOW: u64 = 4 << 20;
+const LOOSE_SWEEP_MAX: usize = 128;
+static LOOSE_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+static LOOSE_NEXT_SWEEP: AtomicU64 = AtomicU64::new(0);
 
-/// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+struct LooseCache {
+    live: BTreeMap<(u64, u64), Arc<Shadow>>,
+    // Address metadata only: the old all-address page table must be able
+    // to rediscover a previously seen window, even without a fresh find.
+    dormant: BTreeSet<(u64, u64)>,
+}
+
+static LOOSE: Mutex<LooseCache> = Mutex::new(LooseCache {
+    live: BTreeMap::new(),
+    dormant: BTreeSet::new(),
+});
+
+fn loose_now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+pub(crate) fn loose_reclaim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RECLAIM_LOOSE").as_deref() == Ok("1"))
+}
+
+fn loose_idle(owners: usize, age_ms: u64, age_submissions: u64, pressure: bool, writable: bool) -> bool {
+    owners == 1 && !writable && age_submissions >= 4 && age_ms >= if pressure { 1000 } else { 10000 }
+}
+
+impl LooseCache {
+    fn take_idle(&mut self, now: u64, submission: u64, pressure: bool) -> Vec<Arc<Shadow>> {
+        let keys: Vec<_> = self.live.iter().filter(|(_, s)| {
+            loose_idle(Arc::strong_count(s), now.saturating_sub(s.used_ms.load(Relaxed)),
+                submission.saturating_sub(s.used_submission.load(Relaxed)), pressure,
+                s.may_have_gpu_writes.load(Relaxed))
+                && crate::host::resource_references(&s.buffer) == 1
+                && s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                && s.before.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty()
+        }).take(LOOSE_SWEEP_MAX).map(|(key, _)| *key).collect();
+        let mut gone = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(copy) = self.live.remove(&key) {
+                self.dormant.insert(key);
+                gone.push(copy);
+            }
+        }
+        gone
+    }
+
+    fn get_or_make(&mut self, key: (u64, u64)) -> Option<(Arc<Shadow>, bool)> {
+        if let Some(shadow) = self.live.get(&key) {
+            shadow.touch_loose();
+            return Some((shadow.clone(), false));
+        }
+        let shadow = new_loose(key.0, key.1)?;
+        self.dormant.remove(&key);
+        self.live.insert(key, shadow.clone());
+        Some((shadow, true))
+    }
+}
+
+/// Adapt cool_fox's loose-window sweep to the older synchronous renderer.
+/// The map lock serializes lookup against removal. A descriptor slot or
+/// unreset list owns the Shadow; page-table and potentially GPU-written
+/// windows are pinned even after their owners disappear. The COM count
+/// is an additional conservative veto, not the lifetime proof.
+pub(crate) fn reclaim_idle_loose() {
+    if !loose_reclaim_enabled() {
+        return;
+    }
+    let submission = LOOSE_SUBMISSIONS.fetch_add(1, Relaxed).saturating_add(1);
+    let now = loose_now_ms();
+    let next = LOOSE_NEXT_SWEEP.load(Relaxed);
+    if now < next || LOOSE_NEXT_SWEEP.compare_exchange(next, now.saturating_add(1000), Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let pressure = memory_pressured() || crate::host::video_memory_pressured();
+    let gone = {
+        let Ok(mut cache) = LOOSE.try_lock() else { return };
+        let gone = cache.take_idle(now, submission, pressure);
+        if !gone.is_empty() {
+            changed();
+        }
+        gone
+    };
+    if !gone.is_empty() {
+        let bytes: u64 = gone.iter().map(|s| s.len).sum();
+        tracing::debug!(windows = gone.len(), bytes, pressure, "released idle read-only loose shadows");
+    }
+    drop(gone);
+}
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
-        return Some(shadow.clone());
+    let len = end.checked_next_multiple_of(WINDOW)?.checked_sub(start)?;
+    let key = (start, len);
+    let mut cache = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let (shadow, made) = cache.get_or_make(key)?;
+    if made {
+        changed();
     }
+    Some(shadow)
+}
+
+fn new_loose(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
@@ -818,10 +943,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         len,
         "loose memory copied to the host"
     );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
-    map.insert((start, len), shadow.clone());
-    changed();
-    Some(shadow)
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.loose = true;
+    Some(Arc::new(shadow))
 }
 
 /// The copy a buffer view of `len` bytes at `address`, whose elements are
@@ -908,10 +1032,33 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 /// Every host copy of title memory made so far (buffers and windows).
+#[cfg(feature = "diagnostics")]
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).live.values().cloned());
     all
+}
+
+/// A shader may compute an address without an explicit CPU-side lookup.
+/// Restore any dormant window before rebuilding the all-address table;
+/// thereafter pin these windows because its GPU writes are not necessarily
+/// reconstructible. An allocation failure must not publish a partial
+/// address space as if the reclaimed windows did not exist.
+pub(crate) fn all_for_page_table() -> Option<Vec<Arc<Shadow>>> {
+    let mut all: Vec<_> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    let mut cache = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let dormant: Vec<_> = cache.dormant.iter().copied().collect();
+    for (start, len) in dormant {
+        let shadow = new_loose(start, len)?;
+        cache.live.insert((start, len), shadow);
+        cache.dormant.remove(&(start, len));
+        changed();
+    }
+    for shadow in cache.live.values() {
+        shadow.note_possible_gpu_write();
+        all.push(shadow.clone());
+    }
+    Some(all)
 }
 
 /// For device-removed reports: the copy of title memory whose host range
@@ -925,7 +1072,7 @@ pub(crate) fn near(va: u64) -> String {
         LOOSE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .values()
+            .live.values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
     let below = all.iter().filter(|c| c.0 <= va).max();
@@ -949,6 +1096,59 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loose_sweep_requires_idle_unowned_read_only_windows() {
+        assert!(!loose_idle(1, 9999, 4, false, false));
+        assert!(loose_idle(1, 10000, 4, false, false));
+        assert!(!loose_idle(1, 999, 4, true, false));
+        assert!(loose_idle(1, 1000, 4, true, false));
+        assert!(!loose_idle(1, 10000, 3, true, false));
+        assert!(!loose_idle(2, 10000, 4, true, false));
+        assert!(!loose_idle(1, 10000, 4, true, true));
+    }
+
+    #[test]
+    fn loose_cache_recreates_read_only_windows_but_keeps_live_and_writable_ones() {
+        use crate::watch::tests as pools;
+        let Some(_host) = host() else { return };
+        // An isolated cache, so this test never sweeps another test's
+        // title memory or depends on a process-global environment flag.
+        let p = pools::pool(1);
+        let key = (p as u64, PAGE as u64);
+        let mut cache = LooseCache { live: BTreeMap::new(), dormant: BTreeSet::new() };
+        // SAFETY: the test owns the mapped page.
+        unsafe { (p as *mut u8).write_bytes(0x31, PAGE) };
+        let (copy, made) = cache.get_or_make(key).unwrap();
+        assert!(made);
+        assert_eq!(copy.update(p, PAGE), PAGE);
+        assert_eq!(copy.read_host(p as u64, 1), [0x31313131]);
+        let now = copy.used_ms.load(Relaxed).saturating_add(10000);
+        let sub = copy.used_submission.load(Relaxed).saturating_add(4);
+        assert!(cache.take_idle(now, sub, false).is_empty());
+        let com = copy.buffer.clone();
+        drop(copy);
+        assert!(cache.take_idle(now, sub, false).is_empty());
+        drop(com);
+        let gone = cache.take_idle(now, sub, false);
+        assert_eq!(gone.len(), 1);
+        assert!(cache.dormant.contains(&key));
+        drop(gone);
+        // SAFETY: the same test-owned page is still live.
+        unsafe { (p as *mut u8).write_bytes(0x72, PAGE) };
+        let (copy, made) = cache.get_or_make(key).unwrap();
+        assert!(made);
+        assert!(cache.dormant.is_empty());
+        assert_eq!(copy.update(p, PAGE), PAGE);
+        assert_eq!(copy.read_host(p as u64, 1), [0x72727272]);
+        copy.note_possible_gpu_write();
+        let now = copy.used_ms.load(Relaxed).saturating_add(10000);
+        let sub = copy.used_submission.load(Relaxed).saturating_add(4);
+        drop(copy);
+        assert!(cache.take_idle(now, sub, true).is_empty());
+        drop(cache);
+        pools::free(p);
+    }
 
     #[test]
     fn memory_pressure_requires_both_reserves_to_recover() {

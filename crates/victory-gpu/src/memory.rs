@@ -277,7 +277,9 @@ impl Shared {
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
-        let copies = crate::shadow::all();
+        let copies = crate::shadow::all_for_page_table().unwrap_or_else(|| {
+            crate::host::fail(format_args!("could not restore a reclaimed title-memory window before page table publication"))
+        });
         let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|copy, &mut slot| {
             let keep = live.contains(copy);

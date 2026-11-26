@@ -793,7 +793,7 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
-        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        host.raw_shadow_at(index, &shadow, shadow.range().1 & !3, uav);
         self.root_slots.insert((key, copy, uav), index);
         Some((index, offset))
     }

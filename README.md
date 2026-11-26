@@ -246,9 +246,20 @@ Diagnostics report a `memory cache census` with working set, private commit,
 physical and commit headroom, pressure state, idle CPU buffer bytes/budget,
 logical staging bytes and the count/logical size of loose shadows. The
 logical shadow sizes are not measurements of physical RAM or VRAM residency.
-This change does not yet reclaim loose shadows: they may be referenced by
-persistent descriptors and page tables. Validate on identical synthetic or
-legally supplied workloads before drawing performance conclusions.
+Experimental `VICTORY_RECLAIM_LOOSE=1` adapts cool_fox's idle-window
+reclamation. Between synchronous submissions, at most 128 read-only
+loose windows are reclaimed per one-second sweep if the map is their sole
+owner, no other COM references or pending snapshots remain, and they have
+been idle for four submissions and ten seconds (one second under RAM/DXGI
+pressure). Descriptor slots and retired descriptors retain loose Shadow
+owners through the relevant fence. Potentially GPU-written windows and
+windows published to the all-address page table stay pinned: their prior
+contents might not be reconstructible. Dormant address metadata permits
+rebuilding a reclaimed window on lookup or before page-table publication;
+a failed restoration stops rather than publishing a partial address space.
+The option is off by default until Windows validation. This does not
+reclaim every live or GPU-authored window. Validate on identical synthetic
+or legally supplied workloads before drawing performance conclusions.
 
 The pressure-aware retention policy is informed by the RAM cache pressure
 handling in [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)

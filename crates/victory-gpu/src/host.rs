@@ -984,6 +984,7 @@ impl Host {
         crate::shadow::maintain_snapshot_pool();
         self.video_memory();
         crate::upload_pool::maintain();
+        crate::shadow::reclaim_idle_loose();
         crate::texture::reclaim_idle_staging();
         crate::residency::maintain(self);
         let started = std::time::Instant::now();
@@ -3103,14 +3104,27 @@ impl Host {
 
 /// Host resources that view heap slots stopped viewing while a submission
 /// may have been running ([`retire`]).
-static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+type Retired = (ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>);
+static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
+
+/// Extra advisory veto for the idle-shadow sweep. Actual ownership is
+/// provided by the map, lists, descriptor slots and the retired queue.
+pub(crate) fn resource_references(resource: &ID3D12Resource) -> u32 {
+    // SAFETY: a live COM resource; balance our temporary reference.
+    unsafe {
+        let raw = resource.as_raw();
+        let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+        ((**unknown).AddRef)(raw);
+        ((**unknown).Release)(raw)
+    }
+}
 
 /// Keeps `resource` alive until the GPU work running now (or the next
 /// submission's) has run: title threads rewrite view heap slots while the
 /// GPU runs, and a shader that took the old descriptor still reads what it
 /// views.
-pub(crate) fn retire(resource: ID3D12Resource) {
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+pub(crate) fn retire(resource: ID3D12Resource, shadow: Option<std::sync::Arc<crate::shadow::Shadow>>) {
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((resource, shadow));
 }
 
 /// After a submission has run, with none running: the retired resources go.
