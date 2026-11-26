@@ -2865,6 +2865,47 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// castable pair shares one host texture (no copy), a pair of other
     /// shapes over the same bytes (block-compressed against plain) is two,
     /// bridged by a copy at the read.
+    /// A texture fed from title memory given up (`resource::evict`) while a
+    /// recorded list names it: the list still reads it, and the next use
+    /// makes it again with its bytes from title memory.
+    #[test]
+    fn a_texture_given_up_is_made_again_with_its_bytes_and_recorded_lists_keep_it() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = crate::watch::tests::pool(1) as u64;
+        let object = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 0));
+        // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(desc));
+        let record = || {
+            slots.make(0, &view);
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view);
+            run(&list, &slots, &read, 0, Some(&out), (8, 8));
+            list.close();
+            list
+        };
+        // SAFETY: inside the mapped output.
+        let texel = || unsafe { (data as *const [f32; 4]).read() }[0];
+        let list = record();
+        assert!(crate::resource::give_up_now(object), "fed from title memory");
+        assert!(crate::resource::made_copy(object).is_none(), "its title texture let go");
+        host.execute(&[&list]);
+        assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "the recorded list read it");
+        // SAFETY: inside the mapped output.
+        unsafe { std::ptr::write_bytes(data, 0, 16) };
+        let list = record();
+        host.execute(&[&list]);
+        assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "made again with its bytes");
+        assert!(crate::resource::made_copy(object).is_some(), "a host copy exists after the next read");
+    }
+
     #[test]
     fn a_texture_written_in_one_format_reads_in_another_through_a_placed_view() {
         let Some(host) = crate::host::host() else {

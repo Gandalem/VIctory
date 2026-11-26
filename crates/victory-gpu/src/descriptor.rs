@@ -258,7 +258,9 @@ pub(crate) fn publish_pending(device: &crate::host::Host,
 /// read marks if the cap is reached.
 #[cfg(windows)]
 pub(crate) fn make_read(slots: &[u32]) {
-    if crate::resource::PLACED_BYTES.load(std::sync::atomic::Ordering::Relaxed) >= PLACED_CAP {
+    if !crate::resource::eviction_enabled()
+        && crate::resource::PLACED_BYTES.load(std::sync::atomic::Ordering::Relaxed) >= PLACED_CAP
+    {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!("placed textures reached their cap: views shaders read now stay null"));
         return;
@@ -299,6 +301,20 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
         }
     }
     textures
+}
+
+/// Every shader-visible view heap's slots viewing one of the host textures
+/// `textures` (raw pointers) are left null, made again when read
+/// (`crate::resource::evict` gives those textures up).
+pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
+            host.evict(textures);
+        }
+    }
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at

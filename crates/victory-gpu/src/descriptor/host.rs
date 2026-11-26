@@ -33,6 +33,9 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
+    /// The slots each kept texture is viewed in (by its raw pointer), for
+    /// textures given up ([`HostHeap::evict`]).
+    by_texture: Mutex<std::collections::HashMap<usize, Vec<u32>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -204,6 +207,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             pending_views: Mutex::new(std::collections::BTreeMap::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
+            by_texture: Mutex::default(),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end,
@@ -574,6 +578,23 @@ impl HostHeap {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             let old = std::mem::replace(slot, resource);
+            // Textures (views without a copy of title memory) by slot.
+            let raw = |k: &Kept| k.as_ref().filter(|k| k.1.is_none()).map(|k| windows::core::Interface::as_raw(&k.0) as usize);
+            let (was, now) = (raw(&old), raw(slot));
+            if was != now {
+                let mut by = self.by_texture.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(was) = was
+                    && let Some(slots) = by.get_mut(&was)
+                {
+                    slots.retain(|&i| i != index);
+                    if slots.is_empty() {
+                        by.remove(&was);
+                    }
+                }
+                if let Some(now) = now {
+                    by.entry(now).or_default().push(index);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((old, _)) = &old
                 && !self.sampler
@@ -839,7 +860,7 @@ impl HostHeap {
             return None;
         };
         let needs_remake = || {
-            if !for_draw || !is_placed_texture(&view) {
+            if !for_draw || !is_texture(&view) {
                 return false;
             }
             let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
@@ -933,6 +954,33 @@ impl HostHeap {
         Some(text)
     }
 
+    /// Slots viewing one of the host textures `textures` (raw pointers),
+    /// which are given up: each gets a null view of its kind and holds the
+    /// texture no more (retired until the running submission has run), its
+    /// record stays noted so heap syncs leave it, and the next draw reading
+    /// it through a table or shader reading it through the heap (its read
+    /// mark, cleared) makes it again.
+    pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
+        let slots: Vec<u32> = {
+            let by = self.by_texture.lock().unwrap_or_else(|e| e.into_inner());
+            textures.iter().filter_map(|t| by.get(t)).flatten().copied().collect()
+        };
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        for index in slots.into_iter().filter(|&i| i < self.count) {
+            let key = made.get(index as usize).copied().unwrap_or(0);
+            let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+            match &view {
+                Some(v) => null_for(v, self.cpu(index)),
+                None => null_view(self.cpu(index)),
+            }
+            self.keep(index, None);
+            if index < self.count {
+                self.viewed.set(index, view.as_ref(), false);
+                crate::shadow::forget_read(index);
+            }
+        }
+    }
+
     /// The host textures (raw pointers) slots `slots` view.
     pub(crate) fn textures_at(&self, slots: &[u32]) -> Vec<usize> {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -962,6 +1010,12 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
         self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+    }
+
+    /// Whether slot `index` holds a host view of a resource (tests).
+    #[cfg(test)]
+    pub(crate) fn kept(&self, index: u32) -> bool {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
     }
 }
 
@@ -1659,6 +1713,13 @@ fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }
 
+/// Whether `view` is a shader view of a texture (one placed in memory, or a
+/// resource object's): such a slot left null is made when read.
+fn is_texture(view: &View) -> bool {
+    is_placed_texture(view)
+        || matches!(view, View::Shader(r, _) if crate::resource::texture_memory(*r as crate::object::This).is_some())
+}
+
 /// A view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
@@ -1903,6 +1964,41 @@ mod tests {
         desc[10] = va as u32;
         desc[11] = (va >> 32) as u32;
         desc
+    }
+
+    /// A slot viewing a texture given up (`crate::resource::evict`) holds it
+    /// no more: heap syncs pass it by, a draw reading it through a table
+    /// makes it again.
+    #[test]
+    fn a_slot_viewing_a_texture_given_up_is_made_again_when_read() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        // A 4x1 RGBA8 texture, linear, in memory of its own, and a 2D view.
+        let address = placed_memory();
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        crate::descriptor::create_placed_srv(null, &words, &view, title_heap.start);
+        let host = title_heap.host().expect("a host view heap");
+        assert!(host.mirror(0, title_heap.start, true).is_some());
+        assert!(host.kept(0), "made for the draw");
+        let texture = crate::resource::texture_at(address, &words).expect("its resource");
+        assert!(crate::resource::give_up_now(texture));
+        assert!(!host.kept(0), "the slot holds it no more");
+        assert!(host.made(0), "its record stays noted");
+        assert!(host.mirror(0, title_heap.start, false).is_some());
+        assert!(!host.kept(0), "heap syncs pass it by");
+        assert!(host.mirror(0, title_heap.start, true).is_some());
+        assert!(host.kept(0), "made again for the draw");
+        assert!(crate::resource::made_copy(texture).is_some(), "with a host texture again");
     }
 
     #[test]

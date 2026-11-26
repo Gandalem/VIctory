@@ -487,6 +487,70 @@ mod tests {
         }
     }
 
+    /// The idle rule against the heap reads that thrashed (run evict1): a
+    /// texture shaders read through the heap in every frame stays over more
+    /// frames and time than the idle limits; one read once is given up. A
+    /// list of the title's naming a texture (a table read, a copy) stamps it
+    /// as used; a list of ours (uploads) does not.
+    #[test]
+    fn textures_read_every_frame_stay_and_title_lists_stamp_theirs() {
+        let Some(host) = host() else { return };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let step = 32;
+        // Two 4x1 RGBA8 textures, linear, in memory of their own, viewed at
+        // slots 5 and 6.
+        let memory = Box::leak(vec![0u8; 1 << 17].into_boxed_slice());
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let heap_host = title_heap.host().expect("a host view heap");
+        let textures: Vec<crate::object::This> = [5u32, 6]
+            .iter()
+            .map(|&slot| {
+                let address = memory.as_ptr() as u64 + u64::from(slot) * (1 << 13);
+                let mut view = [0u32; 16];
+                view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+                (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+                let at = title_heap.start + u64::from(slot) * step;
+                crate::descriptor::create_placed_srv(null, &words, &view, at);
+                assert!(heap_host.mirror(slot, at, true).is_some());
+                crate::resource::texture_at(address, &words).expect("its resource")
+            })
+            .collect();
+        let owned: Vec<_> = textures.iter().map(|&t| crate::resource::owned(t).expect("may be given up")).collect();
+        let (idle_frames, idle_ms) = (crate::resource::IDLE_FRAMES, crate::resource::IDLE_MS);
+        {
+            // No submission takes the marks meanwhile.
+            let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            // Passes a third of the idle limits apart, over three times them.
+            for k in 0..10 {
+                crate::shadow::tests::mark_read(5);
+                if k == 0 {
+                    crate::shadow::tests::mark_read(6);
+                }
+                let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
+                crate::resource::evict_among(&owned, &read, 1000 + k * idle_frames / 3, 1_000_000 + k * idle_ms / 3, 0);
+                assert!(crate::resource::made_copy(textures[0]).is_some(), "read every frame: stays (frame {k})");
+            }
+        }
+        assert!(crate::resource::made_copy(textures[1]).is_none(), "read once: given up");
+        drop(owned);
+        // A title list naming the texture stamps it, an upload list does not.
+        let copy = crate::resource::host_copy(textures[0]).unwrap();
+        for (ours, stamped) in [(true, false), (false, true)] {
+            copy.unstamp();
+            let list = host.new_list().unwrap();
+            if ours {
+                list.set_ours();
+            }
+            let _ = list.transition(textures[0], 0x40);
+            assert_eq!(copy.last_used().0 != u64::MAX, stamped, "ours: {ours}");
+        }
+    }
+
     #[test]
     fn title_lists_stamp_textures_but_upload_lists_do_not() {
         let Some(host) = host() else { return };
@@ -1067,7 +1131,11 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        crate::resource::stamp_heap_reads();
+        if crate::resource::eviction_enabled() {
+            crate::resource::evict_unused(self);
+        } else {
+            crate::resource::stamp_heap_reads();
+        }
         crate::shadow::maintain_snapshot_pool();
         self.video_memory();
         crate::bindless::maintain_ready();
