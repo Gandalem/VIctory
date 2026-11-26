@@ -303,6 +303,19 @@ changed textures record copies. Bindless buffer coverage is the exact
 union of live descriptor ranges, cached per copy and access kind rather
 than a single enclosing hull. GPU submission remains synchronous.
 
+## Parallel buffer refresh
+
+Independent host buffer copies share the bounded preparation worker
+pool when four or more copies are pending; ranges of one copy stay on
+one worker. This follows the separate-copy refresh and flush_one approach
+in [cool_fox host.rs](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/host.rs).
+Before a shader-write snapshot, only the corresponding buffer must be
+refreshed. Other pending copies stay batched until a memory write or
+submission barrier. All worker jobs join before the GPU executes.
+`VICTORY_TEXTURE_WORKERS=1` disables parallel preparation of both buffers
+and textures; RAM pressure also selects serial processing. Timing counts
+elapsed wall time. GPU copy-back is still synchronous.
+
 ## Idle GPU upload reuse and allocation recovery
 
 Texture upload buffers use a bounded spare cache, adapted from

@@ -288,8 +288,10 @@ fn merge_waited_piece(host: &mut [u8], old: &[u8], title: &mut [u8]) -> bool {
     changed
 }
 
-// SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// SAFETY: D3D12 resources are free-threaded. The persistent mapping has
+// one writer per Shadow during a synchronous submission. Batch workers
+// operate on distinct Shadow allocations; the submitting thread joins
+// them before taking snapshots, submitting GPU work or merging writes.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}

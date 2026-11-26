@@ -67,7 +67,7 @@ fn allocation_size(size: u64, limit: u64) -> u64 {
 
 fn trim(idle: &mut Idle, limit: u64) {
     // The pool only owns idle buffers; dropping them cannot invalidate a
-    // recorded or in-flight upload. Prefer keeping the most recent.
+    // recorded or in-flight upload.
     while idle.bytes > limit || idle.entries.len() > MAX_ENTRIES {
         let Some(spare) = idle.entries.pop() else { break };
         idle.bytes -= spare.capacity;
