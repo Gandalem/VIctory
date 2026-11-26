@@ -85,17 +85,14 @@ impl Last {
     }
 }
 
-#[cfg(feature = "diagnostics")]
 static STAGING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn live_staging_bytes() -> u64 {
     STAGING_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        #[cfg(feature = "diagnostics")]
         STAGING_BYTES.fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
         // All recorded uploads hold the staging Arc, not only its buffer.
         // The last owner releases an idle allocation, never a live slice.
@@ -661,7 +658,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 fn staging_with_admission(
     resource: This,
     texture: &ID3D12Resource,
-    mut admission: Option<&mut crate::upload_pool::Admission>,
+    admission: Option<&mut crate::upload_pool::Admission>,
 ) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
@@ -706,16 +703,7 @@ fn staging_with_admission(
             Some(&mut total),
         );
     }
-    let estimate = total.saturating_add((64 << 10) - 1);
-    if let Some(limit) = admission.as_mut() {
-        if !limit.admit(estimate) {
-            return None;
-        }
-    }
-    let (buffer, data, capacity) = crate::upload_pool::take(host, total)?;
-    if let Some(limit) = admission {
-        limit.consume(capacity);
-    }
+    let (buffer, data, capacity) = crate::upload_pool::take(host, total, admission)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -739,7 +727,6 @@ fn staging_with_admission(
         last: Mutex::default(),
         used_ms: std::sync::atomic::AtomicU64::new(now_ms()),
     });
-    #[cfg(feature = "diagnostics")]
     STAGING_BYTES.fetch_add(s.size, std::sync::atomic::Ordering::Relaxed);
     *held = Some(s.clone());
     STAGED.lock().unwrap_or_else(|e| e.into_inner())

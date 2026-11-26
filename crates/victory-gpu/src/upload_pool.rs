@@ -44,42 +44,82 @@ pub(crate) fn recent_oom() -> bool {
 pub(crate) struct Admission {
     commit_left: u64,
     batch_left: u64,
-    admitted: bool,
+    spent: u64,
+    limited_ram: bool,
+    sampled_at: Instant,
+}
+
+fn batch_limit(commit: u64, pressure: bool, limited_ram: bool, staging: u64) -> u64 {
+    if commit < 1536 * MIB {
+        16 * MIB
+    } else if pressure || (limited_ram && staging >= 1024 * MIB) {
+        64 * MIB
+    } else {
+        u64::MAX
+    }
 }
 
 impl Admission {
     pub(crate) fn new() -> Self {
-        let commit = crate::shadow::memory_status().map_or(u64::MAX, |(_, _, c)| c);
+        let sample = crate::shadow::system_memory().or_else(crate::shadow::memory_status);
+        let (total, _, commit) = sample.unwrap_or((u64::MAX, u64::MAX, u64::MAX));
         let pressure = crate::shadow::memory_pressured() || crate::host::video_memory_pressured();
-        Self::from_status(commit, pressure)
+        Self::from_status(commit, pressure, total <= 32 * 1024 * MIB, crate::texture::live_staging_bytes())
     }
 
-    fn from_status(commit: u64, pressure: bool) -> Self {
-        let batch_left = if commit < 1536 * MIB {
-            16 * MIB
-        } else if pressure {
-            64 * MIB
+    fn from_status(commit: u64, pressure: bool, limited_ram: bool, staging: u64) -> Self {
+        Self {
+            commit_left: commit,
+            batch_left: batch_limit(commit, pressure, limited_ram, staging),
+            spent: 0,
+            limited_ram,
+            sampled_at: Instant::now(),
+        }
+    }
+
+    fn tighten(&mut self, pressure: bool, staging: u64) {
+        let limit = batch_limit(self.commit_left, pressure, self.limited_ram, staging);
+        self.batch_left = self.batch_left.min(limit.saturating_sub(self.spent));
+    }
+
+    fn fits(&self, bytes: u64, growth: bool) -> bool {
+        // Reuse already committed storage without charging system commit.
+        // New allocations require a larger reserve, and must still leave
+        // 512 MiB for required title and GPU work after the allocation.
+        let reserve = if growth {
+            self.commit_left >= 1024 * MIB
+                && self.commit_left.saturating_sub(512 * MIB) >= bytes
         } else {
-            u64::MAX
+            self.commit_left >= 512 * MIB
         };
-        Self { commit_left: commit, batch_left, admitted: false }
+        reserve && (self.batch_left >= bytes || self.spent == 0)
     }
 
-    fn fits(&self, bytes: u64) -> bool {
-        // Allow one larger allocation in a batch if commit headroom
-        // permits it; otherwise large textures could wait forever.
-        self.commit_left.saturating_sub(512 * MIB) >= bytes
-            && (self.batch_left >= bytes || !self.admitted)
+    fn admit(&mut self, bytes: u64, growth: bool) -> bool {
+        if recent_oom() {
+            return false;
+        }
+        // A single heap sweep can outlast the ordinary one-second memory
+        // census. Resample commit at most once per 32 ms. On failure keep
+        // the previously sampled headroom minus allocations since then.
+        if self.sampled_at.elapsed() >= std::time::Duration::from_millis(32) {
+            self.sampled_at = Instant::now();
+            if let Some((total, _, commit)) = crate::shadow::system_memory() {
+                self.commit_left = commit;
+                self.limited_ram = total <= 32 * 1024 * MIB;
+            }
+        }
+        let pressure = crate::shadow::memory_pressured() || crate::host::video_memory_pressured();
+        self.tighten(pressure, crate::texture::live_staging_bytes());
+        self.fits(bytes, growth)
     }
 
-    pub(crate) fn admit(&self, bytes: u64) -> bool {
-        !recent_oom() && self.fits(bytes)
-    }
-
-    pub(crate) fn consume(&mut self, bytes: u64) {
-        self.commit_left = self.commit_left.saturating_sub(bytes);
+    fn consume(&mut self, bytes: u64, growth: bool) {
+        if growth {
+            self.commit_left = self.commit_left.saturating_sub(bytes);
+        }
+        self.spent = self.spent.saturating_add(bytes);
         self.batch_left = self.batch_left.saturating_sub(bytes);
-        self.admitted = true;
     }
 }
 
@@ -152,7 +192,11 @@ pub(crate) fn retry_oom<T>(mut allocate: impl FnMut() -> windows::core::Result<T
     }
 }
 
-pub(crate) fn take(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+pub(crate) fn take(
+    host: &crate::host::Host,
+    size: u64,
+    mut admission: Option<&mut Admission>,
+) -> Option<(ID3D12Resource, *mut u8, u64)> {
     if size == 0 || size > isize::MAX as u64 {
         return None;
     }
@@ -162,6 +206,14 @@ pub(crate) fn take(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resourc
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         trim(&mut idle, limit);
         let i = idle.entries.iter().position(|s| s.capacity == capacity);
+        // Check admission against the actual allocation class and reuse
+        // decision while the idle pool is locked. Explicit uploads pass
+        // no admission policy and retain their original required path.
+        if let Some(limit) = admission.as_deref_mut()
+            && !limit.admit(capacity, i.is_none())
+        {
+            return None;
+        }
         i.map(|i| {
             let spare = idle.entries.swap_remove(i);
             idle.bytes -= spare.capacity;
@@ -174,11 +226,18 @@ pub(crate) fn take(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resourc
         unsafe { (spare.mapped as *mut u8).write_bytes(0, size as usize) };
         #[cfg(feature = "diagnostics")]
         REUSED.fetch_add(1, Relaxed);
+        if let Some(limit) = admission {
+            limit.consume(capacity, false);
+        }
         return Some((spare.buffer, spare.mapped as *mut u8, capacity));
     }
     #[cfg(feature = "diagnostics")]
     MADE.fetch_add(1, Relaxed);
-    host.upload_buffer(capacity).map(|(buffer, data)| (buffer, data, capacity))
+    let (buffer, data) = host.upload_buffer(capacity)?;
+    if let Some(limit) = admission {
+        limit.consume(capacity, true);
+    }
+    Some((buffer, data, capacity))
 }
 
 pub(crate) fn put(buffer: ID3D12Resource, mapped: *mut u8, capacity: u64) {
@@ -212,16 +271,44 @@ mod tests {
 
     #[test]
     fn admission_preserves_commit_and_allows_oversized_first_texture() {
-        let mut limit = Admission::from_status(1024 * MIB, true);
-        assert!(!limit.fits(513 * MIB));
-        assert!(limit.fits(32 * MIB));
-        limit.consume(32 * MIB);
-        assert!(!limit.fits(MIB));
-        assert!(!Admission::from_status(512 * MIB, false).fits(1));
-        let mut limit = Admission::from_status(4 * 1024 * MIB, true);
-        assert!(limit.fits(64 * MIB));
-        limit.consume(64 * MIB);
-        assert!(!limit.fits(1));
+        let mut limit = Admission::from_status(1024 * MIB, true, false, 0);
+        assert!(!limit.fits(513 * MIB, true));
+        assert!(limit.fits(32 * MIB, true));
+        limit.consume(32 * MIB, true);
+        assert!(!limit.fits(MIB, false));
+        assert!(!Admission::from_status(512 * MIB, false, false, 0).fits(1, true));
+        let mut limit = Admission::from_status(4 * 1024 * MIB, true, false, 0);
+        assert!(limit.fits(64 * MIB, true));
+        limit.consume(64 * MIB, true);
+        assert!(!limit.fits(1, false));
+    }
+
+    #[test]
+    fn admission_distinguishes_reuse_and_growth() {
+        let mut limit = Admission::from_status(768 * MIB, false, false, 0);
+        assert!(limit.fits(MIB, false));
+        assert!(!limit.fits(MIB, true));
+        limit.consume(MIB, false);
+        assert_eq!(limit.commit_left, 768 * MIB);
+        assert_eq!(limit.batch_left, 15 * MIB);
+        assert!(!Admission::from_status(512 * MIB - 1, false, false, 0).fits(1, false));
+    }
+
+    #[test]
+    fn admission_tightens_when_a_long_sweep_crosses_staging_or_commit_limits() {
+        let mut limit = Admission::from_status(8 * 1024 * MIB, false, true, 1024 * MIB - 1);
+        assert!(limit.fits(48 * MIB, true));
+        limit.consume(48 * MIB, true);
+        limit.tighten(false, 1024 * MIB);
+        assert_eq!(limit.batch_left, 16 * MIB);
+        limit.commit_left = 1400 * MIB;
+        limit.tighten(false, 1024 * MIB);
+        assert!(!limit.fits(1, false));
+        limit.commit_left = 8 * 1024 * MIB;
+        limit.tighten(false, 0);
+        assert_eq!(limit.batch_left, 0);
+        assert_eq!(batch_limit(8 * 1024 * MIB, false, false, 2 * 1024 * MIB), u64::MAX);
+        assert_eq!(batch_limit(8 * 1024 * MIB, false, true, 1024 * MIB), 64 * MIB);
     }
 
     #[test]

@@ -361,11 +361,16 @@ seconds of disuse (one second under RAM/DXGI pressure). Host textures
 and descriptor identities are unchanged; the next use rebuilds staging.
 
 New speculative bindless staging allocations reserve at least 512 MiB
-of system commit, use a 16 MiB submission budget below 1536 MiB of
-available commit or 64 MiB under memory pressure, and pause during the
-500 ms OOM hold-down. A single larger first allocation may cross the
-soft budget only if commit permits. Existing uploads and explicitly
-recorded texture uploads are not throttled. Unserved descriptors are
+of system commit after allocation and require at least 1 GiB before
+growing committed upload storage. Reusing an already committed spare
+requires only 512 MiB and does not charge the commit estimate again.
+The soft submission budget is 16 MiB below 1536 MiB of available commit
+or 64 MiB under memory pressure or on hosts with at most 32 GiB of RAM
+when live logical staging reaches 1 GiB. Long sweeps resample system
+commit at most every 32 ms and tighten their remaining budget as needed.
+A single larger first allocation may cross the soft budget only if
+commit permits. The 500 ms OOM hold-down pauses speculative work.
+Existing uploads and explicitly recorded texture uploads are not throttled. Unserved descriptors are
 checked again on later submissions. This is a conservative admission
 policy inspired by cool_fox residency.rs, not its full asynchronous
 prefetch queue. A fence wait failure now stops submission processing

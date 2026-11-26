@@ -171,7 +171,7 @@ fn configured_pool_ceiling() -> usize {
     })
 }
 
-fn system_memory() -> Option<(u64, u64, u64)> {
+pub(crate) fn system_memory() -> Option<(u64, u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: a plain structure filled by GlobalMemoryStatusEx.
     let mut memory: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
