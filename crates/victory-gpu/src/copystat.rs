@@ -285,6 +285,7 @@ pub(crate) fn log(frames: f64) {
     let (snapshots, cached, limit, loose, loose_bytes) = crate::shadow::cache_stats();
     let memory = crate::shadow::memory_status();
     let video = crate::host::host().and_then(|h| h.video_memory());
+    let (sampled_bytes, target_bytes) = crate::resource::texture_budget_usage();
     let (idle_upload_bytes, idle_upload_count, upload_made, upload_reused, oom_hold) = crate::upload_pool::stats();
     let [gaps, covered] = crate::host::take_refresh_savings();
     tracing::info!(refresh_gap_scope_bytes = gaps, refresh_already_covered_bytes = covered,
@@ -303,6 +304,8 @@ pub(crate) fn log(frames: f64) {
         idle_cpu_buffer_count = snapshots,
         idle_cpu_buffer_mib = cached >> 20,
         idle_cpu_buffer_limit_mib = limit >> 20,
+        sampled_texture_logical_mib = sampled_bytes >> 20,
+        target_texture_logical_mib = target_bytes >> 20,
         texture_staging_logical_mib = crate::texture::live_staging_bytes() >> 20,
         idle_upload_mib = idle_upload_bytes >> 20,
         idle_upload_count,

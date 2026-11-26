@@ -277,7 +277,7 @@ struct VideoBudget {
 
 static VIDEO_PRESSURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn video_room_percent() -> u64 {
+pub(crate) fn video_room_percent() -> u64 {
     static PERCENT: OnceLock<u64> = OnceLock::new();
     *PERCENT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT").ok()

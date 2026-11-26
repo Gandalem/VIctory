@@ -366,6 +366,25 @@ policy inspired by cool_fox residency.rs, not its full asynchronous
 prefetch queue. A fence wait failure now stops submission processing
 rather than releasing storage without confirmed GPU completion.
 
+## Soft sampled texture budget and target reserve
+
+Adapted from the room policy in
+[victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/resource.rs).
+`VICTORY_TEXTURE_DROP_MIPS=auto` or a positive
+`VICTORY_TEXTURE_BUDGET_MB` enables allocation-time adaptation.
+`VICTORY_CARD_ROOM_FOR_TARGETS_MB` defaults to 3072 MiB, capped at
+one third of the local DXGI budget. The outstanding target reserve
+reduces room for sampled textures. Eligible new textures use the most
+detailed retained chain that fits, or the smallest supported chain
+if none fits. Live compatible textures retain their shape. Targets,
+depth, UAV and ineligible textures retain their original shape.
+Numeric mip profiles without a budget keep their previous behavior.
+Required allocations are not refused to enforce a soft budget.
+
+Diagnostics distinguish logical sampled/target allocation bytes from
+actual DXGI usage. This is allocation-time quality and headroom
+management, not physical VRAM reservation or live tiled residency.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
