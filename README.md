@@ -397,7 +397,16 @@ source span; volumes use the full layout. First use fills every retained
 subresource. A failed detile retries even if dirty flags were consumed.
 This adapts retained-source handling from
 [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/texture.rs).
-Untracked memory still uses the original whole-layout hash.
+Untracked memory uses the original whole-layout hash by default.
+Experimental `VICTORY_PARTIAL_UNTRACKED_UPLOADS=1` additionally hashes
+distinct retained source spans after a changed whole-image hash. Packed
+tails share a hash; unchanged retained mips and array slices skip
+detiling and remain outside the pending copy mask. Unsupported layouts,
+single subresources and textures with more than 256 subresources retain
+the original full refresh. A failed detile invalidates the span census
+so the next refresh retries every retained subresource. Unlike the
+reference's view-dependent upload_from path, this selects changed
+content without assuming that eager descriptor slots remain unchanged.
 Bindless GPU uploads record only pending retained subresources.
 Pending changes accumulate across refreshes and are acknowledged on
 recording under the synchronous submission lock. Experimental
@@ -408,9 +417,11 @@ the first-state prelude after all submission-time refreshes have joined.
 Recorded-list owners retain both texture and staging; dirty masks are
 acknowledged only after successful fence completion. Ineligible lists,
 failed refreshes, uninitialized staging and GPU-authored textures retain
-full-chain copies. Untracked hash changes also keep the conservative
-full-chain path. This reduces logical copy traffic, not measured PCIe
-traffic. The explicit option is off by default pending GPU validation.
+full-chain copies. Untracked hash changes keep the conservative
+full-chain path unless the optional retained-span hashing is enabled.
+This reduces logical copy traffic for bindless and eligible explicit
+preludes, not measured PCIe traffic. Both options are off by default
+pending GPU validation.
 
 ## Memory-pressure admission and idle staging reclamation
 

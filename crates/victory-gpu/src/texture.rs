@@ -69,6 +69,9 @@ pub(crate) struct Staging {
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
+    // Optional hashes of retained source spans. Packed tail mips share
+    // a key; the whole-image digest still supports idle staging reuse.
+    span_hashes: std::collections::BTreeMap<(usize, usize), blake3::Hash>,
     // A failed detile must retry even after consuming dirty pages.
     ready: bool,
     // Accumulate successful staging changes until a heap upload records
@@ -824,13 +827,35 @@ impl Staging {
     }
 
     fn refresh_untracked(&self, last: &mut Last, tiled: &[u8]) -> (usize, bool) {
+        static PARTIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let partial = *PARTIAL.get_or_init(|| std::env::var("VICTORY_PARTIAL_UNTRACKED_UPLOADS").as_deref() == Ok("1"));
+        self.refresh_untracked_impl(last, tiled, partial)
+    }
+
+    fn refresh_untracked_impl(&self, last: &mut Last, tiled: &[u8], partial: bool) -> (usize, bool) {
         let size = tiled.len();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if last.ready && last.hash == Some(hash) {
             return (size, false);
         }
+        // Adapt retained-mip source handling to memory without write
+        // tracking. Unlike view-dependent upload_from, select spans by
+        // content rather than mutable descriptor metadata. The source
+        // is still read/hashed as a whole; this saves detiling and GPU
+        // copies when only some retained subresources changed.
+        if partial && self.footprints.len() > 1 && self.footprints.len() <= 256
+            && let Some(changed) = self.refresh_untracked_spans(last, tiled)
+        {
+            last.hash = last.ready.then_some(hash);
+            #[cfg(feature = "diagnostics")]
+            if changed {
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            }
+            return (size, changed);
+        }
+        last.span_hashes.clear();
         let ok = self.detile(tiled);
         last.ready = ok;
         last.hash = ok.then_some(hash);
@@ -840,6 +865,50 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, ok)
+    }
+
+    /// Return None for an unsupported layout, before changing staging.
+    /// Otherwise hash each distinct retained source span once. On any
+    /// failed detile discard the span census, so the next refresh
+    /// rebuilds every retained subresource and retries the pending upload.
+    fn refresh_untracked_spans(&self, last: &mut Last, tiled: &[u8]) -> Option<bool> {
+        let mut spans = std::collections::BTreeMap::<(usize, usize), Vec<usize>>::new();
+        for i in 0..self.footprints.len() {
+            let (mip, slice) = (i as u32 % self.mips + self.first_mip, i as u32 / self.mips);
+            let (a, b) = self.layout.source_span(mip, slice)?;
+            let (a, b) = (usize::try_from(a).ok()?, usize::try_from(b).ok()?);
+            if a >= b || b > tiled.len() {
+                return None;
+            }
+            spans.entry((a, b)).or_default().push(i);
+        }
+        let mut next = std::collections::BTreeMap::new();
+        let mut changed = false;
+        let mut ok = true;
+        for ((a, b), indices) in spans {
+            let source = &tiled[a..b];
+            let digest = blake3::hash(source);
+            next.insert((a, b), digest);
+            if last.ready && last.span_hashes.get(&(a, b)) == Some(&digest) {
+                continue;
+            }
+            let mut span_ok = true;
+            for &i in &indices {
+                span_ok &= self.detile_one(source, i, true);
+            }
+            if span_ok {
+                last.mark(self.footprints.len(), indices);
+                changed = true;
+            }
+            ok &= span_ok;
+        }
+        last.ready = ok;
+        if ok {
+            last.span_hashes = next;
+        } else {
+            last.span_hashes.clear();
+        }
+        Some(ok && changed)
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -1296,6 +1365,47 @@ mod tests {
         drop(copy);
         assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
         pools::free(p);
+    }
+
+    #[test]
+    fn untracked_span_hashes_skip_unchanged_array_slices_and_preserve_pending() {
+        let Some(_host) = host() else { return };
+        let words: [u32; 14] = [3, 0, 0, 0, 256, 0, 256, (1 << 16) | 2, 28, 1, 0, 1, 0, 0];
+        // SAFETY: the C-layout resource description consists of these words.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+        let layout = crate::resource::texture_layout(&desc).unwrap();
+        let layout = &layout.planes[0].layout;
+        let size = layout.size as usize;
+        let (second, _) = layout.source_span(0, 1).unwrap();
+        let mut bytes = vec![0x37u8; size];
+        let mut image = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(
+            std::ptr::null(), bytes.as_ptr() as u64, &desc, 0, std::ptr::null(),
+            std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
+        ), crate::object::S_OK);
+        let upload = staging(image, crate::resource::host_resource(image).unwrap()).unwrap();
+        {
+            let mut last = upload.last.lock().unwrap();
+            assert_eq!(upload.refresh_untracked_impl(&mut last, &bytes, true), (size, true));
+            assert_eq!(last.pending, [true, true]);
+            last.pending.fill(false);
+            bytes[second as usize] = 0x91;
+            assert_eq!(upload.refresh_untracked_impl(&mut last, &bytes, true), (size, true));
+            assert_eq!(last.pending, [false, true]);
+            assert_eq!(upload.refresh_untracked_impl(&mut last, &bytes, true), (size, false));
+            assert_eq!(last.pending, [false, true]);
+            // A later changed slice must accumulate, not replace its mask.
+            bytes[0] = 0x72;
+            assert_eq!(upload.refresh_untracked_impl(&mut last, &bytes, true), (size, true));
+            assert_eq!(last.pending, [true, true]);
+            // SAFETY: both staging offsets belong to a live allocation.
+            unsafe {
+                assert_eq!(*upload.data.add(upload.footprints[0].Offset as usize), 0x72);
+                assert_eq!(*upload.data.add(upload.footprints[1].Offset as usize), 0x91);
+            }
+        }
+        drop(upload);
+        assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
     }
 
     #[test]
