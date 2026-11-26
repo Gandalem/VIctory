@@ -3,7 +3,8 @@
 //!
 //! Covers RDNA2 hardware semantics that differ from naive DXIL lowering:
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
-//! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
+//! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and denormal
+//! operands of `v_mul_legacy_f32`.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -632,6 +633,62 @@ fn v_cmp_lg_is_false_for_nan() {
                 inp[0], inp[1],
             );
         });
+    }
+}
+
+/// 64-bit integer compares order by the high dword (signed for i64), then
+/// by the low one. AMD's D3D12 compiler runs an ordered i64 `icmp` as if the
+/// dwords were swapped (RX 9070 and gfx1036 alike), so the lowering compares
+/// the dwords; the values are picked so that the two orders disagree.
+#[test]
+fn v_cmp_u64_and_i64_order_by_the_high_dword() {
+    type Order = fn(u64, u64) -> bool;
+    let ops: [(u16, &str, Order); 12] = [
+        (0x0a1, "v_cmp_lt_i64", |a, b| (a as i64) < (b as i64)),
+        (0x0a2, "v_cmp_eq_i64", |a, b| a == b),
+        (0x0a3, "v_cmp_le_i64", |a, b| (a as i64) <= (b as i64)),
+        (0x0a4, "v_cmp_gt_i64", |a, b| (a as i64) > (b as i64)),
+        (0x0a5, "v_cmp_ne_i64", |a, b| a != b),
+        (0x0a6, "v_cmp_ge_i64", |a, b| (a as i64) >= (b as i64)),
+        (0x0e1, "v_cmp_lt_u64", |a, b| a < b),
+        (0x0e2, "v_cmp_eq_u64", |a, b| a == b),
+        (0x0e3, "v_cmp_le_u64", |a, b| a <= b),
+        (0x0e4, "v_cmp_gt_u64", |a, b| a > b),
+        (0x0e5, "v_cmp_ne_u64", |a, b| a != b),
+        (0x0e6, "v_cmp_ge_u64", |a, b| a >= b),
+    ];
+    let values: [u64; 10] = [
+        0,
+        1,
+        0xFFFF_FFFF,
+        0x1_0000_0000,
+        0x1_FFFF_FFFF,
+        0x0000_0040_C010_FBFF,
+        0x0001_8000_0000_0040,
+        0x7FFF_FFFF_FFFF_FFFF,
+        0x8000_0000_0000_0001,
+        0xFFFF_FFFF_0000_0000,
+    ];
+    let inputs: Vec<[u32; 4]> = values
+        .iter()
+        .flat_map(|&a| values.iter().map(move |&b| (a, b)))
+        .map(|(a, b)| [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32])
+        .collect();
+    for (op, name, order) in ops {
+        // op s20, v[1:2], v[3:4] and, sharing v2, op s20, v[1:2], v[2:3];
+        // v_cndmask_b32_e64 v0, 0, 1, s20
+        for second in [3, 2] {
+            let mut body = vop3(op, 20, vgpr(1), vgpr(second), 0x80).to_vec();
+            body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+            let shader = build_valu_cs(&body);
+            let at = usize::from(second) - 1;
+            run_cases(&shader, &inputs, |backend, _, inp, got| {
+                let a = u64::from(inp[0]) | u64::from(inp[1]) << 32;
+                let b = u64::from(inp[at]) | u64::from(inp[at + 1]) << 32;
+                let want = u32::from(order(a, b));
+                assert_eq!(got, want, "{backend}: {name}({a:#018x}, {b:#018x})");
+            });
+        }
     }
 }
 
@@ -1742,4 +1799,37 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         "{:?}",
         refused.err()
     );
+}
+
+#[test]
+fn v_mul_legacy_f32_treats_denormals_as_zero() {
+    // v_mul_legacy_f32 v0, v1, v2 (VOP2 opcode 0x007 in its VOP3 encoding)
+    let shader = build_valu_cs(&vop3(0x107, 0, vgpr(1), vgpr(2), vgpr(0)));
+    let f = f32::to_bits;
+    let (denorm, neg_denorm, min_normal) = (0x0000_0001u32, 0x8040_0000u32, 0x0080_0000u32);
+
+    let cases: &[(u32, u32, u32)] = &[
+        // Zero or denormal times anything, non-finite included, is +0.
+        (f(0.0), f(f32::INFINITY), f(0.0)),
+        (f(-0.0), f(f32::NAN), f(0.0)),
+        (f(f32::NAN), f(0.0), f(0.0)),
+        (denorm, f(f32::INFINITY), f(0.0)),
+        (f(f32::NAN), neg_denorm, f(0.0)),
+        (denorm, f(2.0f32.powi(100)), f(0.0)),
+        // The smallest normal is not zero.
+        (min_normal, f(2.0), f(f32::MIN_POSITIVE * 2.0)),
+        // Ordinary products.
+        (f(1.5), f(-4.0), f(-6.0)),
+        (f(3.0), f(0.5), f(1.5)),
+    ];
+
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].2;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mul_legacy_f32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
 }

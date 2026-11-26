@@ -1318,6 +1318,66 @@ fn min_max_and_clamp_match_the_hardware() {
     assert_clean(check(&passing(min_max_probes())));
 }
 
+/// `v_cubeid_f32`, `v_cubesc_f32`, `v_cubetc_f32` and `v_cubema_f32` of
+/// (x, y, z) (RDNA2 ISA: the major axis is z when |z| >= |x| and |z| >= |y|,
+/// else y when |y| >= |x|, else x), with the coordinates' denormals read as
+/// zeros of their sign.
+fn cube(op: u16, x: u32, y: u32, z: u32) -> u32 {
+    let (x, y, z) = (ftz(x), ftz(y), ftz(z));
+    let (ax, ay, az) = (fl(x).abs(), fl(y).abs(), fl(z).abs());
+    let zmaj = az >= ax && az >= ay;
+    let ymaj = ay >= ax;
+    let neg = |v: u32| fl(v) < 0.0;
+    let minus = |v: u32| v ^ 0x8000_0000;
+    let pick = |zv: u32, yv: u32, xv: u32| {
+        if zmaj {
+            zv
+        } else if ymaj {
+            yv
+        } else {
+            xv
+        }
+    };
+    match op {
+        0x144 => {
+            let id = pick(
+                if neg(z) { 5 } else { 4 },
+                if neg(y) { 3 } else { 2 },
+                u32::from(neg(x)),
+            );
+            (id as f32).to_bits()
+        }
+        0x145 => pick(
+            if neg(z) { minus(x) } else { x },
+            x,
+            if neg(x) { z } else { minus(z) },
+        ),
+        0x146 => pick(minus(y), if neg(y) { minus(z) } else { z }, minus(y)),
+        _ => out(fl(pick(z, y, x)) * 2.0),
+    }
+}
+
+/// The cube-map face instructions over signed zeros, denormals, infinities
+/// and NaN in each coordinate.
+fn cube_probes() -> Vec<Probe> {
+    let xyz = triples(F32_EDGES, F32_EDGES, F32_THIRD);
+    (0x144u16..=0x147)
+        .map(|op| {
+            probe(
+                vop3(op, 5, [v(1), v(2), v(3)], NONE),
+                xyz.clone(),
+                F32,
+                move |i| vec![cube(op, i[0], i[1], i[2])],
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn cube_faces_match_the_hardware() {
+    assert_clean(check(&cube_probes()));
+}
+
 /// The 16 float predicates of `v_cmp_*_f32` (RDNA2 ISA: `o` ordered, `u`
 /// unordered, `n*` true when unordered).
 fn compare(op: u16, a: u32, b: u32) -> bool {
@@ -1465,6 +1525,17 @@ fn class_compares_match_the_hardware() {
 fn conversion_probes() -> Vec<Probe> {
     let xs = unary(F32_EDGES);
     let ints = unary(U32_EDGES);
+    let mut unsigned = U32_EDGES.to_vec();
+    // Two observed WARP misroundings, then the neighbors of midpoints
+    // with even and odd lower significands at every inexact exponent.
+    unsigned.extend([0xDE84_975E, 0xFFFF_FF7F]);
+    for exponent in 24..32 {
+        let base = 1u32 << exponent;
+        let ulp = base >> 23;
+        for midpoint in [base + ulp / 2, base + ulp + ulp / 2] {
+            unsigned.extend([midpoint - 1, midpoint, midpoint + 1]);
+        }
+    }
     let mut p = vec![
         probe([vop1(0x08, 5, v(1))], xs.clone(), INT, |i| {
             vec![to_i32(i[0])]
@@ -1494,7 +1565,7 @@ fn conversion_probes() -> Vec<Probe> {
         probe([vop1(0x05, 5, v(1))], ints.clone(), F32, |i| {
             vec![(i[0] as i32 as f32).to_bits()]
         }),
-        probe([vop1(0x06, 5, v(1))], ints.clone(), F32, |i| {
+        probe([vop1(0x06, 5, v(1))], unary(&unsigned), INT, |i| {
             vec![(i[0] as f32).to_bits()]
         }),
         // An f16 result keeps the destination's high half (v5 = d).
