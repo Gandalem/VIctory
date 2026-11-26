@@ -161,6 +161,13 @@
 //!   a view the bit of its first byte's page as base with that byte's
 //!   offset in its page as phase. Writes at computed addresses mark the
 //!   page-table bitmap instead ("Title memory").
+//! * **Read marks** (with [`Options::view_marks`]; added 2026-11-25):
+//!   every image instruction that reads a texture shader view the program
+//!   takes from the resource heap itself (not through a table, whose slots
+//!   the host makes for the draw) also sets bit
+//!   [`VIEW_READS`] + the view's heap index in the same bitmap, after the
+//!   written pages, where still clear: the host makes views it left null
+//!   until a shader reads them (textures the title placed itself).
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -225,7 +232,7 @@ pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, LARGE_HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE,
     SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDES, configure_view_heap_capacity, null_buffer_view,
-    view_heap_capacity, VIEW_MARKS, VIEW_WRITES, VIEW_MARK_NONE, VIEW_WRITE_BITS,
+    view_heap_capacity, VIEW_MARKS, VIEW_WRITES, VIEW_MARK_NONE, VIEW_WRITE_BITS, VIEW_READS,
 };
 
 /// The loop limit without an override: 2^20.

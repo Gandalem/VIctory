@@ -1227,6 +1227,11 @@ impl Host {
         let withheld: Vec<_> = back.iter().filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n)).collect();
         crate::shadow::copy_back_marks(&withheld);
+        // Texture views left null that shaders read: made for what follows.
+        let read = crate::shadow::take_reads();
+        if !read.is_empty() {
+            crate::descriptor::make_read(&read);
+        }
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {

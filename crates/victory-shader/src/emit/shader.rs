@@ -41,6 +41,10 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
 /// Bits in the written-pages bitmap of buffer views; marks past it go to
 /// the last bit.
 pub const VIEW_WRITE_BITS: u32 = 1 << 22;
+/// The first bit of the read marks of texture views (`emit`, "Read
+/// marks"), after the written pages in the same bitmap: one bit per
+/// resource-heap index, [`HEAP_VIEWS`] of them.
+pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 
 static VIEW_HEAP_CAPACITY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
@@ -137,6 +141,11 @@ pub(crate) struct Shader {
     /// The heap index of each handle of an unordered buffer view (writes
     /// through it are marked by the index's view-mark entry).
     pub view_index: std::collections::HashMap<V, V>,
+    /// The heap index of each handle of a texture shader view (its reads
+    /// are marked, `emit` "Read marks"), and those the instruction being
+    /// lowered uses.
+    pub texture_index: std::collections::HashMap<V, V>,
+    pub texture_reads: Vec<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -201,6 +210,8 @@ impl Shader {
             view_marks: None,
             view_writes: None,
             view_index: std::collections::HashMap::new(),
+            texture_index: std::collections::HashMap::new(),
+            texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -555,6 +566,10 @@ impl Shader {
         // Unordered typed, raw and structured buffers (kinds 10-12).
         if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
             self.view_index.insert(h, index);
+        }
+        // Texture shader views (kinds 1-9).
+        if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&(props.0 & 0xFF)) {
+            self.texture_index.insert(h, index);
         }
         h
     }
