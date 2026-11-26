@@ -756,6 +756,32 @@ fn parallel_untracked() -> bool {
     *ENABLED.get_or_init(|| std::env::var("VICTORY_PARALLEL_UNTRACKED").as_deref() == Ok("1"))
 }
 
+/// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
+/// at most: the title's own threads need the rest), here when that is
+/// fewer than two.
+pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
+    if threads < 2 {
+        (0..n).for_each(f);
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    f(i);
+                }
+            });
+        }
+    });
+}
+
 /// Refresh independent staging buffers in input order. Tracked reads
 /// use the existing kernel copy; the optional untracked worker path
 /// reads an owned snapshot through ReadProcessMemory before hashing.

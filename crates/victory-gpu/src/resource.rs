@@ -2169,9 +2169,10 @@ fn hand_out_resource(
     clear: *const c_void,
     iid: *const Iid,
     out: *mut This,
+    defer_placed: bool,
 ) -> HRESULT {
     #[cfg(not(windows))]
-    let _ = (state, clear);
+    let _ = (state, clear, defer_placed);
     #[allow(unused_mut)] // the host texture is set on Windows only
     let mut resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
@@ -2188,13 +2189,20 @@ fn hand_out_resource(
     });
     #[cfg(windows)]
     {
-        resource.initialize_host(state, clear, lazy_texture_enabled());
+        if defer_placed {
+            // Internal placed views carry no clear value. Publish their
+            // title object first, as in the upstream texture_at path.
+            debug_assert!(clear.is_null());
+            resource.made_with = (state, None);
+        } else {
+            resource.initialize_host(state, clear, lazy_texture_enabled());
+        }
     }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if resource.host_lazy_state.is_some()
+    } else if defer_placed || resource.host_lazy_state.is_some()
         || made(&resource).is_some()
     {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
@@ -2333,6 +2341,7 @@ pub(crate) extern "system" fn create_committed(
         clear,
         iid,
         out,
+        false,
     )
 }
 
@@ -2445,6 +2454,7 @@ pub(crate) extern "system" fn create_at_address(
         clear,
         iid,
         out,
+        false,
     )
 }
 
@@ -2488,29 +2498,37 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if let Some(&r) = map.get(&(address, *desc))
         && current(r as This)
     {
-        return Some(r as This);
+        drop(map);
+        return resource(r as This).host_ref().is_some().then_some(r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
+    if d.dimension == BUFFER || address == 0 {
         return None;
     }
     let mut out = std::ptr::null();
-    let status = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
+    // Same resource properties as create_at_address, but do not make the
+    // host texture under PLACED_TEXTURES.
+    let status = hand_out_resource(
+        d,
+        HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 1, visible_nodes: 1 },
+        0,
+        Backing::Address(address as *mut u8),
         0,
         std::ptr::null(),
         &RESOURCE_IIDS[0],
         &mut out,
+        true,
     );
     if status != S_OK {
         return None;
     }
     PLACED_BYTES.fetch_add(placed_size(desc).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     map.insert((address, *desc), out as usize);
-    made(resource(out)).is_some().then_some(out)
+    // Its host texture is made without the map's lock: the textures of the
+    // slots a submission's shaders read are made several at a time.
+    drop(map);
+    resource(out).host_ref().is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -2558,6 +2576,7 @@ pub(crate) extern "system" fn create_placed(
         clear,
         iid,
         out,
+        false,
     )
 }
 
@@ -2843,6 +2862,29 @@ mod tests {
         assert!(t.upgrade().is_none(), "freed with its title texture");
         assert_eq!(slot::<Release>(read, 0x10)(read), 0);
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// Placed textures asked for from several threads at once: one resource
+    /// and one host texture for each memory, made side by side.
+    #[cfg(windows)]
+    #[test]
+    fn placed_textures_made_side_by_side_are_one_each() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let memory = Box::leak(vec![0u8; 4 << 16].into_boxed_slice());
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let base = memory.as_ptr() as u64;
+        let made: Vec<Vec<usize>> = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| s.spawn(move || (0..4u64).map(|k| texture_at(base + (k << 16), &words).unwrap() as usize).collect::<Vec<_>>()))
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        for k in 0..4 {
+            assert!(made.iter().all(|m| m[k] == made[0][k]), "one resource for memory {k}");
+            assert!(made_copy(made[0][k] as This).is_some(), "with a host texture");
+        }
     }
 
     /// Textures idle for the idle time and frames are given up; past the
