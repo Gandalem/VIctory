@@ -53,11 +53,26 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked), with room to read tracked memory into.
+/// (memory not tracked). Temporary tiled reads share the bounded CPU pool
+/// instead of retaining a full copy for every resident texture.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
-    read: Vec<u8>,
+}
+
+#[cfg(feature = "diagnostics")]
+static STAGING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn live_staging_bytes() -> u64 {
+    STAGING_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Staging {
+    fn drop(&mut self) {
+        STAGING_BYTES.fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -308,9 +323,14 @@ impl Staging {
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            // Keep only the live read until detiling completes. Reusing
+            // the bounded CPU pool avoids one full tiled allocation per
+            // texture without changing its staging buffer or dirty tracking.
+            let mut read = crate::shadow::pooled(size);
+            read.resize(size, 0);
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            self.detile(&read);
+            crate::shadow::give_back(read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
@@ -479,6 +499,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
     });
+    #[cfg(feature = "diagnostics")]
+    STAGING_BYTES.fetch_add(s.size, std::sync::atomic::Ordering::Relaxed);
     *held = Some(s.clone());
     Some(s)
 }

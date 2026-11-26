@@ -305,6 +305,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn memory_pressure_caps_only_idle_command_scratch() {
+        assert_eq!(idle_scratch_budget(4 << 20, false), 4 << 20);
+        assert_eq!(idle_scratch_budget(4 << 20, true), 256 << 10);
+        assert_eq!(idle_scratch_budget(64 << 10, true), 64 << 10);
+        assert_eq!(idle_scratch_budget(0, true), 0);
+    }
+
+    #[test]
     fn idle_scratch_retention_keeps_only_a_bounded_prefix() {
         let sizes = [64 << 10, 128 << 10, 256 << 10, 4 << 20];
         assert_eq!(scratch_prefix_to_keep(sizes, 0), 0);
@@ -625,13 +633,18 @@ const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
 /// Retain only this many bytes of scratch chunks per idle command list.
 fn scratch_keep_bytes() -> u64 {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
+    let configured = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_SCRATCH_KEEP_MB")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(4)
             .min(64) << 20
-    })
+    });
+    idle_scratch_budget(configured, crate::shadow::memory_pressured())
+}
+
+fn idle_scratch_budget(configured: u64, pressure: bool) -> u64 {
+    if pressure { configured.min(256 << 10) } else { configured }
 }
 
 /// Keep a prefix so allocation order and the growth strategy are preserved.
@@ -835,6 +848,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::shadow::maintain_snapshot_pool();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();

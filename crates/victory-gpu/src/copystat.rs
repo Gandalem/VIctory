@@ -283,12 +283,17 @@ pub(crate) fn log(frames: f64) {
         },
     );
     let (snapshots, cached, limit, loose, loose_bytes) = crate::shadow::cache_stats();
+    let memory = crate::shadow::memory_status();
     tracing::info!(
         working_set_mib = ?process.map(|m| m[0] >> 20),
         private_commit_mib = ?process.map(|m| m[1] >> 20),
-        idle_snapshot_count = snapshots,
-        idle_snapshot_mib = cached >> 20,
-        idle_snapshot_limit_mib = limit >> 20,
+        memory_pressure = crate::shadow::memory_pressured(),
+        physical_free_mib = ?memory.map(|m| m.1 >> 20),
+        available_commit_mib = ?memory.map(|m| m.2 >> 20),
+        idle_cpu_buffer_count = snapshots,
+        idle_cpu_buffer_mib = cached >> 20,
+        idle_cpu_buffer_limit_mib = limit >> 20,
+        texture_staging_logical_mib = crate::texture::live_staging_bytes() >> 20,
         loose_shadow_count = loose,
         loose_shadow_logical_mib = loose_bytes >> 20,
         "memory cache census"

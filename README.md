@@ -187,19 +187,31 @@ result. Full GPU and shader regression testing is required before merge.
 
 ## Memory retention (experimental)
 
-The idle snapshot cache is bounded by installed RAM, available physical RAM,
-and available commit. It is checked at most once per second while the cache
-is used; the default ceiling is 2048 MiB and the normal budget on a 32 GiB
+The idle CPU buffer cache (snapshots and temporary texture detiling reads)
+is bounded by installed RAM, available physical RAM, and available commit.
+It is checked at most once per second during submissions or cache use; the default ceiling is 2048 MiB and the normal budget on a 32 GiB
 system is at most 512 MiB. Below 1 GiB available physical RAM or commit, idle
 snapshots are released. `VICTORY_SNAPSHOT_POOL_MB` overrides the ceiling
-(0–2048 MiB, 0 disables idle retention). It does not limit live snapshots.
+(0–2048 MiB, 0 disables idle retention). It does not limit live snapshots
+or active temporary reads.
+
+Under pressure (physical RAM available <= 3 GiB or available commit
+<= 4 GiB), idle CPU storage is capped at 64 MiB; normal retention resumes
+when physical RAM reaches 5 GiB and commit headroom reaches 6 GiB.
+Below 1 GiB of either reserve, the idle budget is still zero. Failed OS
+memory samples retain the last successful observation. This adapts
+[cool_fox residency](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/residency.rs).
 
 After a completed command list is reset, retained scratch chunks are capped
-at 4 MiB per list (`VICTORY_SCRATCH_KEEP_MB`, 0–64 MiB). Active uploads and
-resources still referenced by recorded GPU work are not reclaimed.
+at 4 MiB per list (`VICTORY_SCRATCH_KEEP_MB`, 0–64 MiB), further capped at
+256 KiB during pressure. Temporary tiled texture reads reuse the bounded
+CPU pool rather than retaining a full allocation in every texture's Last.
+Active uploads and resources referenced by GPU work are not reclaimed.
+No required texture uploads are intentionally skipped.
 
 Diagnostics report a `memory cache census` with working set, private commit,
-idle snapshot bytes/budget and the count/logical size of loose shadows. The
+physical and commit headroom, pressure state, idle CPU buffer bytes/budget,
+logical staging bytes and the count/logical size of loose shadows. The
 logical shadow sizes are not measurements of physical RAM or VRAM residency.
 This change does not yet reclaim loose shadows: they may be referenced by
 persistent descriptors and page tables. Validate on identical synthetic or

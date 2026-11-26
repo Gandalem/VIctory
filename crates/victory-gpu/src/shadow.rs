@@ -58,6 +58,8 @@ struct SnapshotPool {
     bytes: usize,
     limit: usize,
     checked: Option<std::time::Instant>,
+    memory: Option<(u64, u64, u64)>,
+    pressured: bool,
 }
 
 impl SnapshotPool {
@@ -67,6 +69,8 @@ impl SnapshotPool {
             bytes: 0,
             limit: 0,
             checked: None,
+            memory: None,
+            pressured: false,
         }
     }
 
@@ -99,7 +103,20 @@ impl SnapshotPool {
             return;
         }
         self.checked = Some(Instant::now());
-        self.set_limit(snapshot_limit(system_memory(), configured_pool_ceiling()));
+        if let Some(memory) = system_memory() {
+            self.memory = Some(memory);
+            let (_, physical, commit) = memory;
+            let pressure = next_memory_pressure(self.pressured, physical, commit);
+            if pressure != self.pressured {
+                tracing::info!(pressure, physical_free_mib = physical >> 20,
+                    available_commit_mib = commit >> 20, "host memory pressure changed");
+            }
+            self.pressured = pressure;
+        }
+        // A failed OS query must retain the last successful observation.
+        MEMORY_PRESSURED.store(self.pressured, std::sync::atomic::Ordering::Relaxed);
+        let limit = idle_budget(self.memory, configured_pool_ceiling(), self.pressured);
+        self.set_limit(limit);
     }
 
     fn take(&mut self, n: usize) -> Vec<u8> {
@@ -164,17 +181,54 @@ fn system_memory() -> Option<(u64, u64, u64)> {
     ok.then_some((memory.ullTotalPhys, memory.ullAvailPhys, memory.ullAvailPageFile))
 }
 
-static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool::new());
+/// Enter pressure if either reserve is low; require both reserves to
+/// recover before allowing caches to grow again. Thresholds adapted from
+/// cool_fox's residency policy (f4b48ad).
+fn next_memory_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    const GIB: u64 = 1 << 30;
+    if was {
+        physical < 5 * GIB || commit < 6 * GIB
+    } else {
+        physical <= 3 * GIB || commit <= 4 * GIB
+    }
+}
 
-/// An empty buffer with room for n bytes, from the idle pool if possible.
-fn pooled(n: usize) -> Vec<u8> {
+fn idle_budget(memory: Option<(u64, u64, u64)>, ceiling: usize, pressure: bool) -> usize {
+    let normal = snapshot_limit(memory, ceiling);
+    if pressure { normal.min(64 * MIB) } else { normal }
+}
+
+static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool::new());
+static MEMORY_PRESSURED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn memory_pressured() -> bool {
+    MEMORY_PRESSURED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Maintain idle storage even when no snapshot was used in a submission.
+pub(crate) fn maintain_snapshot_pool() {
+    if let Ok(mut pool) = POOL.try_lock() {
+        pool.refresh_limit();
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn memory_status() -> Option<(u64, u64, u64)> {
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).memory
+}
+
+/// An empty temporary CPU buffer with room for n bytes. Only returned
+/// allocations count against the idle budget; live snapshots and active
+/// texture reads remain owned by their callers.
+pub(crate) fn pooled(n: usize) -> Vec<u8> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.refresh_limit();
     pool.take(n)
 }
 
-/// Return a completed snapshot to the bounded idle cache.
-fn give_back(v: Vec<u8>) {
+/// Return a completed temporary buffer to the bounded idle cache.
+pub(crate) fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.refresh_limit();
     pool.put(v);
@@ -845,6 +899,34 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_pressure_requires_both_reserves_to_recover() {
+        const GIB: u64 = 1 << 30;
+        assert!(next_memory_pressure(false, 3 * GIB, 16 * GIB));
+        assert!(next_memory_pressure(false, 12 * GIB, 4 * GIB));
+        assert!(!next_memory_pressure(false, 4 * GIB, 5 * GIB));
+        assert!(next_memory_pressure(true, 4 * GIB, 7 * GIB));
+        assert!(next_memory_pressure(true, 6 * GIB, 5 * GIB));
+        assert!(!next_memory_pressure(true, 5 * GIB, 6 * GIB));
+    }
+
+    #[test]
+    fn pressure_reduces_idle_budget_without_restricting_live_allocations() {
+        const GIB: u64 = 1 << 30;
+        let memory = Some((32 * GIB, 3 * GIB, 4 * GIB));
+        assert_eq!(idle_budget(memory, MAX_POOL_BYTES, true), 64 * MIB);
+        assert_eq!(idle_budget(memory, 16 * MIB, true), 16 * MIB);
+        assert_eq!(idle_budget(Some((32 * GIB, GIB / 2, 4 * GIB)), MAX_POOL_BYTES, true), 0);
+        assert_eq!(idle_budget(Some((32 * GIB, 8 * GIB, 8 * GIB)), MAX_POOL_BYTES, false), 512 * MIB);
+        let mut pool = SnapshotPool::new();
+        pool.set_limit(0);
+        let mut live = pool.take(4096);
+        live.resize(4096, 1);
+        assert_eq!(live[4095], 1);
+        pool.put(live);
+        assert_eq!(pool.bytes, 0);
+    }
 
     #[test]
     fn snapshot_budget_scales_with_ram_and_commit() {
