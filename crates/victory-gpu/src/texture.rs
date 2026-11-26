@@ -333,6 +333,25 @@ pub(crate) fn prepare_heap_upload(resource: This, admission: &mut crate::upload_
     staging_with_admission(resource, crate::resource::host_resource(resource)?, Some(admission))
 }
 
+/// Bounded ahead-of-submission preparation for the optional heap
+/// worker. The caller holds both the submission and viewed-heap locks.
+/// Cap source reads before allocating staging; recheck at submission.
+pub(crate) fn prepare_ahead(resource: This, admission: &mut crate::upload_pool::Admission,
+    remaining: u64) -> Option<u64>
+{
+    const MAX_SOURCE: u64 = 4 << 20;
+    let (_, desc) = crate::resource::texture_memory(resource)?;
+    let source = crate::resource::texture_layout(&desc)?.planes[0].layout.size;
+    if source == 0 || source > MAX_SOURCE.min(remaining) {
+        return None;
+    }
+    let staging = prepare_heap_upload(resource, admission)?;
+    // In-place untracked reads are not safe on a background worker.
+    // Tracked reads already go through the checked kernel copy.
+    staging.refresh_now_with(true);
+    Some(source)
+}
+
 /// Record only after all CPU preparation jobs have joined. The heap lock
 /// still protects the title resource; command recording stays serial.
 pub(crate) fn record_heap_upload(list: &HostList, resource: This, staging: &Arc<Staging>) -> bool {

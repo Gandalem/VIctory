@@ -10,8 +10,8 @@
 //! `crate::watch`).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 
 use crate::descriptor::View;
 use crate::host::HostList;
@@ -39,6 +39,8 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 #[derive(Default)]
 pub(crate) struct Viewed {
     inner: Mutex<Inner>,
+    ahead_queued: AtomicBool,
+    ahead_cursor: Mutex<Option<usize>>,
 }
 
 type Range = (usize, u64, u64, bool);
@@ -210,6 +212,107 @@ fn left_kind(view: &View) -> usize {
     }
 }
 
+// The reference heap_worker publishes asynchronously recorded lists.
+// This older eager renderer cannot publish descriptors at submission,
+// so the worker only prepares staging ahead. The mandatory submission
+// pass still rechecks contents, records copies and settles states.
+const AHEAD_COUNT: usize = 32;
+const AHEAD_BYTES: u64 = 16 << 20;
+const AHEAD_MS: u128 = 8;
+
+struct AheadJob {
+    viewed: Weak<Viewed>,
+}
+
+impl Drop for AheadJob {
+    fn drop(&mut self) {
+        if let Some(viewed) = self.viewed.upgrade() {
+            viewed.ahead_queued.store(false, Relaxed);
+        }
+    }
+}
+
+fn worker_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_WORKER").as_deref() == Ok("1"))
+}
+
+fn ahead_pressured() -> bool {
+    crate::shadow::memory_pressured()
+        || crate::host::video_memory_pressured()
+        || crate::upload_pool::recent_oom()
+}
+
+/// Bounded, deduplicated best-effort requests, never a raw title
+/// resource pointer. Saturation or an unavailable worker cannot stop
+/// the original mandatory submission pass.
+pub(crate) fn kick(viewed: &Arc<Viewed>) {
+    if !worker_enabled() || ahead_pressured() {
+        return;
+    }
+    static WORKER: OnceLock<Option<mpsc::SyncSender<AheadJob>>> = OnceLock::new();
+    let Some(sender) = WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<AheadJob>(8);
+        match std::thread::Builder::new().name("victory-heap-ahead".into()).spawn(move || {
+            for job in rx {
+                if let Some(viewed) = job.viewed.upgrade()
+                    && let Some(host) = crate::host::host()
+                {
+                    host.prepare_heap_ahead(&viewed);
+                }
+                // Clears the deduplication flag even on a skipped pass.
+                drop(job);
+            }
+        }) {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                tracing::warn!(error = %e, "heap preparation worker unavailable");
+                None
+            }
+        }
+    }) else { return };
+    if viewed.ahead_queued.swap(true, Relaxed) {
+        return;
+    }
+    // A rejected job is dropped, clearing its flag for the next kick.
+    let _ = sender.try_send(AheadJob { viewed: Arc::downgrade(viewed) });
+}
+
+fn ahead_keys(textures: &BTreeMap<usize, u32>, cursor: Option<usize>, count: usize) -> Vec<usize> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    match cursor {
+        Some(last) => textures.range((Excluded(last), Unbounded))
+            .chain(textures.range(..=last)).take(count).map(|(&key, _)| key).collect(),
+        None => textures.keys().take(count).copied().collect(),
+    }
+}
+
+/// Called only with the host's submission lock held, so no GPU list is
+/// reading a staging buffer while the worker changes it. Do not record
+/// commands, publish descriptors or acknowledge pending upload masks.
+pub(crate) fn prepare_ahead(viewed: &Viewed) {
+    if ahead_pressured() {
+        return;
+    }
+    let Ok(inner) = viewed.inner.try_lock() else { return };
+    let Ok(mut cursor) = viewed.ahead_cursor.try_lock() else { return };
+    let keys = ahead_keys(&inner.textures, *cursor, AHEAD_COUNT);
+    let started = std::time::Instant::now();
+    let mut admission = crate::upload_pool::Admission::new();
+    let mut left = AHEAD_BYTES;
+    for key in keys {
+        if left == 0 || started.elapsed().as_millis() >= AHEAD_MS || ahead_pressured() {
+            break;
+        }
+        *cursor = Some(key);
+        // The heap lock prevents resource destruction, as in uploads().
+        // Oversized textures remain on the mandatory submission path.
+        if let Some(bytes) = crate::texture::prepare_ahead(key as This, &mut admission, left) {
+            left = left.saturating_sub(bytes);
+        }
+    }
+}
+
 /// At submission, before anything else of it: the textures the heaps of its
 /// heap-indexing lists view are brought up to date, those whose title
 /// memory changed copied into their host textures by a list of ours, which
@@ -276,6 +379,32 @@ fn finish_uploads(list: &HostList, pending: &mut Vec<(usize, Arc<crate::texture:
     #[cfg(feature = "diagnostics")]
     UPLOADED.fetch_add(recorded as u64, Relaxed);
     recorded
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::*;
+
+    #[test]
+    fn ahead_cursor_wraps_without_repeating_entries() {
+        let textures = BTreeMap::from([(1, 1), (3, 1), (7, 1), (9, 1)]);
+        assert_eq!(ahead_keys(&textures, None, 2), [1, 3]);
+        assert_eq!(ahead_keys(&textures, Some(3), 3), [7, 9, 1]);
+        assert_eq!(ahead_keys(&textures, Some(6), 8), [7, 9, 1, 3]);
+        assert!(ahead_keys(&BTreeMap::new(), Some(9), 4).is_empty());
+    }
+
+    #[test]
+    fn rejected_or_finished_ahead_job_clears_queue_flag() {
+        let viewed = Arc::new(Viewed::default());
+        viewed.ahead_queued.store(true, Relaxed);
+        let (tx, _rx) = mpsc::sync_channel::<AheadJob>(0);
+        assert!(tx.try_send(AheadJob { viewed: Arc::downgrade(&viewed) }).is_err());
+        assert!(!viewed.ahead_queued.load(Relaxed));
+        viewed.ahead_queued.store(true, Relaxed);
+        drop(AheadJob { viewed: Arc::downgrade(&viewed) });
+        assert!(!viewed.ahead_queued.load(Relaxed));
+    }
 }
 
 /// The upload list, used under its lock only.

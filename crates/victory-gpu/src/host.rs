@@ -966,6 +966,14 @@ impl Host {
         }
     }
 
+    /// A worker may prepare staging only between synchronous GPU
+    /// submissions. Never wait behind GPU work: the normal submission
+    /// path is responsible for all required uploads.
+    pub(crate) fn prepare_heap_ahead(&self, viewed: &crate::bindless::Viewed) {
+        let Ok(_submitted) = self.submitted.try_lock() else { return };
+        crate::bindless::prepare_ahead(viewed);
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -1837,6 +1845,8 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
             deferred.copies.push(Step::Heap(viewed.clone()));
+            drop(deferred);
+            crate::bindless::kick(viewed);
         }
     }
 

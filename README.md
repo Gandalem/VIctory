@@ -309,6 +309,19 @@ changed textures record copies. Bindless buffer coverage is the exact
 union of live descriptor ranges, cached per copy and access kind rather
 than a single enclosing hull. GPU submission remains synchronous.
 
+`VICTORY_HEAP_WORKER=1` enables an experimental dedicated bindless
+preparation thread, adapted from [fxceless/victory-fork's heap worker](https://github.com/fxceless/victory-fork/blob/main/crates/victory-gpu/src/heap_worker.rs).
+It accepts up to eight deduplicated weak heap requests and prepares
+staging between synchronous submissions, never waiting on an occupied
+submission lock. Each pass rotates through at most 32 entries, 16 MiB
+of source reads (4 MiB per texture), and checks an 8 ms soft time budget
+between textures. Pressure and OOM stop speculative work. It never
+records GPU commands or publishes views: the normal submission rechecks
+dirty pages or hashes, records pending copies and retains all staging
+owners. The reference's asynchronous ready-list publication depends on
+late-wait and deferred descriptor publication, which are not present in
+this renderer. This option is off by default pending Windows tests.
+
 ## Parallel buffer refresh
 
 Independent host buffer copies share the bounded preparation worker
