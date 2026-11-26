@@ -607,7 +607,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     (*current == generation).then(|| view.clone())
 }
 
-/// A short-lived pin for a shader view. A resource's destructor removes
+/// A short-lived pin for a shader or unordered view. A resource's destructor removes
 /// its VIEWS entries before freeing its allocation; acquiring the pin
 /// under that lock therefore cannot dereference a freed object or revive
 /// a zero-refcount resource.
@@ -630,7 +630,7 @@ fn pinned_view_at(i: u32, generation: u32) -> Option<(View, Option<ShaderPin>)> 
         return None;
     }
     let pin = match *view {
-        View::Shader(resource, _) if resource != 0 => {
+        View::Shader(resource, _) | View::Unordered(resource, _, _) if resource != 0 => {
             if !object::try_add_ref(resource as This) {
                 return None;
             }
