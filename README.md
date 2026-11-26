@@ -336,6 +336,20 @@ Required allocations are not refused merely because of a budget or
 backoff. This is not live texture eviction or deferred texture admission.
 Diagnostics count idle upload bytes, allocations/reuses and OOM hold-down.
 
+`VICTORY_STAGING_BLOCKS=1` experimentally enables staging suballocation,
+adapted from [cool_fox pool.rs](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/pool.rs).
+Requests up to 32 MiB use 64 KiB-aligned slices of mapped 64 MiB D3D12
+upload blocks, with at most 16 blocks including pending allocations.
+Each recorded list retains the staging lease until safe reset; GPU
+copy footprints add the slice's base offset, while CPU detiling keeps
+relative offsets. Slices are zeroed before reuse. Only entirely idle
+blocks count toward the existing idle-byte cap and can be released on
+pressure or OOM. New blocks charge their full commit cost and are not
+grown under pressure. Larger requests and unavailable blocks fall back
+to the original dedicated upload path. This is off by default until
+Windows GPU tests validate the shared-buffer path; it does not pool
+host texture allocations or title-address upload arenas.
+
 ## Dirty texture source spans
 
 Tracked texture updates read and detile only retained mip and array

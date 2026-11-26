@@ -42,6 +42,10 @@ pub(crate) struct Staging {
     /// Logical footprint bytes and allocated upload-buffer capacity.
     size: u64,
     capacity: u64,
+    /// Local footprints stay relative to this mapped slice. GPU copies
+    /// add the base offset into the shared D3D12 upload resource.
+    offset: u64,
+    lease: Option<crate::upload_pool::BlockLease>,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
@@ -96,7 +100,11 @@ impl Drop for Staging {
         STAGING_BYTES.fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
         // All recorded uploads hold the staging Arc, not only its buffer.
         // The last owner releases an idle allocation, never a live slice.
-        crate::upload_pool::put(self.buffer.clone(), self.data, self.capacity);
+        if self.lease.is_none() {
+            crate::upload_pool::put(self.buffer.clone(), self.data, self.capacity);
+        }
+        // A pooled slice is returned by its lease, after every recorded
+        // list has released the final Arc<Staging>.
     }
 }
 
@@ -377,7 +385,7 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
                         f.RowPitch
                     )
                 },
-                (gpu + footprint.Offset, len),
+                (gpu + staging.offset + footprint.Offset, len),
             );
         }
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -388,12 +396,15 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
                 SubresourceIndex: i as u32,
             },
         };
+        let mut placed = *footprint;
+        placed.Offset += staging.offset;
         let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
+            // SAFETY: as above. The block lease holds the GPU resource,
+            // and its 64 KiB-aligned slice preserves footprint alignment.
             pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
+                PlacedFootprint: placed,
             },
         };
         // SAFETY: an open list; both locations name live resources.
@@ -703,19 +714,24 @@ fn staging_with_admission(
             Some(&mut total),
         );
     }
-    let (buffer, data, capacity) = crate::upload_pool::take(host, total, admission)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let crate::upload_pool::Allocation { buffer, data, capacity, offset, lease } =
+        crate::upload_pool::take(host, total, admission)?;
+    if lease.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
     let s = Arc::new(Staging {
         buffer,
         size: total,
         capacity,
+        offset,
+        lease,
         data,
         footprints,
         rows,
