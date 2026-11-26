@@ -37,8 +37,9 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
-    /// Its bytes.
+    /// Logical footprint bytes and allocated upload-buffer capacity.
     size: u64,
+    capacity: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
@@ -70,10 +71,13 @@ pub(crate) fn live_staging_bytes() -> u64 {
     STAGING_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[cfg(feature = "diagnostics")]
 impl Drop for Staging {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
         STAGING_BYTES.fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
+        // All recorded uploads hold the staging Arc, not only its buffer.
+        // The last owner releases an idle allocation, never a live slice.
+        crate::upload_pool::put(self.buffer.clone(), self.data, self.capacity);
     }
 }
 
@@ -225,12 +229,15 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // even if the title later writes its memory too.
     // Once per list for each host texture, however many title textures of
     // its memory the list samples.
-    if is_host_written(resource) || !list.first_use(texture.as_raw() as usize) {
+    if is_host_written(resource) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
         return;
     };
+    if !list.first_use(texture.as_raw() as usize) {
+        return;
+    }
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     record(list, resource, texture, &staging);
@@ -252,12 +259,12 @@ pub(crate) fn prepare_heap_upload(resource: This) -> Option<Arc<Staging>> {
 
 /// Record only after all CPU preparation jobs have joined. The heap lock
 /// still protects the title resource; command recording stays serial.
-pub(crate) fn record_heap_upload(list: &HostList, resource: This, staging: &Staging) -> bool {
+pub(crate) fn record_heap_upload(list: &HostList, resource: This, staging: &Arc<Staging>) -> bool {
     let Some(texture) = crate::resource::host_resource(resource) else {
         return false;
     };
     record(list, resource, texture, staging);
-    list.keep(&staging.buffer);
+    list.keep_staging(staging);
     true
 }
 
@@ -558,7 +565,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, capacity) = crate::upload_pool::take(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -570,6 +577,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let s = Arc::new(Staging {
         buffer,
         size: total,
+        capacity,
         data,
         footprints,
         rows,

@@ -793,6 +793,9 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Staging ownership, not just COM references: an upload allocation
+    /// must not enter the idle pool while this recording can still read it.
+    staging_kept: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -939,6 +942,7 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         crate::shadow::maintain_snapshot_pool();
         self.video_memory();
+        crate::upload_pool::maintain();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1494,7 +1498,6 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1517,6 +1520,7 @@ impl HostList {
         } else {
             // The preceding submission has finished and Reset released the
             // previous recording. No in-flight upload is reclaimed here.
+            *self.deferred() = Deferred::default();
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             let keep = scratch_prefix_to_keep(
                 scratch.chunks.iter().map(|chunk| chunk.capacity),
@@ -1899,6 +1903,11 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Keep an upload's staging owner until the completed list resets.
+    pub(crate) fn keep_staging(&self, staging: &std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().staging_kept.push(staging.clone());
     }
 
     /// Whether this is the first time since the reset that the list asks
@@ -2465,26 +2474,26 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
+        let made = crate::upload_pool::retry_oom(|| {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of an upload buffer.
+            unsafe {
+                self.device.CreateCommittedResource(
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
                     &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
+                )?;
+                let b = buffer.ok_or_else(windows::core::Error::empty)?;
+                b.Map(0, None, Some(&mut data))?;
+                Ok((b, data.cast()))
+            }
+        });
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(pair) => Some(pair),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -2898,26 +2907,26 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
+        let made = crate::upload_pool::retry_oom(|| {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of a CPU-visible buffer.
+            unsafe {
+                self.device.CreateCommittedResource(
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
                     &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
+                )?;
+                let b = buffer.ok_or_else(windows::core::Error::empty)?;
+                b.Map(0, None, Some(&mut data))?;
+                Ok((b, data.cast()))
+            }
+        });
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(pair) => Some(pair),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None

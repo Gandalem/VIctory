@@ -64,6 +64,8 @@ mod texture_workers;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
+mod upload_pool;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]

@@ -218,6 +218,16 @@ pub(crate) fn memory_status() -> Option<(u64, u64, u64)> {
     POOL.lock().unwrap_or_else(|e| e.into_inner()).memory
 }
 
+/// Emergency reclamation leaves every live snapshot and texture read
+/// intact. Keep the idle limit at zero until the next periodic sample.
+pub(crate) fn release_idle_buffers() -> usize {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = pool.bytes;
+    pool.set_limit(0);
+    pool.checked = Some(std::time::Instant::now());
+    bytes
+}
+
 /// An empty temporary CPU buffer with room for n bytes. Only returned
 /// allocations count against the idle budget; live snapshots and active
 /// texture reads remain owned by their callers.

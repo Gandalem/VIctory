@@ -303,6 +303,26 @@ changed textures record copies. Bindless buffer coverage is the exact
 union of live descriptor ranges, cached per copy and access kind rather
 than a single enclosing hull. GPU submission remains synchronous.
 
+## Idle GPU upload reuse and allocation recovery
+
+Texture upload buffers use a bounded spare cache, adapted from
+[victory-nvidia-8gb staging](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/texture.rs).
+Recorded lists retain staging owners until successful reset, rather than
+just their COM buffer. Only fully released staging allocations can be
+reused; reuse clears the logical bytes. Entries are rounded to 64 KiB,
+at most 32 MiB each; idle retention defaults to 128 MiB / 128 entries.
+`VICTORY_STAGING_POOL=0` disables it, and `VICTORY_STAGING_POOL_MB` sets
+the idle byte limit (0–512). RAM or DXGI pressure clears idle uploads.
+
+For mapped upload and shared-buffer allocation failures with
+E_OUTOFMEMORY, reclaim idle upload/CPU caches and retry once if anything
+was freed. Idle GPU retention stays disabled for at least 500 ms after
+the failure, following the backoff idea in
+[cool_fox residency](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/residency.rs).
+Required allocations are not refused merely because of a budget or
+backoff. This is not live texture eviction or deferred texture admission.
+Diagnostics count idle upload bytes, allocations/reuses and OOM hold-down.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
