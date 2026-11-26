@@ -663,7 +663,10 @@ impl State {
                 0 => crate::memory::heap(),
                 h => crate::descriptor::heap(h as This).host(),
             };
-            let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes()) else {
+            // Shaders using title memory mark in a bitmap of their own, held
+            // back while their results are (`crate::memory::withholding`).
+            let memory = p.stages.iter().any(|s| s.memory.is_some());
+            let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes(memory)) else {
                 once!("a shader marking its writes without a view heap: dropped");
                 not_run("write marks without a view heap");
                 return false;
@@ -2330,7 +2333,7 @@ void main() {
         value: u32,
     ) {
         let marks = heap_host.marks().expect("marks table");
-        let writes = crate::shadow::view_writes().expect("view_writes bitmap");
+        let writes = crate::shadow::view_writes(false).expect("view_writes bitmap");
         // SAFETY: live resource.
         let marks_gpu = unsafe { marks.GetGPUVirtualAddress() };
         list.keep(marks);

@@ -452,6 +452,28 @@ mod tests {
         assert_eq!(scratch_prefix_to_keep(sizes, 8 << 20), 4);
     }
 
+    /// Shaders that use title memory mark their reads in their own bitmap:
+    /// read marks of both bitmaps are taken, each slot once until it is
+    /// forgotten, and a forgotten slot's next read is taken again.
+    #[test]
+    fn read_marks_of_both_bitmaps_are_taken() {
+        let Some(host) = host() else { return };
+        // No submission takes the marks meanwhile.
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let (plain, memory) = (victory_shader::emit::view_heap_capacity() - 2, victory_shader::emit::view_heap_capacity() - 1);
+        crate::shadow::tests::mark_read(false, plain);
+        crate::shadow::tests::mark_read(true, memory);
+        let taken = crate::shadow::take_reads();
+        assert!(taken.contains(&plain), "a plain shader's read");
+        assert!(taken.contains(&memory), "a read by a shader that uses title memory");
+        let again = crate::shadow::take_reads();
+        assert!(!again.contains(&plain) && !again.contains(&memory), "each once");
+        crate::shadow::forget_read(memory);
+        assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its mark cleared");
+        crate::shadow::tests::mark_read(true, memory);
+        assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
+    }
+
     /// The textures shaders read through the heap since the last eviction
     /// pass are named again at each pass (a slot's read is reported as new
     /// only once), and the marks are cleared for the next.
@@ -479,7 +501,7 @@ mod tests {
         // No submission takes the marks meanwhile.
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..2 {
-            crate::shadow::tests::mark_read(0);
+            crate::shadow::tests::mark_read(false, 0);
             let slots = crate::shadow::reads_since();
             assert!(slots.contains(&0), "the slot read");
             assert!(crate::descriptor::read_textures(&slots).contains(&raw), "its texture named");
@@ -527,9 +549,9 @@ mod tests {
             let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
             // Passes a third of the idle limits apart, over three times them.
             for k in 0..10 {
-                crate::shadow::tests::mark_read(5);
+                crate::shadow::tests::mark_read(false, 5);
                 if k == 0 {
-                    crate::shadow::tests::mark_read(6);
+                    crate::shadow::tests::mark_read(false, 6);
                 }
                 let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
                 crate::resource::evict_among(&owned, &read, 1000 + k * idle_frames / 3, 1_000_000 + k * idle_ms / 3, 0);
@@ -1365,12 +1387,24 @@ impl Host {
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
-        for list in runs {
+        // Shaders that read memory with no copy computed something else than
+        // the console's: it stays out of title memory, where it broke the
+        // title's own data (runs c1, c4), and so does what every program
+        // using title memory wrote while any misses
+        // (`crate::memory::withholding`). Only lists with such programs have
+        // checks; all are asked before anything goes back. Other programs in
+        // those lists write through bounded views from their own inputs:
+        // their ranges go back (the imposter transforms beside the BVH
+        // builder in one list, run light13).
+        let missed: Vec<bool> = runs
+            .iter()
+            .map(|list| list.deferred().missed.iter().any(|check| check()))
+            .collect();
+        crate::memory::note_submission(missed.contains(&true));
+        let withholding = crate::memory::withholding();
+        for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
-            // Shaders that read memory with no copy computed something else
-            // than the console's: it stays out of title memory, where it broke
-            // the title's own data (runs c1, c4).
-            let missed = deferred.missed.iter().any(|check| check());
+            let missed = missed || withholding && !deferred.missed.is_empty();
             for step in &deferred.copies {
                 if let Step::GpuWrite(shadow, address, len, _, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
@@ -1401,7 +1435,7 @@ impl Host {
         // Process marked pages before the declared ranges disarm their copies.
         let withheld: Vec<_> = back.iter().filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n)).collect();
-        crate::shadow::copy_back_marks(&withheld);
+        crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
@@ -1417,11 +1451,10 @@ impl Host {
                 crate::memory::note_withheld(len as u64);
             }
         }
-        // A missed submission's withheld bytes leave the host copies at
-        // their next refresh (upstream ec9e750e). Do this after the range
-        // copy-backs, so a successful one cannot clear the retake mark.
+        // Retake withheld ranges as upstream does; after the declared
+        // copy-backs, so an ordinary copy-back cannot clear the retake.
         for (_, address, len) in &withheld {
-            crate::watch::retake(*address, *len);
+            crate::memory::drop_withheld(*address, *len);
         }
         for list in runs {
             for work in &list.deferred().after {

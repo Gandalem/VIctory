@@ -979,10 +979,13 @@ unsafe impl Send for Bitmap {}
 // SAFETY: as above.
 unsafe impl Sync for Bitmap {}
 
-static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
+static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
 
-fn bitmap() -> Option<&'static Bitmap> {
-    BITMAP
+/// The bitmap of other shaders, or (`memory`) of shaders that use title
+/// memory, whose marks go back only while it is not withheld
+/// (`crate::memory::withholding`).
+fn bitmap(memory: bool) -> Option<&'static Bitmap> {
+    BITMAPS[usize::from(memory)]
         .get_or_init(|| {
             // Written pages, then one read mark per heap index.
             let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::view_heap_capacity();
@@ -1003,9 +1006,10 @@ fn bitmap() -> Option<&'static Bitmap> {
 }
 
 /// The host GPU address of the buffer views' written-pages bitmap, for the
-/// root UAV of shaders that mark their writes.
-pub(crate) fn view_writes() -> Option<u64> {
-    bitmap().map(|b| b.gpu)
+/// root UAV of shaders that mark their writes (`memory`: shaders that use
+/// title memory, see [`bitmap`]).
+pub(crate) fn view_writes(memory: bool) -> Option<u64> {
+    bitmap(memory).map(|b| b.gpu)
 }
 
 /// Heap slots whose texture views shaders read: the marks seen so far (a
@@ -1017,27 +1021,32 @@ static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()))
 /// at (`victory_shader::emit`, "Read marks"), each once until
 /// [`forget_read`]. Clears the slots forgotten since first.
 pub(crate) fn take_reads() -> Vec<u32> {
-    let Some(b) = BITMAP.get().and_then(Option::as_ref) else {
-        return Vec::new();
-    };
     let words = (victory_shader::emit::view_heap_capacity() / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
-    // SAFETY: the mapped bitmap's read marks; the GPU is done with them
-    // (one submission runs at a time).
-    let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
+    // Both bitmaps: shaders that use title memory mark their reads in theirs.
+    let mut maps: Vec<&mut [u32]> = [false, true]
+        .into_iter()
+        .filter_map(|memory| BITMAPS[usize::from(memory)].get().and_then(Option::as_ref))
+        // SAFETY: the mapped bitmap's read marks; the GPU is done with them
+        // (one submission runs at a time).
+        .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
+        .collect();
+    if maps.is_empty() {
+        return Vec::new();
+    }
     let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
     let (seen, forgotten) = &mut *reads;
     seen.resize(words, 0);
     for slot in forgotten.drain(..) {
         let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
         if w < words {
-            bits[w] &= !bit;
+            maps.iter_mut().for_each(|bits| bits[w] &= !bit);
             seen[w] &= !bit;
         }
     }
     let mut new = Vec::new();
-    for (w, (x, s)) in bits.iter().zip(seen.iter_mut()).enumerate() {
-        let mut fresh = *x & !*s;
+    for (w, s) in seen.iter_mut().enumerate() {
+        let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
         *s |= fresh;
         while fresh != 0 {
             new.push(w as u32 * 32 + fresh.trailing_zeros());
@@ -1047,7 +1056,8 @@ pub(crate) fn take_reads() -> Vec<u32> {
     new
 }
 
-/// The heap slots shaders read texture views at since the last call, whose marks are cleared: what the title used (eviction stamps,
+/// The heap slots shaders read texture views at since the last call (both
+/// bitmaps), whose marks are cleared: what the title used (eviction stamps,
 /// `crate::resource::evict`). Between submissions, after [`take_reads`]
 /// has seen every mark: its own record of slots seen keeps a slot read
 /// again from being reported as new.
@@ -1055,7 +1065,7 @@ pub(crate) fn reads_since() -> Vec<u32> {
     let words = (victory_shader::emit::view_heap_capacity() / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     let mut slots = Vec::new();
-    if let Some(b) = BITMAP.get().and_then(Option::as_ref) {
+    for b in [false, true].into_iter().filter_map(|memory| BITMAPS[usize::from(memory)].get().and_then(Option::as_ref)) {
         // SAFETY: the mapped bitmap's read marks; no submission runs.
         let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
         for (w, word) in bits.iter_mut().enumerate() {
@@ -1074,7 +1084,7 @@ pub(crate) fn reads_since() -> Vec<u32> {
 /// Heap slot `slot` now holds a texture view left null: its next read is
 /// marked again.
 pub(crate) fn forget_read(slot: u32) {
-    if BITMAP.get().and_then(Option::as_ref).is_some() {
+    if BITMAPS.iter().any(|b| b.get().and_then(Option::as_ref).is_some()) {
         READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
     }
 }
@@ -1082,32 +1092,52 @@ pub(crate) fn forget_read(slot: u32) {
 /// After a submission: every page its shaders marked as written through
 /// views goes back ([`Shadow::copy_back_marked`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
-/// memory declared); the bitmap is cleared. Before the copy-backs of
+/// memory declared) and, with `memory_withheld`, pages that shaders using
+/// title memory marked; the bitmaps are cleared. Before the copy-backs of
 /// declared ranges, which disarm the copies.
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
-pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
-    // No bitmap allocation for unmarked submissions.
-    let Some(b) = BITMAP.get().and_then(Option::as_ref) else {
-        return;
-    };
+pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+    let (mut marked, mut held) = (Vec::new(), Vec::new());
+    for memory in [false, true] {
+        let Some(b) = BITMAPS[usize::from(memory)].get().and_then(Option::as_ref) else {
+            continue;
+        };
+        let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+        // SAFETY: the mapped bitmap; the GPU is done with it (one submission
+        // runs at a time).
+        let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
+        // Marks of offsets past the bitmap land in its last bit, no copy's.
+        bits[words - 1] &= !(1u32 << 31);
+        let used = (marks().end as usize).div_ceil(32).min(words);
+        for (w, word) in bits[..used].iter_mut().enumerate() {
+            let mut x = std::mem::take(word);
+            let into = if memory && memory_withheld { &mut held } else { &mut marked };
+            while x != 0 {
+                into.push((w * 32) as u32 + x.trailing_zeros());
+                x &= x - 1;
+            }
+        }
+    }
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
-    let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
-    // SAFETY: the mapped bitmap; the GPU is done with it (one submission
-    // runs at a time).
-    let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
-    // The final bit alone is reserved for out-of-range offsets; other
-    // bits in this word may belong to live copies.
-    bits[words - 1] &= !(1u32 << 31);
-    let mut marked = Vec::new();
-    let used = (marks().end as usize).div_ceil(32).min(words);
-    for (w, word) in bits[..used].iter_mut().enumerate() {
-        let mut x = std::mem::take(word);
-        while x != 0 {
-            marked.push((w * 32) as u32 + x.trailing_zeros());
-            x &= x - 1;
+    marked.sort_unstable();
+    marked.dedup();
+    let page_of = |m: &Marks, n: u32| {
+        let (&base, copy) = m.owners.range(..=n).next_back()?;
+        let copy = copy.upgrade()?;
+        let k = n - base;
+        (k < pages(copy.start, copy.len)).then(|| {
+            let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
+            (copy, page)
+        })
+    };
+    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
+    if !held.is_empty() {
+        let m = marks();
+        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+            crate::memory::drop_withheld(page, PAGE);
         }
     }
     if marked.is_empty() {
@@ -1115,27 +1145,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
     }
     let pages: Vec<(Arc<Shadow>, usize)> = {
         let m = marks();
-        marked
-            .iter()
-            .filter_map(|&n| {
-                let (&base, copy) = m.owners.range(..=n).next_back()?;
-                let copy = copy.upgrade()?;
-                let k = n - base;
-                (k < pages(copy.start, copy.len)).then(|| {
-                    let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-                    (copy, page)
-                })
-            })
-            .collect()
+        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
     for (copy, page) in pages {
         if withheld
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
         {
-            // The page was written through a withheld view. Retake its
-            // title bytes at the next refresh (upstream ec9e750e).
-            crate::watch::retake(page, PAGE);
+            crate::memory::drop_withheld(page, PAGE);
             continue;
         }
         let written = copy.copy_back_marked(page);
@@ -1508,8 +1525,8 @@ pub(crate) mod tests {
     use super::*;
 
     /// A shader's read mark; the caller holds the submission lock.
-    pub(crate) fn mark_read(slot: u32) {
-        let b = bitmap().expect("a host GPU");
+    pub(crate) fn mark_read(memory: bool, slot: u32) {
+        let b = bitmap(memory).expect("a host GPU");
         let bit = victory_shader::emit::VIEW_READS + slot;
         // SAFETY: a bit of the mapped bitmap; no submission runs.
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
@@ -1749,7 +1766,7 @@ pub(crate) mod tests {
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
-        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap()) else {
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
             unregister(p, p as u64);
             return; // no host GPU here
         };
@@ -1775,7 +1792,7 @@ pub(crate) mod tests {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
         }
-        copy_back_marks(&[]);
+        copy_back_marks(&[], false);
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
@@ -1827,6 +1844,81 @@ pub(crate) mod tests {
         );
         assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
         copy.copy_back(p, PAGE + 16);
+        unregister(p, p as u64);
+    }
+
+    /// Marks of shaders using title memory stay out of title memory while
+    /// their results are held back, and are cleared; the other shaders'
+    /// marks of the same submission go back.
+    #[test]
+    fn marks_of_shaders_using_title_memory_are_held_back() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(others), Some(memory)) = (find(p as u64, len as u64), bitmap(false), bitmap(true)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, len);
+        copy.writing_marked(p, len, true);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
+        // Page 0 marked by another shader, page 1 by one using title memory.
+        for (b, n) in [(others, base), (memory, base + 1)] {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+        }
+        copy_back_marks(&[], true);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
+        // SAFETY: a dword of the mapped bitmap.
+        assert_eq!(unsafe { *(memory.data as *const u32).add((base + 1) / 32) } & 1 << ((base + 1) % 32), 0, "cleared");
+        unregister(p, p as u64);
+    }
+
+    /// What a frame withheld leaves every host copy of its memory at the
+    /// frame's end (run textures9's shape): in frame N a program using title
+    /// memory writes a record into the copies and the frame misses, so it
+    /// stays out of title memory but in the copies for the GPU; in frame
+    /// N+1, which misses nothing, a program reading the record must see
+    /// title memory's bytes, not frame N's, in a title buffer's copy and in
+    /// an inner buffer's copy of the same pages alike.
+    #[test]
+    fn what_a_frame_withholds_leaves_the_copies_at_its_end() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
+        register(p, p as u64, len as u64);
+        register(p + 1, p as u64, PAGE as u64);
+        let (Some(outer), Some(inner)) = (find(p as u64, len as u64), find(p as u64 + 16, 16)) else {
+            unregister(p + 1, p as u64);
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        assert!(!Arc::ptr_eq(&outer, &inner));
+        let byte = |c: &Shadow| c.read_host(p as u64 + 16, 1)[0] & 0xff;
+        for c in [&outer, &inner] {
+            let (start, n) = c.range();
+            c.update(start as usize, n as usize);
+            c.writing_marked(start as usize, n as usize, false);
+            c.write_host(p as u64 + 16, &[0x22]);
+            c.keep_writes(start as usize, n as usize);
+        }
+        crate::memory::note_submission(false);
+        crate::memory::drop_withheld(p + 16, 4);
+        assert_eq!((byte(&outer), byte(&inner)), (0x22, 0x22), "frame N: the GPU's copies keep it");
+        crate::memory::log_frame();
+        for c in [&outer, &inner] {
+            let (start, n) = c.range();
+            c.update(start as usize, n as usize);
+        }
+        assert_eq!((byte(&outer), byte(&inner)), (0x11, 0x11), "frame N+1: title memory's bytes");
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
+        unregister(p + 1, p as u64);
         unregister(p, p as u64);
     }
 

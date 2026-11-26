@@ -812,6 +812,25 @@ pub(crate) mod tests {
 
     /// Everything is changed at first; after taking, only what is written
     /// (by faults, or reported) is, and every tracker of a page sees it.
+    /// A retake marks host buffer copies holding the memory, not other
+    /// trackers of it (a texture's staging): shaders' writes reach only the
+    /// copies. A title write still marks both.
+    #[test]
+    fn a_retake_marks_buffer_copies_alone() {
+        let p = pool(2);
+        let copy = track_copy(p, 2 * PAGE, true).expect("pool memory is tracked");
+        let texture = track(p, 2 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(copy.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        assert_eq!(texture.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        retake(p + PAGE, 16);
+        assert!(copy.changed(p / PAGE + 1), "the copy takes it again");
+        assert!(!texture.changed(p / PAGE + 1), "the texture's tracker is left alone");
+        assert_eq!(copy.take(p, p + 2 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+        // SAFETY: a page of our pool, guarded: the handler opens it.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
+        assert!(copy.changed(p / PAGE + 1) && texture.changed(p / PAGE + 1), "a title write marks both");
+    }
+
     #[test]
     fn writes_mark_every_tracker_of_their_page() {
         let p = pool(4);
