@@ -204,7 +204,7 @@ fn seeds() -> [[u32; 4]; 64] {
 }
 
 fn tail(parts: &mut [[u32; 4]; 64], bytes: &[u8]) {
-    for (thread, chunk) in bytes.chunks_exact(16).enumerate() {
+    for (thread, chunk) in bytes.as_chunks::<16>().0.iter().enumerate() {
         let with = std::array::from_fn(|i| u32::from_le_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]));
         step(&mut parts[thread], with);
     }
@@ -265,7 +265,7 @@ fn piece_runs_join_without_losing_or_adding_pieces() {
 fn shader_piece(span: &CardSpan, i: u32) -> (u32, u32) {
     let piece = span.first + i;
     let lo = piece * 65536;
-    let lo = if lo > span.skew { lo - span.skew } else { 0 };
+    let lo = lo.saturating_sub(span.skew);
     let hi = (piece + 1) * 65536 - span.skew;
     (lo.max(span.from), hi.min(span.to))
 }
