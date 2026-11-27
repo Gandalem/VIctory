@@ -3099,7 +3099,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let since = crate::watch::changes();
+    let whole = read(src, dst, len)
+        || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -3118,7 +3120,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
-        read_pieces(src, dst, len);
+        read_pieces(src, dst, len, title_dst);
     }
 }
 
@@ -3143,7 +3145,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
+            read_pieces(at, to, remaining, false);
             break;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
@@ -3153,13 +3155,13 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             unsafe { to.write_bytes(0, n) };
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
-            read_pieces(at, to, n);
+            read_pieces(at, to, n, false);
         }
         offset += n;
     }
 }
 
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+fn read_pieces(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
@@ -3170,8 +3172,18 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    if title_dst {
+                        // Like cool_fox's zero fallback, never directly touch
+                        // a title page that may disappear during a remapping.
+                        static ZEROS: [u8; 4096] = [0; 4096];
+                        let since = crate::watch::changes();
+                        if !read(ZEROS.as_ptr(), to, n) {
+                            crate::watch::again_after_change(since, || read(ZEROS.as_ptr(), to, n));
+                        }
+                    } else {
+                        // SAFETY: inside the writable host destination.
+                        unsafe { to.write_bytes(0, n) };
+                    }
                 }
             });
         }
@@ -3207,13 +3219,19 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 /// per frame.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
-    if len == 0 || write(dst as usize, len) {
+    let since = crate::watch::changes();
+    if len == 0 || write(dst as usize, len)
+        || crate::watch::again_after_change(since, || write(dst as usize, len))
+    {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
         if !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                let since = crate::watch::changes();
+                if !write(at, n) {
+                    crate::watch::again_after_change(since, || write(at, n));
+                }
             });
         }
     });
@@ -3328,6 +3346,37 @@ mod title_copies {
                 assert!(out[..27].iter().chain(&out[N - 27..]).all(|&v| v == 0xee));
             }
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// Adapted from cool_fox's a_put_waits_for_a_change_of_mapping:
+    /// both copy paths recover when a physical view is only temporarily absent.
+    #[test]
+    fn title_copies_retry_during_a_mapping_change() {
+        for copy in [false, true] {
+            // SAFETY: a private reservation with no committed pages.
+            let at = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+            assert_ne!(at, 0);
+            let (began, wait) = std::sync::mpsc::channel();
+            let change = std::thread::spawn(move || {
+                let _changing = crate::watch::title_memory_remapping();
+                began.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                // SAFETY: the reservation's first page.
+                assert!(!unsafe { VirtualAlloc(at as _, 4096, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+            });
+            wait.recv().unwrap();
+            let source = [0x5au8; 64];
+            if copy {
+                copy_mapped(at as *mut u8, source.as_ptr(), source.len(), true);
+            } else {
+                write_mapped(at as *mut u8, source.as_ptr(), source.len());
+            }
+            change.join().unwrap();
+            // SAFETY: the worker committed this page and is no longer running.
+            assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, source.len()) }, &source);
+            // SAFETY: release our private reservation.
+            assert_ne!(unsafe { VirtualFree(at as _, 0, MEM_RELEASE) }, 0);
         }
     }
 

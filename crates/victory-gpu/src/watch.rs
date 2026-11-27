@@ -808,6 +808,78 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// Serializes the HLE's physical mapping transactions, including the gap
+/// where a larger view is taken away and its unaffected pages mapped again.
+/// Adapted from cool_fox's MAPPING/Remapping and CHANGES (f4b48ad).
+static MAPPING: Mutex<()> = Mutex::new(());
+
+/// Odd while a mapping transaction is under way, even after it finishes.
+static CHANGES: AtomicU64 = AtomicU64::new(0);
+
+#[must_use = "hold the guard until the mapping transaction is complete"]
+pub struct Remapping {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        CHANGES.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Held across the whole physical view unmap/remap operation, even on error.
+pub fn title_memory_remapping() -> Remapping {
+    let guard = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    CHANGES.fetch_add(1, Ordering::SeqCst);
+    Remapping { _guard: guard }
+}
+
+/// For `again_after_change`: sampled before the copy that may fail.
+pub(crate) fn changes() -> u64 {
+    CHANGES.load(Ordering::SeqCst)
+}
+
+/// `f` failed to read or write title memory, at some time since [`changes`]
+/// said `since`. If the runtime changed a mapping in that time, the pages
+/// may have been away for that moment only ([`MAPPING`]): again, when the
+/// change is done. Whether `f` did it.
+pub(crate) fn again_after_change(since: u64, mut f: impl FnMut() -> bool) -> bool {
+    let mut since = since;
+    for _ in 0..4 {
+        let now = change_done();
+        if now == since {
+            return false;
+        }
+        since = now;
+        if f() {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`changes`], when no change is under way (or one has been for a second).
+fn change_done() -> u64 {
+    let mut tries = 0;
+    let mut started = None;
+    loop {
+        let now = changes();
+        if now.is_multiple_of(2) {
+            return now;
+        }
+        tries += 1;
+        if tries < 100 {
+            std::hint::spin_loop();
+            continue;
+        }
+        if started.get_or_insert_with(std::time::Instant::now).elapsed().as_secs() >= 1 {
+            return now;
+        }
+        // SAFETY: gives the processor to another thread.
+        unsafe { windows_sys::Win32::System::Threading::Sleep(u32::from(tries > 200)) };
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
