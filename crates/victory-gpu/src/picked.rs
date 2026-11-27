@@ -297,11 +297,9 @@ impl State {
         for (id, at, len) in self.turn(most) {
             let hit = self.pending.get(&id).is_some_and(|&(lo, hi)|
                 lo < at.saturating_add(len) && at < hi);
-            if hit {
-                if let Some((lo, _)) = self.pending.remove(&id) {
-                    self.found.insert(id);
-                    found.push((id, lo));
-                }
+            if hit && let Some((lo, _)) = self.pending.remove(&id) {
+                self.found.insert(id);
+                found.push((id, lo));
             }
         }
         found
