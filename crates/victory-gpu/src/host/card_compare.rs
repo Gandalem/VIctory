@@ -434,6 +434,36 @@ impl CheckedRun {
 
 type CheckedRuns = std::collections::BTreeMap<(usize, usize, usize), CheckedRun>;
 
+/// Parallel source Check::look on the same stable, fenced mapping as
+/// the serial check. Result ordering stays identical to the fetch plan.
+/// # Safety
+/// The caller owns the completed exclusive readback for this entire call.
+unsafe fn parallel_check_fetch<'a>(pool: &CardFetch, batch: &[FetchPiece], checks: &'a CheckedRuns,
+    copies: &[std::sync::Arc<crate::shadow::Shadow>]) -> Vec<(u64, &'a CheckedPiece, bool)>
+{
+    let mut inputs = Vec::new();
+    let mut keys = Vec::new();
+    for piece in batch {
+        let check = &checks[&(piece.copy, piece.lo, piece.hi)];
+        let shadow = &copies[piece.copy];
+        let (start, _) = shadow.range();
+        let (from, to) = check.extent();
+        assert_eq!((from, to), (piece.lo, piece.hi));
+        // SAFETY: caller's checked fence and packed in-bounds offsets.
+        let bytes = unsafe { std::slice::from_raw_parts(
+            (pool.data as *const u8).add(piece.at as usize), to - from) };
+        for p in &check.pieces {
+            let block = (start as usize / PIECE + p.number as usize) * PIECE;
+            keys.push((shadow.id(), p));
+            inputs.push(super::land::HashInput {
+                block, bytes: &bytes[p.from - from..p.to - from], expected: p.hash,
+            });
+        }
+    }
+    let results = super::land::hash_many(&inputs);
+    keys.into_iter().zip(results).map(|((id, p), same)| (id, p, same)).collect()
+}
+
 /// # Safety
 /// The batch is a completed fetch into this live, exclusive mapping.
 /// The caller keeps it stable until all checks and landing finish.
@@ -443,21 +473,32 @@ unsafe fn check_fetch_batch(pool: &CardFetch, batch: &[FetchPiece], checks: &Che
 {
     let mut verified = Vec::new();
     let mut all_same = true;
-    for piece in batch {
-        let check = &checks[&(piece.copy, piece.lo, piece.hi)];
-        let id = copies[piece.copy].id();
-        // SAFETY: caller's checked fence and packed in-bounds offsets.
-        let bytes = unsafe { std::slice::from_raw_parts(
-            (pool.data as *const u8).add(piece.at as usize), piece.hi - piece.lo) };
-        for (p, same) in check.results(bytes) {
-            let key = (id, p.number);
-            if same {
-                verified.push(key);
-            } else {
-                suspects.fetched(key, false);
-                all_same = false;
-                tracing::warn!(copy = id, piece = p.number, from = p.from, to = p.to,
-                    "GPU readback hash mismatch");
+    let mut note = |id: u64, p: &CheckedPiece, same: bool| {
+        let key = (id, p.number);
+        if same {
+            verified.push(key);
+        } else {
+            suspects.fetched(key, false);
+            all_same = false;
+            tracing::warn!(copy = id, piece = p.number, from = p.from, to = p.to,
+                "GPU readback hash mismatch");
+        }
+    };
+    if super::land::on() {
+        // SAFETY: the checked mapping remains exclusive until the
+        // source landing pool has joined every hash job.
+        for (id, p, same) in unsafe { parallel_check_fetch(pool, batch, checks, copies) } {
+            note(id, p, same);
+        }
+    } else {
+        for piece in batch {
+            let check = &checks[&(piece.copy, piece.lo, piece.hi)];
+            let id = copies[piece.copy].id();
+            // SAFETY: caller's checked fence and packed in-bounds offsets.
+            let bytes = unsafe { std::slice::from_raw_parts(
+                (pool.data as *const u8).add(piece.at as usize), piece.hi - piece.lo) };
+            for (p, same) in check.results(bytes) {
+                note(id, p, same);
             }
         }
     }

@@ -425,6 +425,18 @@ checked direct-queue retry is mandatory; a second mismatch fails
 closed. Thus the source's cross-flight repair after concurrent
 landing is not enabled. Overlapping title submissions remain
 unported; this is still a serialized queue handoff.
+Experimental `VICTORY_LAND=1` with `VICTORY_FETCH_CHECK=1` adapts
+the reference land.rs reusable worker pool, 64 KiB block order,
+roughly 256 KiB jobs and torn::Check::look to CPU hash validation.
+`VICTORY_LAND_THREADS` selects 1--16 threads (including caller;
+default available parallelism divided by four, clamped to 1--4).
+The checked readback is read-only through every job, and all jobs
+finish before any mismatch decisions or landing. Small batches and
+one-thread configurations stay serial. Preserve exact result order,
+retry and suspect retirement. Title-memory merges remain serial:
+the current alias/guard semantics do not permit the reference's
+parallel title writes. This reduces CPU hash work on the critical
+thread, not GPU compare coverage or GPU submission waits.
 Experimental `VICTORY_LIST_DETACH=1` adapts the reference's Detached
 list/recording ownership to this branch's segmented Arc-based queues.
 All submitted segments share one owner for uploads and draw state,

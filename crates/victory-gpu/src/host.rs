@@ -28,6 +28,7 @@ mod late;
 
 pub(crate) use late::{PendingTitle, SettleWhy, late_enabled};
 mod torn;
+mod land;
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
