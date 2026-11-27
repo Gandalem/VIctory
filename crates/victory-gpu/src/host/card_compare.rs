@@ -653,6 +653,62 @@ fn declared_scope(runs: &[&HostList]) -> Option<CardScope> {
     Some(scope)
 }
 
+/// Reference picked::declare runs after the final CPU refresh and before
+/// the title lists. Keep the candidates separate from recorded GpuWrite
+/// steps: changing recorded lists would affect later replays.
+pub(super) fn prepare_picked(runs: &[&HostList]) -> Vec<crate::picked::Range> {
+    if !crate::picked::lands() || crate::memory::withholding() {
+        return Vec::new();
+    }
+    let mut shown = Vec::new();
+    let mut declared = Vec::new();
+    for list in runs {
+        let d = list.deferred();
+        if !d.after.is_empty() || !d.missed.is_empty()
+            || d.copies.iter().any(|s| matches!(s, Step::Memory(..) | Step::Run(..) | Step::Host(..)))
+        {
+            return Vec::new();
+        }
+        for step in &d.copies {
+            match step {
+                Step::Heap(viewed) if d.card_picked => shown.extend(viewed.picked_ranges()),
+                Step::GpuWrite(shadow, address, len, _, _) => {
+                    declared.push((shadow.clone(), *address, *len));
+                }
+                _ => {}
+            }
+        }
+    }
+    let ranges = crate::picked::known_ranges(shown, &declared);
+    for (shadow, address, len) in &ranges {
+        // Snapshot only after this submission's refreshes. Previously
+        // discovered GPU bytes are part of the baseline, not new writes.
+        shadow.writing(*address, *len, false);
+    }
+    ranges
+}
+
+/// Reference picked::with / hand_back: land newly written bytes before
+/// the title's completion signal. The current branch's mark and withholding
+/// semantics take precedence; release cancelled snapshots without merging.
+pub(super) fn finish_picked(ranges: &[crate::picked::Range], withholding: bool) {
+    if ranges.is_empty() {
+        return;
+    }
+    let marks = if withholding { None } else { crate::shadow::card_mark_ranges() };
+    for range in ranges {
+        let (shadow, address, len) = range;
+        let safe = marks.as_ref().is_some_and(|marks|
+            !marks.iter().any(|mark| crate::picked::overlaps(range, mark)));
+        if safe {
+            let written = shadow.copy_back(*address, *len);
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        } else {
+            shadow.keep_writes(*address, *len);
+        }
+    }
+}
+
 /// The source's picked-view discovery adapted to the existing full
 /// compare. Do not change which pieces are hashed, fetched or landed.
 /// Only a current UAV hull with no declaration or mark for the entire

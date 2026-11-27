@@ -899,6 +899,57 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     const LINEAR: u32 = 0x100;
 
+    /// Drive the production picked path with real GPU copies and a UAV
+    /// hull, but without an explicit GpuWrite for the first two submissions.
+    /// The first discovery must not land; only a later declared change may.
+    #[test]
+    #[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_PICKED_WRITES=2 and D3D12; run alone"]
+    fn picked_writes_land_only_after_discovery() {
+        let host = crate::host::host().expect("D3D12 device");
+        const PAGE: usize = 1 << 16;
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).expect("registered copy");
+        assert!(copy.card().is_some() && copy.marked(), "tracked card buffer required");
+        assert!(crate::picked::lands());
+        // SAFETY: owned test pages, initialized before their first refresh.
+        unsafe {
+            (p as *mut u32).write_unaligned(0);
+            ((p + PAGE) as *mut u32).write_unaligned(0);
+        }
+        let viewed = Arc::new(Viewed::default());
+        {
+            let mut inner = viewed.inner.lock().unwrap();
+            let seen = Seen::Buffer(copy.clone(), p as u64, len as u64, true);
+            inner.count(&seen, true);
+            inner.slots.insert(0, seen);
+        }
+        let submit = |value: u32, explicit: bool| {
+            let (upload, data) = host.upload_buffer(4).unwrap();
+            // SAFETY: four mapped bytes in a live upload buffer.
+            unsafe { data.cast::<u32>().write_unaligned(value) };
+            let list = host.new_list().unwrap();
+            list.defer_heap(&viewed);
+            list.note_card_picked();
+            if explicit {
+                copy.refresh(&list, (p + PAGE) as u64, 4);
+                copy.gpu_writes(&list, (p + PAGE) as u64, 4, false);
+            }
+            list.keep(&upload);
+            // SAFETY: live buffers, valid four-byte copy, open command list.
+            unsafe { list.list.CopyBufferRegion(&copy.buffer, 0, &upload, 0, 4) };
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: owned mapped pages after completed submission.
+            unsafe { (p as *const u32).read_unaligned() }
+        };
+        assert_eq!(submit(0x12345678, false), 0, "discovery is not retroactive");
+        assert_eq!(submit(0xabcdef01, false), 0xabcdef01, "new write lands");
+        assert_eq!(submit(0x55667788, true), 0xabcdef01, "explicit declaration owns copy");
+        crate::shadow::unregister(p, p as u64);
+    }
+
     /// A copy's hull is its live ranges' first start to last end, kept as
     /// slots come and go; a copy no slot views any more has none.
     #[test]

@@ -1,9 +1,9 @@
 //! Reference picked-view shader classification and write discovery.
 //! Source: DoubleGhosty/cool_fox@f4b48ad766ddbec1a1867022cd42f7645b0dd55e, picked.rs.
 //! This branch already compares all carded buffers for heap-indexed writes.
-//! Reuse those flags to observe possible undeclared writes. Unlike the
-//! reference's rotating discovery/landing path, this stage only diagnoses:
-//! no speculative declaration, delayed landing, or reduced coverage.
+//! Reuse those flags to observe possible undeclared writes. Stage 2
+//! registers previously found live UAV ranges before a future submission,
+//! never retroactively lands a discovery, and keeps full GPU coverage.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering::Relaxed;
@@ -12,8 +12,22 @@ use crate::pipeline::Shader;
 use crate::shadow::Shadow;
 
 pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PICKED_WRITES").is_some_and(|v| v == "1"))
+    stage() > 0
+}
+
+/// Reference stage selection: off, observation, or automatic landing.
+/// Stage 1 retains this branch's observation-only behavior.
+fn stage() -> u8 {
+    static STAGE: OnceLock<u8> = OnceLock::new();
+    *STAGE.get_or_init(|| match std::env::var("VICTORY_PICKED_WRITES").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+pub(crate) fn lands() -> bool {
+    stage() > 1
 }
 
 // Source picked.rs UNKNOWN / ASKED / NO / YES, stored on Shader here
@@ -120,9 +134,81 @@ pub(crate) fn found(copy: &Arc<Shadow>, at: usize) {
         entry.insert(Arc::downgrade(copy));
         let (start, len) = copy.range();
         tracing::info!(
-            "possible undeclared picked-view write: {start:#x}+{len:#x}, piece +{at:#x} (VICTORY_PICKED_WRITES=1); observed only"
+            "possible undeclared picked-view write: {start:#x}+{len:#x}, piece +{at:#x}; found for future submissions (VICTORY_PICKED_WRITES)"
         );
     }
+}
+
+/// A live UAV range, in title addresses. Adapt source picked::declare
+/// and picked::with to this branch's weak exact-owner registry.
+pub(crate) type Range = (Arc<Shadow>, usize, usize);
+
+fn key(range: &Range) -> (usize, usize, usize) {
+    (Arc::as_ptr(&range.0) as usize, range.1, range.2)
+}
+
+/// Existing declarations or marks may own a snapshot of the entire page.
+/// Exclude the same copy even for disjoint ranges, and overlapping title
+/// pages of distinct copies. This avoids double merge and alias conflicts.
+fn conflicts(a: (usize, usize, usize), b: (usize, usize, usize)) -> bool {
+    const PAGE: usize = 1 << 16;
+    if a.2 == 0 || b.2 == 0 {
+        return false;
+    }
+    a.0 == b.0
+        || (a.1 / PAGE <= b.1.saturating_add(b.2).saturating_sub(1) / PAGE
+            && b.1 / PAGE <= a.1.saturating_add(a.2).saturating_sub(1) / PAGE)
+}
+
+pub(crate) fn overlaps(a: &Range, b: &Range) -> bool {
+    conflicts(key(a), key(b))
+}
+
+/// Reference found -> shown intersection. Merge live hulls per exact copy,
+/// then exclude ambiguous ownership. No stale descriptor or found pointer
+/// alone is sufficient to create a write declaration.
+pub(crate) fn known_ranges(shown: Vec<Range>, declared: &[Range]) -> Vec<Range> {
+    let mut found = FOUND.lock().unwrap_or_else(|e| e.into_inner());
+    found.retain(|_, owner| owner.strong_count() != 0);
+    let mut hulls = BTreeMap::<usize, Range>::new();
+    for (copy, address, len) in shown {
+        let id = Arc::as_ptr(&copy) as usize;
+        if len == 0 || copy.card().is_none() || !copy.marked()
+            || !found.get(&id).is_some_and(|owner| owner.ptr_eq(&Arc::downgrade(&copy)))
+        {
+            continue;
+        }
+        let (start, size) = copy.range();
+        let from = address.max(start as usize);
+        let to = address.saturating_add(len).min(start.saturating_add(size) as usize);
+        if from >= to {
+            continue;
+        }
+        hulls.entry(id).and_modify(|h| {
+            let lo = h.1.min(from);
+            let hi = h.1.saturating_add(h.2).max(to);
+            h.1 = lo;
+            h.2 = hi - lo;
+        }).or_insert((copy, from, to - from));
+    }
+    drop(found);
+    let candidates: Vec<_> = hulls.into_values().collect();
+    let conflicts_with = |i: usize, range: &Range| {
+        declared.iter().any(|d| overlaps(range, d))
+            || candidates.iter().enumerate().any(|(j, other)| i != j && overlaps(range, other))
+    };
+    candidates.iter().enumerate().filter(|(i, range)| !conflicts_with(*i, range))
+        .map(|(_, range)| range.clone()).collect()
+}
+
+#[test]
+fn picked_declarations_exclude_same_copy_and_overlapping_title_pages() {
+    let page = 1 << 16;
+    assert!(conflicts((1, page, 4), (1, 4 * page, 4)));
+    assert!(conflicts((1, page, 4), (2, page + 4096, 4)));
+    assert!(conflicts((1, 2 * page - 1, 2), (2, 2 * page, 4)));
+    assert!(!conflicts((1, page, page), (2, 2 * page, page)));
+    assert!(!conflicts((1, page, 0), (1, page, 4)));
 }
 
 /// A hash flags a whole piece, not individual bytes. Any declaration or

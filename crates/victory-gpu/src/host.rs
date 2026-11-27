@@ -1663,6 +1663,7 @@ impl Host {
         batch.flush();
         // Reference two-sided buffers: upload changed CPU ranges and hash
         // their GPU baseline before title work reaches the direct queue.
+        let picked = card_compare::prepare_picked(runs);
         let carded = crate::shadow::carded();
         self.card_before(&carded, &mut submitted);
         let prepared = std::time::Instant::now();
@@ -1829,6 +1830,7 @@ impl Host {
         // The title fence has completed. Restore changed GPU pieces to
         // the CPU side before the existing marked/declared merge paths.
         self.card_back(&carded, runs, &mut submitted);
+        card_compare::finish_picked(&picked, withholding);
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();

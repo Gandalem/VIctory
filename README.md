@@ -294,10 +294,18 @@ A bounded background queue analyzes shaders using this branch's native
 IR; the current UAV hulls and existing completed GPU comparison flags
 identify possible undeclared writes. Pieces intersecting a declaration
 or write mark are excluded, as are ambiguous title-memory submissions.
-No extra GPU compare, reduced coverage or automatic declaration/landing
-is introduced. The source's rotating probes, picked-write landing and
-async relay remain unported. These optional paths need real-adapter
-verification.
+No extra GPU compare or reduced coverage is introduced.
+Experimental `VICTORY_PICKED_WRITES=2` additionally declares the
+currently visible UAV hulls of previously discovered, tracked card
+copies after the final refresh. Only changes made in that subsequent
+submission are merged. Existing declarations, aliased title pages,
+ambiguous memory callbacks, held-back writes or unknown/overlapping
+GPU marks take precedence: cancel automatic landing and release its
+snapshot. This does not retroactively land the original discovery.
+The source's rotating GPU probes and async relay remain unported.
+Run the ignored `picked_writes_land_only_after_discovery` test with
+the card-buffer options and `VICTORY_PICKED_WRITES=2` on an adapter.
+These optional paths need real-adapter verification.
 Loose windows and exact-view arenas stay on the existing path. Run the
 ignored `carded_shadow_refresh_compare_and_copy_back` test with
 `VICTORY_CARD_BUFFERS=1` and `VICTORY_CARD_BUFFERS_MIN_KB=64` on a real
