@@ -702,6 +702,22 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    // Source many_page_mapper: retain the single-call path unless
+    // the runtime opted into batch mapping. Bound the gathered list.
+    let many = crate::resource::many_page_mapper();
+    let mut gathered = Vec::with_capacity(64);
+    let mut gathered_ok = true;
+    let mut map = |to, from, len| match many {
+        Some(many) => {
+            gathered.push((to, from, len));
+            if gathered.len() == 64 {
+                gathered_ok &= many(&gathered);
+                gathered.clear();
+            }
+            true
+        }
+        None => map(to, from, len),
+    };
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -721,6 +737,12 @@ extern "system" fn copy_page_mappings(
                 _ => false,
             };
             at += len;
+        }
+    }
+    if let Some(many) = many {
+        ok &= gathered_ok;
+        if !gathered.is_empty() {
+            ok &= many(&gathered);
         }
     }
     if !ok {

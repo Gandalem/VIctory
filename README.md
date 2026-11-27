@@ -500,8 +500,22 @@ split and their surviving neighbors remapped. Cap the hint cache
 at 65,536 entries (discarding hints only costs a redundant split).
 Keep the existing physical reverse map, mapping transaction and
 guard notifications. Real Windows tests exercise split elision,
-stale-hint fallback and retained contents. Parallel remapping and
-the GPU alternate-view journal remain unported.
+stale-hint fallback and retained contents.
+Experimental `VICTORY_MAP_THREADS=2` through `16` ports the
+reference xmem scatter/map_aliases, Op/change and pool::all, and
+the GPU ManyPageMapper callback. Default 1 preserves the original
+serial path. Group at most 64 independent single-page operations;
+split placeholders on the caller, perform independent exact-page
+unmaps/maps on reusable workers, then publish alias/guard
+metadata after completion. Failed direct maps retry serially;
+failed unmaps restore the previous owner metadata. Duplicate
+destinations and read-after-map dependencies break groups.
+Larger mapped-view edits, multi-page alias ranges and self-alias
+ranges retain the serial path. The source auto-thread policy and
+priority changes are not enabled. Like the source, independent
+batch operations may finish even if another operation fails.
+GPU alternate-view journal and overlapping title flights remain
+unported.
 Run the ignored `parallel_staging_landing_preserves_pending_cpu_bytes`
 test with the send-order and landing options. No GPU compare
 coverage or submission waits are removed.
