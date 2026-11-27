@@ -1666,6 +1666,12 @@ impl Host {
         let picked = card_compare::prepare_picked(runs);
         let carded = crate::shadow::carded();
         self.card_before(&carded, &mut submitted);
+        // As in source CardPlan::check, pre-record the check for the
+        // same title fence. Keep the original per-list timing path.
+        #[cfg(feature = "diagnostics")]
+        let tail = if timing() { None } else { self.prepare_card_tail(&carded) };
+        #[cfg(not(feature = "diagnostics"))]
+        let tail = self.prepare_card_tail(&carded);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1691,6 +1697,11 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                // A tail is only prepared for the non-timed single group.
+                // Its command allocator and card owners remain live.
+                if i + 1 == groups.len() && let Some(tail) = &tail {
+                    self.enqueue_card_tail(tail);
+                }
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -1829,7 +1840,7 @@ impl Host {
             .collect();
         // The title fence has completed. Restore changed GPU pieces to
         // the CPU side before the existing marked/declared merge paths.
-        self.card_back(&carded, runs, &mut submitted);
+        self.card_back(&carded, runs, tail, &mut submitted);
         card_compare::finish_picked(&picked, withholding);
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.

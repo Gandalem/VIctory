@@ -330,6 +330,18 @@ live UAV comparison coverage; the default remains full allocation
 because padding-only GPU writes are not mirrored in this optional
 mode. The sync list also records all uploads, a single transition batch,
 then all independent hash passes, as in the source's card_before.
+Experimental `VICTORY_CARD_CHECK_TAIL=1` ports the reference's
+CardPlan::check tail recording: prepare the full compare/flag-readback
+list before title work, queue it immediately after the title group
+with a separate ExecuteCommandLists call (preserving buffer decay),
+and use the same checked title fence. Keep its allocator and owners
+until completion; the existing fetch and CPU copy-back still follow.
+This removes one independent check fence wait on eligible submissions.
+With `VICTORY_CARD_COMPARE_RANGES=1` or per-list GPU timing enabled,
+use the previous post-fence check path. This is not asynchronous relay:
+the next title submission still waits for the current CPU merge.
+Run the ignored `card_check_tail_shares_title_fence` test on an adapter
+with the card-buffer and tail options, ranges/timing off.
 Run the ignored `logical_card_hash_length_excludes_padding_writes`
 test with the card-buffer options and `VICTORY_CARD_HASH_LEN=1`.
 Run the ignored `deferred_card_hash_does_not_repeat_a_fetched_change`

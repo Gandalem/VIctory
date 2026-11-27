@@ -585,6 +585,12 @@ impl Host {
                 fail(format_args!("card prelude device removed: {e}"));
             }
         }
+        self.recycle_card_list(phase, work);
+    }
+
+    /// Called only after the fence covering the list was checked, including
+    /// the title-fence path. The caller holds the submission lock.
+    fn recycle_card_list(&self, phase: CardPhase, work: CardPrelude) {
         // Only completed work is ever put back. Keep one per phase;
         // it is impossible to overwrite another in-flight allocator.
         let mut lists = self.card_lists.lock().unwrap_or_else(|e| e.into_inner());
@@ -897,6 +903,97 @@ fn deferred_hashes_commit_only_fetched_pieces() {
     assert!(fetched_hash_runs(&[]).is_empty());
 }
 
+type CardPlans = Vec<(usize, Vec<CardSpan>)>;
+
+/// Source CardPlan::check and lists ownership, adapted to the serial
+/// submission lock. The owning carded snapshot remains live until
+/// card_back has consumed the flags; only the allocator/list is recycled.
+pub(super) struct CardCheck {
+    work: CardPrelude,
+    commands: [Option<ID3D12CommandList>; 1],
+    plans: CardPlans,
+}
+
+fn check_tail_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_CHECK_TAIL").is_some_and(|v| v == "1"))
+}
+
+fn card_plans(copies: &[std::sync::Arc<crate::shadow::Shadow>], scope: Option<&CardScope>) -> CardPlans {
+    copies.iter().enumerate().filter_map(|(copy, shadow)| {
+            shadow.card()?;
+            let (start, _) = shadow.range();
+            let ranges = scope.as_ref().map(|s| s.get(&(std::sync::Arc::as_ptr(shadow) as usize))
+                .map_or(&[][..], Vec::as_slice));
+            let spans = compare_spans(start as usize, shadow.card_hash_size() as usize, ranges);
+            (!spans.is_empty()).then_some((copy, spans))
+    }).collect()
+}
+
+impl Host {
+    fn record_card_check(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>],
+        plans: &CardPlans, deferred: bool) -> CardPrelude
+    {
+        let list = self.card_list(CardPhase::Check);
+        // Source CardPlan::check begins with a global UAV barrier.
+        // The separate ExecuteCommandLists call preserves buffer decay
+        // between the title command group and this check.
+        compare_barrier(&list.list);
+        for (copy, spans) in plans {
+            let shadow = &copies[*copy];
+            let card = shadow.card().expect("planned card copy");
+            // SAFETY: the check executes after title work. All buffers live,
+            // and spans are disjoint complete pieces with valid flag offsets.
+            unsafe {
+                card.work.bind(&list.list, &shadow.buffer);
+                for span in spans {
+                    // Source's synchronous compare-only mode: no hash
+                    // is overwritten until the changed bytes are fetched.
+                    card_pass(&list.list, span, shadow.card_hash_size() as u32, span.first, if deferred { 1 } else { 2 });
+                }
+                compare_barrier(&list.list);
+                list.list.ResourceBarrier(&[transition(&card.work.differs,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                for span in spans {
+                    let at = u64::from(span.first) * 4;
+                    list.list.CopyBufferRegion(&card.work.flags, at, &card.work.differs, at,
+                        u64::from(span.pieces) * 4);
+                }
+            }
+        }
+        list
+    }
+
+    /// The reference records CardPlan::check before sending title work.
+    /// Marks are not available until the fence, so the post-fence
+    /// declared-range option deliberately keeps the older path.
+    pub(super) fn prepare_card_tail(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>]) -> Option<CardCheck> {
+        if !check_tail_enabled() || ranges_enabled() {
+            return None;
+        }
+        let plans = card_plans(copies, None);
+        if plans.is_empty() {
+            return None;
+        }
+        let work = self.record_card_check(copies, &plans, deferred_hashes());
+        // SAFETY: a freshly recorded open list; all owners live in the
+        // caller's carded snapshot for the entire submission.
+        let command = unsafe { work.list.Close() }.and_then(|()| work.list.cast())
+            .unwrap_or_else(|e| fail(format_args!("could not close card check tail: {e}")));
+        Some(CardCheck { work, commands: [Some(command)], plans })
+    }
+
+    /// # Safety
+    /// The submission lock is held, all title groups have been queued,
+    /// and the next checked fence covers this list too.
+    pub(super) unsafe fn enqueue_card_tail(&self, check: &CardCheck) {
+        // SAFETY: the caller owns the closed command list and its resources.
+        // Use a distinct queue execution, not the same list array: the
+        // current renderer relies on D3D12 buffer COMMON decay.
+        unsafe { self.queue.ExecuteCommandLists(&check.commands) };
+    }
+}
+
 impl Host {
     /// Adapt the source card_before: copy CPU-dirty ranges, then hash the
     /// joined pieces on the device before the title's lists execute.
@@ -956,49 +1053,34 @@ impl Host {
     /// the fence and land flagged full pieces before the CPU merge.
     /// Full coverage is the default and the conservative fallback.
     pub(super) fn card_back(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>],
-        runs: &[&HostList], submitted: &mut u64)
+        runs: &[&HostList], tail: Option<CardCheck>, submitted: &mut u64)
     {
         if copies.is_empty() {
             return;
         }
         let deferred = deferred_hashes();
-        let scope = declared_scope(runs);
         let mut picked = picked_observation(runs);
-        let plans: Vec<_> = copies.iter().enumerate().filter_map(|(copy, shadow)| {
-            shadow.card()?;
-            let (start, _) = shadow.range();
-            let ranges = scope.as_ref().map(|s| s.get(&(std::sync::Arc::as_ptr(shadow) as usize))
-                .map_or(&[][..], Vec::as_slice));
-            let spans = compare_spans(start as usize, shadow.card_hash_size() as usize, ranges);
-            (!spans.is_empty()).then_some((copy, spans))
-        }).collect();
-        if plans.is_empty() {
-            return;
-        }
-        let list = self.card_list(CardPhase::Check);
-        for (copy, spans) in &plans {
-            let shadow = &copies[*copy];
-            let card = shadow.card().expect("planned card copy");
-            // SAFETY: the title submission finished. All buffers live,
-            // and spans are disjoint complete pieces with valid flag offsets.
-            unsafe {
-                card.work.bind(&list.list, &shadow.buffer);
-                for span in spans {
-                    // Source's synchronous compare-only mode: no hash
-                    // is overwritten until the changed bytes are fetched.
-                    card_pass(&list.list, span, shadow.card_hash_size() as u32, span.first, if deferred { 1 } else { 2 });
-                }
-                compare_barrier(&list.list);
-                list.list.ResourceBarrier(&[transition(&card.work.differs,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                for span in spans {
-                    let at = u64::from(span.first) * 4;
-                    list.list.CopyBufferRegion(&card.work.flags, at, &card.work.differs, at,
-                        u64::from(span.pieces) * 4);
-                }
+        let plans = if let Some(check) = tail {
+            // Host::execute checked the title fence and device status,
+            // and its tail was queued before that fence. Assert the
+            // completed value here too before recycling the allocator.
+            // SAFETY: a plain query under the submission lock.
+            if unsafe { self.fence.GetCompletedValue() } < *submitted {
+                fail(format_args!("card check tail fence incomplete"));
             }
-        }
-        self.run_card_list(CardPhase::Check, list, submitted);
+            let CardCheck { work, commands: _, plans } = check;
+            self.recycle_card_list(CardPhase::Check, work);
+            plans
+        } else {
+            let scope = declared_scope(runs);
+            let plans = card_plans(copies, scope.as_ref());
+            if plans.is_empty() {
+                return;
+            }
+            let list = self.record_card_check(copies, &plans, deferred);
+            self.run_card_list(CardPhase::Check, list, submitted);
+            plans
+        };
         let mut fetches = Vec::new();
         let mut total = 0u64;
         for (copy, spans) in plans {
@@ -1087,6 +1169,55 @@ impl Host {
     }
 }
 
+
+/// Exercise the real tail path and verify that the check shares the
+/// title fence on both a changed and a clean submission.
+#[test]
+#[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_CHECK_TAIL=1, ranges/timing off and D3D12; run alone"]
+fn card_check_tail_shares_title_fence() {
+    let host = host().expect("D3D12 device");
+    assert!(check_tail_enabled() && !ranges_enabled());
+    #[cfg(feature = "diagnostics")]
+    assert!(!timing());
+    let p = crate::watch::tests::pool(2);
+    let len = 2 * PIECE;
+    crate::shadow::register(p, p as u64, len as u64);
+    let shadow = crate::shadow::find(p as u64, len as u64).expect("registered copy");
+    let card = shadow.card().expect("device-local copy");
+    // SAFETY: two mapped title pages belong to this test.
+    unsafe { (p as *mut u32).write_unaligned(0) };
+    let warm = host.new_list().unwrap();
+    shadow.refresh(&warm, p as u64, len as u64);
+    warm.close();
+    host.execute(&[&warm]);
+
+    let current = || *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let before = current();
+    let (upload, data) = host.upload_buffer(4).unwrap();
+    let value = 0x24681357u32;
+    // SAFETY: four mapped upload bytes.
+    unsafe { data.cast::<u32>().write_unaligned(value) };
+    let changed = host.new_list().unwrap();
+    changed.keep(&upload);
+    // SAFETY: open command list, live buffers, and in-bounds copy.
+    unsafe { changed.list.CopyBufferRegion(&shadow.buffer, 0, &upload, 0, 4) };
+    changed.close();
+    host.execute(&[&changed]);
+    assert_eq!(current() - before, 2, "one title/check fence and one fetch fence");
+    assert_eq!(shadow.read_host(p as u64, 1), [value]);
+    // SAFETY: flags were read back before the completed title fence.
+    assert_eq!(unsafe { (card.work.flags_data as *const u32).read() } & 1, 1);
+
+    let clean = host.new_list().unwrap();
+    clean.close();
+    let before = current();
+    host.execute(&[&clean]);
+    assert_eq!(current() - before, 1, "no separate check fence or fetch");
+    // SAFETY: the next check's flags have completed too.
+    assert_eq!(unsafe { (card.work.flags_data as *const u32).read() } & 1, 0);
+    assert_eq!(shadow.read_host(p as u64, 1), [value]);
+    crate::shadow::unregister(p, p as u64);
+}
 
 /// Exercise source-length hashing in the production path on a real
 /// adapter. The last owned byte changes, but a separate padding-only
