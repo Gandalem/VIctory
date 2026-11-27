@@ -363,7 +363,109 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    pages: usize,
+    /// Source Section::window: one mapping of this section, kept until
+    /// its final owner goes away. Zero records a failed map.
+    window: std::sync::OnceLock<usize>,
+    committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// The source permits many windows. The shared virtual mapping must
+    /// not yield overlapping Rust mutable slices, so reserve disjoint
+    /// page intervals here; contended requests use the old separate view.
+    leased: Mutex<Vec<(usize, usize)>>,
+}
+
+fn section_window_enabled() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_some_and(|v| v == "1"));
+    *ON
+}
+
+impl Section {
+    fn new(handle: HANDLE, pages: usize) -> Self {
+        Self {
+            handle, pages,
+            window: std::sync::OnceLock::new(),
+            committed: (0..pages.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            leased: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Original fork's persistent section view and per-page commit
+    /// bitmap. As in the reference, the section is pinned by its Arc
+    /// during every write. Keep the current remap/notification path.
+    fn window(self: &Arc<Self>, index: usize, n: usize) -> Option<KeptWindow> {
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        let end = index.checked_add(n).filter(|&end| n != 0 && end <= self.pages)?;
+        let base = *self.window.get_or_init(|| {
+            // SAFETY: this is the whole of a live section we own.
+            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
+        });
+        if base == 0 {
+            return None;
+        }
+        {
+            let mut leased = self.leased.lock().unwrap_or_else(|e| e.into_inner());
+            if leased.iter().any(|&(a, b)| a < end && index < b) {
+                return None;
+            }
+            leased.push((index, end));
+        }
+        // Construct the lease before committing, so failure releases it.
+        let kept = KeptWindow { section: self.clone(), at: base + index * PAGE, index, end };
+        let missing = |page: usize| self.committed[page / 64].load(Ordering::Acquire) >> (page % 64) & 1 == 0;
+        let mut page = index;
+        while page < end {
+            if !missing(page) {
+                page += 1;
+                continue;
+            }
+            let run = (page..end).take_while(|&p| missing(p)).count();
+            if run == 0 {
+                continue;
+            }
+            if !commit(base + page * PAGE, run * PAGE) {
+                return None;
+            }
+            for p in page..page + run {
+                self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
+            }
+            page += run;
+        }
+        Some(kept)
+    }
+}
+
+/// Keeps this particular shared-view interval reserved until the
+/// DirectStorage copy/decode is done. Separate mappings remain the
+/// fallback, including for overlapping requests.
+struct KeptWindow {
+    section: Arc<Section>,
+    at: usize,
+    index: usize,
+    end: usize,
+}
+
+impl KeptWindow {
+    fn bytes(&mut self) -> &mut [u8] {
+        // SAFETY: committed interval of the pinned section's mapping.
+        // No other KeptWindow can name these virtual bytes while this
+        // lease lives. Physical aliasing through other views is the
+        // existing console-memory contract.
+        unsafe { std::slice::from_raw_parts_mut(self.at as *mut u8, (self.end - self.index) * PAGE) }
+    }
+}
+
+impl Drop for KeptWindow {
+    fn drop(&mut self) {
+        let mut leased = self.section.leased.lock().unwrap_or_else(|e| e.into_inner());
+        let i = leased.iter().position(|&r| r == (self.index, self.end))
+            .expect("live section window lease");
+        leased.swap_remove(i);
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -372,8 +474,15 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        if let Some(&base) = self.window.get()
+            && base != 0
+        {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            // SAFETY: our view. Every live kept window pins this Arc.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }) };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -515,7 +624,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section::new(handle, n));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -549,11 +658,14 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     if pages.is_null() {
         return 0;
     }
+    // SAFETY: the title passes n page numbers.
+    let numbers = unsafe { std::slice::from_raw_parts(pages, n) }.to_vec();
     let mut physical = physical();
-    for i in 0..n {
-        // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
-    }
+    // Source XMemFreePhysicalPages: unmap any final section window
+    // outside the physical table lock.
+    let gone: Vec<_> = numbers.iter().filter_map(|number| physical.pages.remove(number)).collect();
+    drop(physical);
+    drop(gone);
     1
 }
 
@@ -572,7 +684,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -599,6 +711,29 @@ impl Drop for View {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(self.at) };
+    }
+}
+
+/// Original fork's Window::Kept / Own choice. Preserve the original
+/// transient mapping on an unavailable or disabled shared view.
+enum Window {
+    Kept(KeptWindow),
+    Own(View),
+}
+
+impl Window {
+    fn make(slice: &Slice, n: usize, kept: bool) -> Option<Self> {
+        if kept && let Some(window) = slice.section.window(slice.index, n) {
+            return Some(Self::Kept(window));
+        }
+        Some(Self::Own(View::map(slice, n)?))
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        match self {
+            Self::Kept(view) => view.bytes(),
+            Self::Own(view) => view.bytes(),
+        }
     }
 }
 
@@ -638,7 +773,12 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
+        let Some(mut view) = Window::make(slice, *n, section_window_enabled()) else {
+            // Bytes in earlier runs may already have landed. Retain the
+            // current notification contract even on a later map failure.
+            if done != 0 {
+                report_written(&shown_at(pages.get(offset / PAGE..(offset + done).div_ceil(PAGE)).unwrap_or(&[])));
+            }
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
@@ -654,7 +794,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
 pub(crate) struct PageWindow {
-    view: View,
+    view: Window,
     within: usize,
     len: usize,
     /// The pages (page numbers) the bytes reach: the title views showing
@@ -685,12 +825,16 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
+    page_window_with(pages, offset, len, section_window_enabled())
+}
+
+fn page_window_with(pages: &[usize], offset: usize, len: usize, kept: bool) -> Option<PageWindow> {
     let runs = runs(pages, offset, len)?;
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view: Window::make(slice, *n, kept)?,
         within: offset % PAGE,
         len,
         pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
@@ -814,7 +958,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -1446,6 +1590,66 @@ mod tests {
         REPORTED.with(|r| r.borrow_mut().clear());
         assert!(write_physical(&pages, 0, &[4]));
         assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    /// Real Windows section views, not a model: retain the source
+    /// mapping, commit only first-use pages, and reuse its address.
+    #[test]
+    fn kept_section_windows_reuse_mapping_and_disallow_overlapping_leases() {
+        let pages = allocate(3);
+        let slices = runs(&pages, 0, 3 * PAGE).unwrap();
+        let section = slices[0].0.section.clone();
+        assert!(section.window(3, 1).is_none());
+        assert!(section.window(0, 0).is_none());
+        let mut a = section.window(0, 2).expect("kept view");
+        let at = a.at;
+        assert!(section.window(1, 1).is_none());
+        let mut b = section.window(2, 1).expect("disjoint kept view");
+        assert_eq!(b.at, at + 2 * PAGE);
+        a.bytes()[17] = 0x23;
+        b.bytes()[3] = 0x45;
+        assert_eq!(section.committed[0].load(std::sync::atomic::Ordering::Acquire) & 7, 7);
+        // Contended requests keep the original transient-map path.
+        let fallback = Window::make(&slices[0].0, 1, true).unwrap();
+        assert!(matches!(&fallback, Window::Own(_)));
+        drop(fallback);
+        drop(a);
+        let mut again = section.window(0, 1).unwrap();
+        assert_eq!(again.at, at);
+        assert_eq!(again.bytes()[17], 0x23);
+        assert_eq!(b.bytes()[3], 0x45);
+        let weak = Arc::downgrade(&section);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+        drop(slices);
+        drop(section);
+        assert!(weak.upgrade().is_some(), "both windows pin the section");
+        drop(b);
+        assert!(weak.upgrade().is_some());
+        drop(again);
+        assert!(weak.upgrade().is_none(), "last window releases the section");
+    }
+
+    /// The kept path must retain the existing report-at-completion
+    /// behavior, even if the title remaps the page during decode.
+    #[test]
+    fn kept_page_window_reports_the_current_view_after_remapping() {
+        let pages = allocate(1);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        REPORTED.with(|r| r.borrow_mut().clear());
+        let mut window = page_window_with(&pages, 17, 16, true).expect("kept window");
+        assert!(matches!(&window.view, Window::Kept(_)));
+        assert_eq!(XMemMapPhysicalPages(b, 1, pages.as_ptr()), b);
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        window.bytes().fill(0x67);
+        drop(window);
+        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        // SAFETY: b is the live mapping of the physical page.
+        assert_eq!(unsafe { b.cast::<u8>().add(17).read() }, 0x67);
         assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }

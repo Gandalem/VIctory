@@ -467,6 +467,20 @@ and upload. With the switch off the previous path is unchanged.
 The original landed_beside journal, generation-based publication
 and concurrent title merges are still not enabled. Run the ignored
 `exact_marked_landing_can_revalidate_the_completed_block` test.
+Experimental `VICTORY_SECTION_WINDOW=1` ports the reference HLE
+xmem::Section::window, its per-page committed bitmap and
+Window::Kept/Own to the DirectStorage physical-write/decode paths.
+Keep a section's mapping while the section lives; commit missing
+64 KiB pages in runs and reuse its view for later writes. The
+current physical mapping and guard notification contract stays:
+report the title addresses showing those pages at completion.
+Pin the section with every kept window, reserve disjoint intervals
+to avoid overlapping mutable virtual slices, and fall back to
+the original per-request view on contention or allocation failure.
+Release the final cached view before closing the section handle.
+No GPU alternate-view write or journal-based clean skip is enabled;
+this is a distinct, directly ported HLE optimization. The default
+continues to use the old temporary view.
 Run the ignored `parallel_staging_landing_preserves_pending_cpu_bytes`
 test with the send-order and landing options. No GPU compare
 coverage or submission waits are removed.
