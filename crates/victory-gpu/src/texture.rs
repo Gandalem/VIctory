@@ -45,8 +45,10 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Host mips per array slice.
     mips: u32,
+    /// Title mip corresponding to host level zero.
+    first_mip: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -72,13 +74,13 @@ struct Last {
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
 /// are its mips), the bytes of the texture's memory it lies in, rounded out
 /// to the layout's blocks; empty if the layout cannot say.
-fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32) -> Vec<(usize, usize)> {
+fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32, first_mip: u32) -> Vec<(usize, usize)> {
     use victory_formats::texture::Dimension;
     let d = &layout.desc;
     let block = layout.alignment.max(256);
     (0..count)
         .map(|i| {
-            let (mip, slice) = (i % mips, i / mips);
+            let (mip, slice) = (i % mips + first_mip, i / mips);
             let m = layout.mips.get(mip as usize)?;
             let (z0, z1) = if d.dimension == Dimension::Tex3d { (0, m.depth.max(1) - 1) } else { (slice, slice) };
             let first = layout.offset(mip, 0, 0, z0).ok()?;
@@ -290,14 +292,24 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     };
     let (fa, ra, total) = footprints(&da, count(&da));
     let (fb, rb, _) = footprints(&db, count(&db));
-    // Subresources in order while both have the same bytes there (mips of
-    // a block-compressed texture past its last whole block do not).
-    let n = (0..fa.len().min(fb.len()))
-        .take_while(|&i| {
+    // Map aliases by their title mip/slice when either host texture is
+    // shortened. Otherwise preserve the original prefix-copy behavior.
+    let pairs: Vec<(usize, usize)> = if crate::resource::dropped(from, &a) > 0 || crate::resource::dropped(to, &b) > 0 {
+        let count = crate::resource::title_subresources(from).min(crate::resource::title_subresources(to));
+        (0..count).filter_map(|i| {
+            Some((crate::resource::host_subresource(from, &a, i)? as usize,
+                  crate::resource::host_subresource(to, &b, i)? as usize))
+        }).take_while(|&(i, j)| {
+            i < fa.len() && j < fb.len() && fa[i].Footprint.RowPitch == fb[j].Footprint.RowPitch
+                && ra[i] == rb[j] && fa[i].Footprint.Depth == fb[j].Footprint.Depth
+        }).collect()
+    } else {
+        (0..fa.len().min(fb.len())).take_while(|&i| {
             let (x, y) = (fa[i], fb[i]);
             x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && ra[i] == rb[i] && x.Footprint.Depth == y.Footprint.Depth
-        })
-        .count() as u32;
+        }).map(|i| (i, i)).collect()
+    };
+    let n = pairs.len() as u32;
     if n == 0 {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return;
@@ -322,16 +334,18 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let l = &list.list;
     // SAFETY: an open list; live resources in the states named.
     unsafe {
-        for i in 0..n {
-            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
+        for &(i, _) in &pairs {
+            l.CopyTextureRegion(&place(&buffer, fa[i]), 0, 0, 0, &sub(&a, i as u32), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
-        for i in 0..n {
-            l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
+        for &(i, j) in &pairs {
+            let mut footprint = fb[j];
+            footprint.Offset = fa[i].Offset;
+            l.CopyTextureRegion(&sub(&b, j as u32), 0, 0, 0, &place(&buffer, footprint), None);
         }
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -699,7 +713,7 @@ impl Staging {
             let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip + self.first_mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return None;
@@ -815,13 +829,15 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
-    let spans = spans(&layout, count, u32::from(d.MipLevels));
+    let first_mip = crate::resource::dropped(resource, texture);
+    let spans = spans(&layout, count, u32::from(d.MipLevels), first_mip);
     let s = Arc::new(Staging {
         size: total,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        first_mip,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         spans,
@@ -836,6 +852,44 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_texture_staging_reads_original_mip_and_slice() {
+        use windows::core::Interface;
+        let Some(_host) = host() else { return };
+        let words: [u32; 14] = [3, 0, 0, 0, 512, 0, 512, (5 << 16) | 2, 28, 1, 0, 1, 0, 0];
+        // SAFETY: the C-layout resource description consists of these words.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+        let title = &crate::resource::texture_layout(&desc).unwrap().planes[0].layout;
+        let bytes: Vec<u8> = (0..title.size).map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8).collect();
+        let mut image = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(
+            std::ptr::null(), bytes.as_ptr() as u64, &desc, 0, std::ptr::null(),
+            std::ptr::from_ref(&ID3D12Resource::IID).cast(), &mut image
+        ), crate::object::S_OK);
+        let texture = crate::resource::host_resource(image).unwrap();
+        let upload = staging(image, &texture).unwrap();
+        let drop = crate::resource::dropped(image, &texture);
+        assert_eq!(upload.first_mip, drop);
+        assert_eq!(upload.mips, 5 - drop);
+        let full = spans(title, 10, 5, 0);
+        assert!(!full.is_empty());
+        for slice in 0..2 {
+            for mip in 0..upload.mips {
+                let host_index = (slice * upload.mips + mip) as usize;
+                let title_index = (slice * 5 + mip + drop) as usize;
+                assert_eq!(upload.spans[host_index], full[title_index]);
+                let f = upload.footprints[host_index];
+                let pitch = f.Footprint.RowPitch as usize;
+                let rows = upload.rows[host_index] as usize;
+                let len = pitch * rows;
+                let mut expected = vec![0u8; len];
+                title.detile(&bytes, mip + drop, slice, &mut expected, pitch, len).unwrap();
+            }
+        }
+        std::mem::drop(upload);
+        assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

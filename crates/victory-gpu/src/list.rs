@@ -652,6 +652,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            let levelwise = crate::resource::dropped(dst, &to) != crate::resource::dropped(src, &from);
+            if levelwise && !crate::resource::matching_copy_shape(dst, src) {
+                tracing::warn!("incompatible whole-texture copy with omitted mip levels");
+                return;
+            }
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
@@ -660,8 +665,12 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::host_writes(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(&to, &from) };
+            if levelwise {
+                copy_retained_levels(list, dst, &to, src, &from);
+            } else {
+                // SAFETY: an open list and live textures.
+                unsafe { list.list.CopyResource(&to, &from) };
+            }
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -671,6 +680,32 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
+}
+
+/// Copy every title mip present on both host textures, with independent
+/// host subresource numbering for each array slice.
+#[cfg(windows)]
+fn copy_retained_levels(
+    list: &crate::host::HostList,
+    dst: This,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    src: This,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let location = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: the borrowed resource is kept alive by the list.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+    };
+    let n = crate::resource::title_subresources(dst).min(crate::resource::title_subresources(src));
+    for index in 0..n {
+        let (Some(d), Some(s)) = (crate::resource::host_subresource(dst, to, index),
+                                  crate::resource::host_subresource(src, from, index)) else { continue };
+        // SAFETY: both retained subresources have matching title dimensions.
+        unsafe { list.list.CopyTextureRegion(&location(to, d), 0, 0, 0, &location(from, s), None) };
+    }
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -718,6 +753,13 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
+        let mut dst = dst;
+        if dst.kind != FOOTPRINT && crate::resource::dropped(dst.resource, &to) > 0 {
+            let Some(index) = crate::resource::host_subresource(dst.resource, &to, dst.footprint.offset as u32) else {
+                return; // explicitly omitted high-resolution mip
+            };
+            dst.footprint.offset = u64::from(index);
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -747,6 +789,12 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::resource::dropped(src.resource, &texture) > 0 {
+                let Some(index) = crate::resource::host_subresource(src.resource, &texture, src.footprint.offset as u32) else {
+                    return; // explicitly omitted high-resolution mip
+                };
+                from.footprint.offset = u64::from(index);
+            }
             if crate::texture::title_written(&texture) {
                 crate::texture::upload(list, src.resource, &texture);
             }
@@ -830,11 +878,14 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     };
     // SAFETY: the title's box (same layout as the host's) or null; a live texture.
     let (b, desc) = unsafe { (source_box.cast::<D3D12_BOX>().as_ref(), texture.GetDesc()) };
+    let Some(host_index) = crate::resource::host_subresource(src.resource, &texture, src.footprint.offset as u32) else {
+        refused!("a mip omitted by the low-VRAM profile");
+    };
     let size = match b {
         Some(b) => [b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top), b.back.saturating_sub(b.front)],
         None => {
             // A subresource index shares the footprint's first dword.
-            let mip = src.footprint.offset as u32 % u32::from(desc.MipLevels.max(1));
+            let mip = host_index % u32::from(desc.MipLevels.max(1));
             let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(desc.DepthOrArraySize) } else { 1 };
             [((desc.Width >> mip) as u32).max(1), (desc.Height >> mip).max(1), (depth >> mip).max(1)]
         }
@@ -864,6 +915,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint.offset = 0;
     from.resource = texture.as_raw().cast_const().cast();
+    from.footprint.offset = u64::from(host_index);
     #[cfg(feature = "diagnostics")]
     {
         let text = || {
@@ -948,6 +1000,10 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        if crate::resource::dropped(dst, &to) > 0 || crate::resource::dropped(src, &from) > 0 {
+            tracing::warn!("resolve involving omitted mip levels is unsupported");
+            return;
+        }
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_writes(list, dst);

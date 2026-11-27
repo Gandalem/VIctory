@@ -270,8 +270,33 @@ render-target headroom (default 3072 MiB when the sampled budget is set,
 limited to one third of the reported local budget). Only upstream
 evictable textures are reclaimed; required resources are not rejected.
 Logical allocation counters are not measurements of resident VRAM.
-Full-resolution texture shapes are unchanged; the previous branch's
-optional MIP reduction is not enabled by these settings.
+Full-resolution texture shapes are unchanged by these budget settings
+alone. MIP reduction requires the separate opt-in profile below.
+
+## Low-VRAM texture profile (experimental)
+
+`VICTORY_TEXTURE_DROP_MIPS=0` (default) keeps the original texture sizes.
+`1` omits the largest mip of eligible sampled 2D textures, and `2`–`4`
+omit additional levels. `auto` selects one omitted level on a detected
+adapter with up to 8 GiB dedicated video memory, or zero when the adapter
+is unknown or has more memory. This is a process-wide choice; no live
+texture changes shape. Eligible textures have at least five mips and
+512 texels on the shorter side. Render targets, depth, UAV, MSAA and
+incompatible formats are excluded. Eligible texture chains typically
+use about a quarter of their original host bytes when one mip is omitted,
+not a quarter of total VRAM. This trades texture detail for memory.
+
+SRV mip ranges, tiled upload source mips, array slice indices, texture
+copies, alias transfers and readbacks map to retained levels. Copies or
+readbacks of omitted levels are skipped; resolves involving shortened
+textures are unsupported. Full title-memory layout and tracking remain
+intact. Existing full-resolution copies and known writable aliases stay
+full-sized. The CPU may still read the full tiled allocation.
+
+The mip mapping follows
+[fxceless/victory-fork PR 610](https://github.com/fxceless/victory-fork/pull/610)
+and [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/tree/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90).
+Validate both modes, including retained array uploads, before deployment.
 
 ## Debugging
 

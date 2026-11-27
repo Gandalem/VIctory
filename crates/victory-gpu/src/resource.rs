@@ -1125,6 +1125,127 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host()
 }
 
+/// Opt-in low-VRAM texture profile. The choice is fixed for the process:
+/// changing the shape of a live resource would invalidate its descriptors.
+#[cfg(windows)]
+fn configured_mip_drop() -> u32 {
+    static LEVELS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LEVELS.get_or_init(|| {
+        let value = std::env::var("VICTORY_TEXTURE_DROP_MIPS").unwrap_or_default();
+        if value.trim().eq_ignore_ascii_case("auto") {
+            let dedicated = crate::host::dedicated_video_memory();
+            let drop = auto_mip_drop(dedicated);
+            tracing::info!(?dedicated, drop, "automatic texture mip profile");
+            drop
+        } else {
+            value.trim().parse::<u32>().unwrap_or(0).min(4)
+        }
+    })
+}
+
+#[cfg(windows)]
+fn auto_mip_drop(dedicated: Option<u64>) -> u32 {
+    u32::from(dedicated.is_some_and(|bytes| bytes > 0 && bytes <= (8 << 30)))
+}
+
+/// Only sampled 2D textures (including arrays/cubes) with a sufficiently
+/// large, complete mip chain. No targets, depth, UAV or MSAA resources.
+/// Adapted from fxceless/victory-fork PR 610 and soldsawn's 8 GB fork.
+#[cfg(windows)]
+fn mip_drop_for(desc: &ResourceDesc, requested: u32) -> u32 {
+    if requested == 0 || desc.dimension != 3 || desc.flags & 0xf != 0
+        || desc.sample_count != 1 || desc.mip_levels < 5
+        || element(desc.format).is_none()
+        || [19, 39, 44, 53].contains(&family(desc.format))
+        || (118..=120).contains(&desc.format)
+    {
+        return 0;
+    }
+    let n = requested.min(4).min(u32::from(desc.mip_levels) - 1);
+    let (w, h) = (desc.width, u64::from(desc.height));
+    if w.min(h) < 512 || !w.is_multiple_of(4 << n) || !h.is_multiple_of(4 << n) {
+        return 0;
+    }
+    n
+}
+
+#[cfg(windows)]
+fn drop_levels(desc: &ResourceDesc) -> u32 {
+    mip_drop_for(desc, configured_mip_drop())
+}
+
+/// Determine the shape of the actual retained host texture, not a newly
+/// looked-up copy (eviction may have replaced it).
+#[cfg(windows)]
+pub(crate) fn dropped(this: This, texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    if r.desc.dimension != 3 || r.desc.mip_levels == 0 {
+        return 0;
+    }
+    // SAFETY: the caller owns the live host resource.
+    let host_mips = unsafe { texture.GetDesc() }.MipLevels;
+    u32::from(r.desc.mip_levels.saturating_sub(host_mips))
+}
+
+#[cfg(windows)]
+fn map_mip_subresource(mips: u32, slices: u32, drop: u32, index: u32) -> Option<u32> {
+    if drop == 0 {
+        return Some(index);
+    }
+    if drop >= mips || index >= mips.checked_mul(slices)? {
+        return None;
+    }
+    let (mip, slice) = (index % mips, index / mips);
+    if mip < drop {
+        return None;
+    }
+    Some(slice * (mips - drop) + mip - drop)
+}
+
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, index: u32) -> Option<u32> {
+    let drop = dropped(this, texture);
+    if drop == 0 {
+        return Some(index);
+    }
+    let d = &resource(this).desc;
+    map_mip_subresource(mip_count(d), u32::from(d.depth_or_array_size), drop, index)
+}
+
+#[cfg(windows)]
+pub(crate) fn title_subresources(this: This) -> u32 {
+    let d = &resource(this).desc;
+    let slices = if d.dimension == TEXTURE_3D { 1 } else { u32::from(d.depth_or_array_size).max(1) };
+    mip_count(d) * slices
+}
+
+#[cfg(windows)]
+pub(crate) fn matching_copy_shape(dst: This, src: This) -> bool {
+    let (a, b) = (&resource(dst).desc, &resource(src).desc);
+    a.dimension == 3 && b.dimension == 3 && a.width == b.width
+        && a.height == b.height && a.depth_or_array_size == b.depth_or_array_size
+        && mip_count(a) == mip_count(b) && a.sample_count == b.sample_count
+        && family(pc_format(a.format)) == family(pc_format(b.format))
+}
+
+/// Shift explicit SRV mip ranges to the retained levels. Views naming
+/// only an omitted level sample the largest retained level instead.
+#[cfg(windows)]
+pub(crate) fn shift_levels(drop: u32, first: &mut u32, levels: &mut u32, clamp: &mut f32) {
+    if drop == 0 {
+        return;
+    }
+    if *levels != u32::MAX {
+        let end = first.saturating_add(*levels);
+        *levels = end.saturating_sub(drop.max(*first)).max(1);
+    }
+    *first = first.saturating_sub(drop);
+    *clamp = (*clamp - drop as f32).max(0.0);
+}
+
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
 #[cfg(windows)]
@@ -1238,11 +1359,31 @@ fn shared_texture(
     state: u32,
     clear: *const c_void,
 ) -> Option<std::sync::Arc<HostTexture>> {
-    let d = host_desc(desc)?;
+    let mut d = host_desc(desc)?;
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
+    // Reuse full-resolution copies if they already exist. Never shorten a
+    // texture whose memory is also described by a writable title texture.
+    // Keep the same MEMORY -> TEXTURES_AT lock order as the original code.
+    let mut drop = drop_levels(desc);
+    if drop != 0 {
+        let full_live = live.as_ref().is_some_and(|t| takes(t, &d));
+        let writable_alias = {
+            let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+            at.get(&address).into_iter().flatten()
+                .any(|&r| resource(r as This).desc.flags & USES != 0)
+        };
+        if full_live || writable_alias {
+            drop = 0;
+        }
+    }
+    if drop > 0 {
+        d.width >>= drop;
+        d.height >>= drop;
+        d.mip_levels -= drop as u16;
+    }
     if let Some(t) = &live
         && takes(t, &d)
     {
@@ -1259,7 +1400,6 @@ fn shared_texture(
     }
     // Host textures are made on first use, in any order: the new one takes
     // the uses of every title texture of the memory, so none replaces it.
-    let mut d = d;
     if let Some(k) = key {
         let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
@@ -1296,7 +1436,11 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     // SAFETY: a live resource.
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
-    d.flags & USES & !flags == 0
+    td.Width == d.width
+        && td.Height == d.height
+        && td.DepthOrArraySize == d.depth_or_array_size
+        && (d.mip_levels == 0 || td.MipLevels == d.mip_levels)
+        && d.flags & USES & !flags == 0
         && (family(d.format) == family(own)
             || t.castable.iter().any(|&c| family(c) == family(d.format)))
 }
@@ -2853,6 +2997,78 @@ mod tests {
         assert_eq!(reclaim_goal(Some(1000 * mb), None, 950 * mb, 0, 0, 90), 0);
         assert_eq!(reclaim_goal(None, Some([8000 * mb, 1000 * mb, 8000 * mb, 7999 * mb]),
             500 * mb, 0, 0, 90), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn low_vram_profile_limits_only_eligible_textures() {
+        let d = texture(1024, 512, 28, 8);
+        assert_eq!(mip_drop_for(&d, 0), 0);
+        assert_eq!(mip_drop_for(&d, 1), 1);
+        assert_eq!(mip_drop_for(&d, 4), 4);
+        for bad in [
+            ResourceDesc { flags: 1, ..d },
+            ResourceDesc { flags: 2, ..d },
+            ResourceDesc { flags: 4, ..d },
+            ResourceDesc { flags: 8, ..d },
+            ResourceDesc { sample_count: 4, ..d },
+            ResourceDesc { dimension: 4, ..d },
+            ResourceDesc { width: 511, ..d },
+            ResourceDesc { height: 514, ..d },
+            ResourceDesc { mip_levels: 4, ..d },
+            ResourceDesc { format: 45, ..d },
+        ] {
+            assert_eq!(mip_drop_for(&bad, 1), 0);
+        }
+        assert_eq!(auto_mip_drop(Some(8 << 30)), 1);
+        assert_eq!(auto_mip_drop(Some(12 << 30)), 0);
+        assert_eq!(auto_mip_drop(Some(0)), 0);
+        assert_eq!(auto_mip_drop(None), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_mip_indices_and_view_ranges_preserve_array_slices() {
+        assert_eq!(map_mip_subresource(8, 2, 1, 0), None);
+        assert_eq!(map_mip_subresource(8, 2, 1, 1), Some(0));
+        assert_eq!(map_mip_subresource(8, 2, 1, 7), Some(6));
+        assert_eq!(map_mip_subresource(8, 2, 1, 8), None);
+        assert_eq!(map_mip_subresource(8, 2, 1, 9), Some(7));
+        assert_eq!(map_mip_subresource(8, 2, 1, 15), Some(13));
+        assert_eq!(map_mip_subresource(8, 2, 1, 16), None);
+        assert_eq!(map_mip_subresource(8, 2, 0, 15), Some(15));
+        let shifted = |drop, first, levels, clamp| {
+            let (mut f, mut l, mut c) = (first, levels, clamp);
+            shift_levels(drop, &mut f, &mut l, &mut c);
+            (f, l, c)
+        };
+        assert_eq!(shifted(1, 0, u32::MAX, 0.0), (0, u32::MAX, 0.0));
+        assert_eq!(shifted(1, 0, 1, 0.0), (0, 1, 0.0));
+        assert_eq!(shifted(1, 0, 8, 0.0), (0, 7, 0.0));
+        assert_eq!(shifted(1, 3, 2, 2.5), (2, 2, 1.5));
+        assert_eq!(shifted(0, 3, 2, 1.0), (3, 2, 1.0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_array_mips_use_the_expected_host_shape() {
+        let Some(host) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let d = ResourceDesc { depth_or_array_size: 2, ..texture(512, 512, 28, 8) };
+        let mut image = null;
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &d, 0, null.cast(), &RESOURCE_IIDS[0], &mut image), S_OK);
+        let drop = drop_levels(&d);
+        let gpu = host_resource(image).unwrap();
+        // SAFETY: the title resource owns the live host texture.
+        let actual = unsafe { gpu.GetDesc() };
+        assert_eq!((actual.Width, actual.Height, actual.MipLevels, actual.DepthOrArraySize),
+            (512 >> drop, 512 >> drop, 8 - drop as u16, 2));
+        assert_eq!(dropped(image, &gpu), drop);
+        assert_eq!(host_subresource(image, &gpu, 15), Some(15 - 2 * drop));
+        assert_eq!(host_subresource(image, &gpu, 0), if drop == 0 { Some(0) } else { None });
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(slot::<Release>(image, 0x10)(image), 0);
     }
 
     #[cfg(windows)]

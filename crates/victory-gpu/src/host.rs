@@ -395,12 +395,9 @@ fn merge_video_memory(previous: Option<[u64; 4]>, local: Option<(u64, u64)>,
     Some([budget, usage, shared_budget, shared_usage])
 }
 
-/// Byte-valued DXGI observations. Force a new local measurement for each
-/// upstream eviction pass; do not reclaim repeatedly from a stale sample.
-/// Diagnostic and pressure-only callers may reuse the 100 ms cache.
-fn sample_video_memory(fresh: bool) -> Option<[u64; 4]> {
+fn video_adapter() -> Option<&'static IDXGIAdapter3> {
     static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
-    let adapter = ADAPTER
+    ADAPTER
         .get_or_init(|| {
             let device = &host()?.device;
             // SAFETY: plain device and DXGI queries.
@@ -410,7 +407,21 @@ fn sample_video_memory(fresh: bool) -> Option<[u64; 4]> {
                 factory.EnumAdapterByLuid(luid).ok()
             }
         })
-        .as_ref()?;
+        .as_ref()
+}
+
+pub(crate) fn dedicated_video_memory() -> Option<u64> {
+    let adapter = video_adapter()?;
+    // SAFETY: plain DXGI adapter description query.
+    let desc = unsafe { adapter.GetDesc1() }.ok()?;
+    Some(desc.DedicatedVideoMemory as u64)
+}
+
+/// Byte-valued DXGI observations. Force a new local measurement for each
+/// upstream eviction pass; do not reclaim repeatedly from a stale sample.
+/// Diagnostic and pressure-only callers may reuse the 100 ms cache.
+fn sample_video_memory(fresh: bool) -> Option<[u64; 4]> {
+    let adapter = video_adapter()?;
     static STATE: OnceLock<Mutex<VideoBudget>> = OnceLock::new();
     let mut state = STATE.get_or_init(|| Mutex::new(VideoBudget::default()))
         .lock().unwrap_or_else(|e| e.into_inner());
