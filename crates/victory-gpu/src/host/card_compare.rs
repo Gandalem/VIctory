@@ -733,6 +733,44 @@ fn relay_fetch_only_merges_the_declared_intersection() {
     assert_eq!(relay_overlap(0, 16, None), None);
 }
 
+/// Source relay_land's completed-piece landing, adapted to the exact
+/// declared picked ranges and existing staging path. Both inline and
+/// worker paths use the same merge and return its byte count.
+/// The submission owner guarantees an exclusive lease on all mappings
+/// and the readback remains completed and stable through the call.
+fn land_fetch_batch(pool: &CardFetch, copies: &[std::sync::Arc<crate::shadow::Shadow>],
+    batch: Vec<FetchPiece>, relay: &RelayPicked, fetched_after: u64,
+    relay_title: &mut Vec<u8>) -> u64
+{
+    let mut written = 0;
+    for piece in batch {
+        // SAFETY: the checked readback fence completed; this
+        // owner pins its mapping and the submission owner keeps
+        // the pool contents stable until landing is acknowledged.
+        let bytes = unsafe { std::slice::from_raw_parts(
+            (pool.data as *const u8).add(piece.at as usize), piece.hi - piece.lo) };
+        let shadow = &copies[piece.copy];
+        let owner = std::sync::Arc::as_ptr(shadow) as usize;
+        if let Some((lo, hi)) = relay_overlap(piece.lo, piece.hi, relay.get(&owner)) {
+            // Only this intersection is a declared picked write.
+            // Outside it update the staging mirror as before,
+            // never turn an undeclared discovery into title data.
+            let (a, b) = (lo - piece.lo, hi - piece.lo);
+            if a != 0 {
+                shadow.land_card(piece.lo, &bytes[..a], fetched_after);
+            }
+            let n = shadow.card_merge_relay(lo, &bytes[a..b], fetched_after, relay_title);
+            written += n as u64;
+            if b < bytes.len() {
+                shadow.land_card(hi, &bytes[b..], fetched_after);
+            }
+        } else {
+            shadow.land_card(piece.lo, bytes, fetched_after);
+        }
+    }
+    written
+}
+
 /// Reference picked::with / hand_back: land newly written bytes before
 /// the title's completion signal. The current branch's mark and withholding
 /// semantics take precedence; release cancelled snapshots without merging.
@@ -1186,6 +1224,8 @@ impl Host {
         // allocation intact and pack_fetches divides the work safely.
         let pool = self.card_fetch_at_least(total).unwrap_or_else(||
             fail(format_args!("no admitted GPU readback pool")));
+        let worker = if relay.is_empty() { None } else { super::relay::worker() };
+        let mut pending: Option<super::relay::Receipt> = None;
         let mut relay_title = Vec::new();
         for batch in pack_fetches(&fetches, pool.size) {
             let list = self.card_list(CardPhase::Fetch);
@@ -1221,36 +1261,39 @@ impl Host {
                     compare_barrier(&list.list);
                 }
             }
+            // Recording this list does not read staging or write the pool.
+            // The preceding worker may land while we record, but it
+            // must finish before another fetch can overwrite the pool.
+            if let Some(receipt) = pending.take() {
+                COPY_BACK[1].fetch_add(receipt.finish(), Ordering::Relaxed);
+            }
             self.run_card_list(CardPhase::Fetch, list, submitted);
             // The completed fetch fence orders these bytes relative to
             // every send. No earlier in-flight fetch can land afterwards
             // until the serial submission contract is deliberately changed.
             let fetched_after = *submitted;
-            for piece in batch {
-                // SAFETY: the checked readback fence completed; this
-                // owner pins its mapping and the submission lock keeps
-                // the pool contents stable until the next batch.
-                let bytes = unsafe { std::slice::from_raw_parts(
-                    (pool.data as *const u8).add(piece.at as usize), piece.hi - piece.lo) };
-                let shadow = &copies[piece.copy];
-                let owner = std::sync::Arc::as_ptr(shadow) as usize;
-                if let Some((lo, hi)) = relay_overlap(piece.lo, piece.hi, relay.get(&owner)) {
-                    // Only this intersection is a declared picked write.
-                    // Outside it update the staging mirror as before,
-                    // never turn an undeclared discovery into title data.
-                    let (a, b) = (lo - piece.lo, hi - piece.lo);
-                    if a != 0 {
-                        shadow.land_card(piece.lo, &bytes[..a], fetched_after);
-                    }
-                    let n = shadow.card_merge_relay(lo, &bytes[a..b], fetched_after, &mut relay_title);
-                    COPY_BACK[1].fetch_add(n as u64, Ordering::Relaxed);
-                    if b < bytes.len() {
-                        shadow.land_card(hi, &bytes[b..], fetched_after);
-                    }
-                } else {
-                    shadow.land_card(piece.lo, bytes, fetched_after);
-                }
+            if let Some(worker) = worker {
+                // Transfer the actual COM and Shadow owners, not just
+                // the mapped address. Receipt joins before the next
+                // GPU use or any later completion callback.
+                let pool = pool.clone();
+                let copies = copies.to_vec();
+                let relay = relay.clone();
+                // SAFETY: plain query on the checked, live queue fence.
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                pending = Some(worker.submit(fetched_after, completed, move || {
+                    let mut title = Vec::new();
+                    land_fetch_batch(&pool, &copies, batch, &relay, fetched_after, &mut title)
+                }));
+            } else {
+                let written = land_fetch_batch(&pool, copies, batch, relay, fetched_after, &mut relay_title);
+                COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
             }
+        }
+        // All mapped writes, including the last batch, are complete
+        // before finish_picked, marked/declared copy-back or title signals.
+        if let Some(receipt) = pending.take() {
+            COPY_BACK[1].fetch_add(receipt.finish(), Ordering::Relaxed);
         }
     }
 }

@@ -918,6 +918,9 @@ fn waited_write_ranges(merged: &[u8], before: &[u8]) -> Vec<(usize, usize)> {
 // one writer per Shadow during a synchronous submission. Batch workers
 // operate on distinct Shadow allocations; the submitting thread joins
 // them before taking snapshots, submitting GPU work or merging writes.
+// The optional relay worker exclusively owns a completed fetch's
+// staging accesses, with the submission lock held by its waiting owner;
+// that owner joins the receipt before reuse or further copy-back.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -1103,7 +1106,7 @@ impl Shadow {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             for (lo, hi) in dirty.landing_parts(fetched_after, from, from + bytes.len()) {
                 // SAFETY: parts lie in the checked readback span and
-                // staging allocation. The submitting thread owns staging.
+                // staging allocation. The serial submission owns staging.
                 unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(lo - from), self.data.add(lo), hi - lo) };
             }
         } else {

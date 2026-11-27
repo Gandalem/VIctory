@@ -370,10 +370,20 @@ is passed to regular and picked declarations; duplicate declarations
 count once, and a completion releases only one claim. Refresh observes
 the counted ranges and snapshot teardown waits for the last owner.
 The default keeps the existing serial range set. The source's flight
-lifetime tests are adapted to this pending owner. This does not enable
-background landing or overlapping submissions; copy-back, generation
-retirement and mapped-buffer access still rely on the submission lock.
-Run the ignored
+lifetime tests are adapted to this pending owner.
+Experimental `VICTORY_CARD_RELAY_WORKER=1` (with the relay-merge,
+send-order and picked-write options above) uses a dedicated
+`victory-relay` landing thread. It takes the completed prefix of the
+source-style flight queue and lands each checked fetch batch in order,
+holding its readback and Shadow owners. The submitting thread may
+record the next fetch while the worker merges, but waits for its
+receipt before executing into the shared readback pool or publishing
+title completion. Worker startup failure falls back to inline landing;
+a failure during landing is fatal rather than repeating a partial merge.
+This is a bounded, fenced worker port, not the source's full asynchronous
+submission pipeline: title submissions still do not overlap, and
+generation retirement and mapped-buffer access rely on the submission
+lock. Run the ignored
 `owned_card_send_keeps_original_bytes_after_staging_changes` test with
 the card-buffer options and `VICTORY_SEND_OWN=1` on a real adapter.
 Run the ignored `card_check_tail_shares_title_fence` test on an adapter
@@ -385,7 +395,8 @@ test with the card-buffer options and `VICTORY_CARD_LOOK_ONLY=1`.
 Run the ignored `picked_writes_land_only_after_discovery` test with
 the card-buffer options and `VICTORY_PICKED_WRITES=2` on an adapter,
 including a separate run with `VICTORY_CARD_SEND_ORDER=1` and
-`VICTORY_CARD_RELAY_MERGE=1`.
+`VICTORY_CARD_RELAY_MERGE=1`, and another with
+`VICTORY_CARD_RELAY_WORKER=1` as well.
 These optional paths need real-adapter verification.
 Loose windows and exact-view arenas stay on the existing path. Run the
 ignored `carded_shadow_refresh_compare_and_copy_back` test with

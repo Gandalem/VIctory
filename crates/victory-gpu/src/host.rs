@@ -23,6 +23,7 @@ use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
 pub(crate) mod card_compare;
 mod card_send;
+mod relay;
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
