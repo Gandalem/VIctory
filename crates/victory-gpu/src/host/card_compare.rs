@@ -606,9 +606,11 @@ fn ranges_enabled() -> bool {
 fn add_range(scope: &mut CardScope, shadow: &std::sync::Arc<crate::shadow::Shadow>,
     address: usize, len: usize, bounded: bool)
 {
-    let Some(card) = shadow.card() else { return };
+    if shadow.card().is_none() {
+        return;
+    }
     let (start, _) = shadow.range();
-    let size = card.size as usize;
+    let size = shadow.card_hash_size() as usize;
     let start = start as usize;
     let (from, to) = if bounded {
         (address.saturating_sub(start).min(size),
@@ -831,6 +833,30 @@ fn declared_compare_spans_cover_each_touched_piece_once() {
     assert_eq!(edge[0].to as usize, size);
 }
 
+/// Mode 0 hashes 16-byte loads, including a load crossing a title-page
+/// boundary when the copy start is not 16-byte aligned. Rehash every
+/// touched piece, clip padding before constructing spans.
+fn dirty_hash_spans(start: usize, size: usize, ranges: &[(usize, usize)]) -> Vec<CardSpan> {
+    let aligned: Vec<_> = ranges.iter().filter_map(|&(from, to)| {
+        let to = to.min(size);
+        (from < to).then(|| (from & !15, to.next_multiple_of(16).min(size)))
+    }).collect();
+    compare_spans(start, size, Some(&aligned))
+}
+
+#[test]
+fn dirty_hash_spans_clip_padding_and_include_shared_loads() {
+    let size = PIECE + 32;
+    let spans = dirty_hash_spans(0, size, &[(0, 2 * PIECE)]);
+    assert_eq!(spans, [card_span_of(0, 0, size)]);
+    assert!(dirty_hash_spans(0, size, &[(size, 2 * PIECE)]).is_empty());
+    // Title-page boundary at PIECE-1, shared 16-byte load.
+    let spans = dirty_hash_spans(1, size, &[(PIECE - 16, PIECE - 15)]);
+    assert_eq!(spans, [card_span_of(1, 0, size)]);
+    let spans = dirty_hash_spans(0, size, &[(PIECE + 17, PIECE + 18)]);
+    assert_eq!(spans, [card_span_of(0, PIECE, size)]);
+}
+
 /// The source compares with mode 1 on the synchronous path, leaving the
 /// old hash intact, and mode 2 for in-flight writes. This branch's CPU
 /// staging mirror must remain coherent even for undeclared writes, so
@@ -884,23 +910,41 @@ impl Host {
             return;
         }
         let list = self.card_list(CardPhase::Sync);
-        for (shadow, card, ranges) in dirty {
+        // Reference card_before: record all CPU-to-card copies first, then
+        // one resource-barrier batch, then the hashing passes. Independent
+        // card buffers no longer serialize a copy and a hash per buffer.
+        let mut sent = Vec::new();
+        let mut hashing = Vec::new();
+        for (shadow, card, ranges) in &dirty {
             let (start, _) = shadow.range();
-            let spans = joined_piece_runs(ranges.iter().map(|&(from, to)|
-                card_span_of(start as usize, from, to)).collect());
-            // SAFETY: ranges are in both live buffers. Buffers have decayed
-            // to COMMON after the last separately submitted list; copies
-            // promote the destination to COPY_DEST, then transition to SRV.
+            let size = shadow.card_hash_size();
+            let spans = dirty_hash_spans(start as usize, size as usize, ranges);
+            // SAFETY: ranges lie in both live resources; buffers decayed to
+            // COMMON after the preceding fence and promote to COPY_DEST.
             unsafe {
-                for (from, to) in ranges {
+                for &(from, to) in ranges {
                     list.list.CopyBufferRegion(&shadow.buffer, from as u64,
                         &card.staging, from as u64, (to - from) as u64);
                 }
-                list.list.ResourceBarrier(&[transition(&shadow.buffer,
-                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
-                card.work.bind(&list.list, &shadow.buffer);
-                for span in &spans {
-                    card_pass(&list.list, span, card.size as u32, 0, 0);
+            }
+            if !spans.is_empty() {
+                sent.push(transition(&shadow.buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+                hashing.push((shadow, card, size, spans));
+            }
+        }
+        if !sent.is_empty() {
+            // SAFETY: live distinct buffers, all uploads already recorded.
+            // Each transition names its actual COPY_DEST state.
+            unsafe { list.list.ResourceBarrier(&sent) };
+            for (shadow, card, size, spans) in hashing {
+                // SAFETY: the source is now in SRV state; each CardWork
+                // owns distinct hash buffers and disjoint piece ranges.
+                unsafe {
+                    card.work.bind(&list.list, &shadow.buffer);
+                    for span in &spans {
+                        card_pass(&list.list, span, size as u32, 0, 0);
+                    }
                 }
             }
             compare_barrier(&list.list);
@@ -921,11 +965,11 @@ impl Host {
         let scope = declared_scope(runs);
         let mut picked = picked_observation(runs);
         let plans: Vec<_> = copies.iter().enumerate().filter_map(|(copy, shadow)| {
-            let card = shadow.card()?;
+            shadow.card()?;
             let (start, _) = shadow.range();
             let ranges = scope.as_ref().map(|s| s.get(&(std::sync::Arc::as_ptr(shadow) as usize))
                 .map_or(&[][..], Vec::as_slice));
-            let spans = compare_spans(start as usize, card.size as usize, ranges);
+            let spans = compare_spans(start as usize, shadow.card_hash_size() as usize, ranges);
             (!spans.is_empty()).then_some((copy, spans))
         }).collect();
         if plans.is_empty() {
@@ -942,7 +986,7 @@ impl Host {
                 for span in spans {
                     // Source's synchronous compare-only mode: no hash
                     // is overwritten until the changed bytes are fetched.
-                    card_pass(&list.list, span, card.size as u32, span.first, if deferred { 1 } else { 2 });
+                    card_pass(&list.list, span, shadow.card_hash_size() as u32, span.first, if deferred { 1 } else { 2 });
                 }
                 compare_barrier(&list.list);
                 list.list.ResourceBarrier(&[transition(&card.work.differs,
@@ -969,7 +1013,7 @@ impl Host {
                     (card.work.flags_data as *const u32).add(span.first as usize), span.pieces as usize) };
                 for (i, flag) in flags.iter().enumerate() {
                     if flag & 1 != 0 {
-                        let (from, to) = card_piece_of(start as usize, card.size as usize, &span, i as u32);
+                        let (from, to) = card_piece_of(start as usize, shadow.card_hash_size() as usize, &span, i as u32);
                         if let Some(picked) = &mut picked {
                             picked.flagged(shadow, from, to);
                         }
@@ -1012,7 +1056,7 @@ impl Host {
                     let shadow = &copies[copy];
                     let card = shadow.card().expect("fetched card copy");
                     let (start, _) = shadow.range();
-                    let spans = compare_spans(start as usize, card.size as usize, Some(&ranges));
+                    let spans = compare_spans(start as usize, shadow.card_hash_size() as usize, Some(&ranges));
                     // SAFETY: all copies for this source have been
                     // recorded first; transition its promoted COPY_SOURCE
                     // state to SRV for mode 0. All owners survive the
@@ -1024,7 +1068,7 @@ impl Host {
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
                         card.work.bind(&list.list, &shadow.buffer);
                         for span in &spans {
-                            card_pass(&list.list, span, card.size as u32, 0, 0);
+                            card_pass(&list.list, span, shadow.card_hash_size() as u32, 0, 0);
                         }
                     }
                     compare_barrier(&list.list);
@@ -1043,6 +1087,46 @@ impl Host {
     }
 }
 
+
+/// Exercise source-length hashing in the production path on a real
+/// adapter. The last owned byte changes, but a separate padding-only
+/// write must not expand the CPU mirror or produce a changed flag.
+#[test]
+#[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_HASH_LEN=1 and D3D12; run alone"]
+fn logical_card_hash_length_excludes_padding_writes() {
+    let host = host().expect("D3D12 device");
+    let p = crate::watch::tests::pool(2);
+    let len = PIECE + 32;
+    crate::shadow::register(p, p as u64, len as u64);
+    let shadow = crate::shadow::find(p as u64, len as u64).expect("registered copy");
+    let card = shadow.card().expect("device-local copy");
+    assert_eq!(shadow.card_hash_size(), len as u64);
+    assert_eq!(card.size, (2 * PIECE) as u64);
+    let submit = |at: usize, value: u32, refresh: bool| {
+        let (upload, data) = host.upload_buffer(4).unwrap();
+        // SAFETY: mapped upload contains four bytes.
+        unsafe { data.cast::<u32>().write_unaligned(value) };
+        let list = host.new_list().unwrap();
+        if refresh {
+            shadow.refresh(&list, p as u64, len as u64);
+        }
+        list.keep(&upload);
+        // SAFETY: four bytes inside the live allocation and an open list.
+        unsafe { list.list.CopyBufferRegion(&shadow.buffer, at as u64, &upload, 0, 4) };
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the second flag is initialized by the completed full
+        // logical comparison; no GPU work is in flight.
+        unsafe { (card.work.flags_data as *const u32).add(1).read() & 1 }
+    };
+    // SAFETY: owned, mapped title bytes.
+    unsafe { ((p + len - 4) as *mut u32).write_unaligned(0) };
+    assert_eq!(submit(len - 4, 0x76543210, true), 1);
+    assert_eq!(shadow.read_host((p + len - 4) as u64, 1), [0x76543210]);
+    assert_eq!(submit(len + 32, 0x11223344, false), 0);
+    assert_eq!(shadow.read_host((p + len - 4) as u64, 1), [0x76543210]);
+    crate::shadow::unregister(p, p as u64);
+}
 
 /// An actual submission changes an undeclared card buffer. Mode 1
 /// must fetch it and commit the new hash exactly once; an empty subsequent

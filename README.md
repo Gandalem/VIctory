@@ -321,6 +321,17 @@ is still fetched into this branch's CPU mirror, so later snapshots
 cannot mistake it for a new write. This adds hashing for changed
 pieces; it does not yet reduce GPU comparison coverage or implement
 probe-only no-readback or async relay. The default is mode 2.
+The source's `card_hash_size` optimization is available via
+`VICTORY_CARD_HASH_LEN=1`: all comparison, dirty rehash and deferred
+fetch-rehash passes use the title buffer's logical length rounded to 16
+bytes rather than its 64 KiB-rounded allocation. The allocation and CPU
+upload remain full sized. This reduces padding hashes/readback, not
+live UAV comparison coverage; the default remains full allocation
+because padding-only GPU writes are not mirrored in this optional
+mode. The sync list also records all uploads, a single transition batch,
+then all independent hash passes, as in the source's card_before.
+Run the ignored `logical_card_hash_length_excludes_padding_writes`
+test with the card-buffer options and `VICTORY_CARD_HASH_LEN=1`.
 Run the ignored `deferred_card_hash_does_not_repeat_a_fetched_change`
 test with the card-buffer options and `VICTORY_CARD_LOOK_ONLY=1`.
 Run the ignored `picked_writes_land_only_after_discovery` test with

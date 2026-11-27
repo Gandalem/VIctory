@@ -236,6 +236,24 @@ fn card_for(staging: &ID3D12Resource, data: *mut u8, size: u64) -> Option<(ID3D1
     }))
 }
 
+/// Source shadow.rs::card_hash_size, kept separate for pure range tests.
+fn card_hash_length(len: u64, size: u64, own: bool) -> u64 {
+    if own {
+        len.next_multiple_of(16).min(size)
+    } else {
+        size
+    }
+}
+
+#[test]
+fn logical_card_hash_length_excludes_allocation_padding() {
+    assert_eq!(card_hash_length(288, 65536, true), 288);
+    assert_eq!(card_hash_length(289, 65536, true), 304);
+    assert_eq!(card_hash_length(289, 65536, false), 65536);
+    assert_eq!(card_hash_length(65536, 65536, true), 65536);
+    assert_eq!(card_hash_length(65535, 65536, true), 65536);
+}
+
 /// Same weak ownership as the source CARDED registry: no copy is kept alive
 /// merely by being registered. The submitting thread takes a strong snapshot
 /// through the comparison and readback fences.
@@ -692,6 +710,17 @@ impl Shadow {
 
     pub(crate) fn card(&self) -> Option<&Card> {
         self.card.as_ref()
+    }
+
+    /// Reference card_hash_size: hash the title-owned bytes, rounded to
+    /// the shader's 16-byte load. Allocations and upload ranges stay at
+    /// their full size. Unlike the reference, retain full coverage by
+    /// default until the experimental card path is validated on hardware.
+    pub(crate) fn card_hash_size(&self) -> u64 {
+        static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let size = self.card.as_ref().map_or(self.len, |c| c.size);
+        card_hash_length(self.len, size, *OWN.get_or_init(||
+            std::env::var_os("VICTORY_CARD_HASH_LEN").is_some_and(|v| v == "1")))
     }
 
     fn card_changed(&self, from: usize, to: usize) {
