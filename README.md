@@ -452,8 +452,21 @@ are written. The marked-page path uses the same exact writes with
 changed blocks dirty for the next refresh instead of claiming they
 are fully synchronized. Run the ignored
 `exact_marked_landing_preserves_title_only_changes` adapter test.
-The reference's alternate-view journal path and concurrent title
-merges are still not enabled.
+Experimental `VICTORY_LAND_TAKEN=1` adapts the source
+`Notes::flush` / `Shadow::landed` clean-skip rule without relying
+on its alternate-view journal. After exact picked relay or marked
+landing, consider only affected full blocks. Try to pin mapping
+transactions without waiting, reject aliases, partial/untracked
+blocks, busy or armed/saved pages, and require a genuinely
+protected block and a successful full-block equality check
+against this copy's CPU staging. Only then clear that copy's dirty
+state; other holders remain dirty and later title writes fault
+normally. A failed check preserves dirty state. This trades a
+guarded CPU read for potentially avoiding a later full refresh
+and upload. With the switch off the previous path is unchanged.
+The original landed_beside journal, generation-based publication
+and concurrent title merges are still not enabled. Run the ignored
+`exact_marked_landing_can_revalidate_the_completed_block` test.
 Run the ignored `parallel_staging_landing_preserves_pending_cpu_bytes`
 test with the send-order and landing options. No GPU compare
 coverage or submission waits are removed.

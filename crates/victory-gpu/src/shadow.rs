@@ -991,6 +991,14 @@ fn landing_runs_split_at_guard_boundaries_without_filling_holes() {
         [(0, 1), (3, 2), (5, 3), (PAGE + 5, 2)]);
 }
 
+/// Source land::taken switch. Require explicit opt-in here, because
+/// the reference uses journal generations and alternate views rather
+/// than this branch's guarded full-block revalidation.
+fn land_taken_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_TAKEN").is_some_and(|v| v == "1"))
+}
+
 /// Opt in to the reference's selective copy-back; the existing full-piece
 /// path remains the default until game/hardware regression tests pass.
 fn exact_back() -> bool {
@@ -1263,8 +1271,43 @@ impl Shadow {
         // Adapt the source's put_changed to this branch's write-watch
         // API. Never use the full-piece fallback across excluded bytes.
         // Leave title-only changes dirty for a later refresh, as source
-        // relay does; do not call card_changed or Tracked::taken here.
-        write_landed_runs(address, title, &changed_runs(title, &was))
+        // relay does. The opt-in landed check may certify a full block
+        // only if its held bytes really equal protected title memory.
+        let runs = changed_runs(title, &was);
+        let written = write_landed_runs(address, title, &runs);
+        if land_taken_enabled() {
+            self.note_landed(address, &runs, title);
+        }
+        written
+    }
+
+    /// Source Notes::flush / Shadow::landed: consider only blocks this
+    /// copy actually landed in, once per block. No journal generation
+    /// or alias shortcut is assumed. Copy owners and the completed
+    /// submission lock are retained throughout the revalidation.
+    fn note_landed(&self, address: usize, runs: &[(usize, usize)], scratch: &mut Vec<u8>) {
+        let Some(tracked) = &self.tracked else { return };
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut last = None;
+        for (off, len) in landing_page_runs(address, runs) {
+            if len == 0 {
+                continue;
+            }
+            let page = (address + off) / PAGE;
+            if last == Some(page) {
+                continue;
+            }
+            last = Some(page);
+            let from = page * PAGE;
+            if from < start || from.checked_add(PAGE).is_none_or(|to| to > end) {
+                continue;
+            }
+            // SAFETY: a whole block inside this live copy's staging.
+            // The previous merge borrow ended; no other submission or
+            // landing helper may access this staging during the check.
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start), PAGE) };
+            tracked.landed(page, held, scratch);
+        }
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -1603,8 +1646,15 @@ impl Shadow {
         // A selective write can leave other bytes changed by the title
         // while the guard was open. As in exact waited copy-back, don't
         // claim that whole block current after a selective landing.
-        if from == page && to == page + PAGE && (!exact || written == 0) {
-            t.taken(&[page / PAGE]);
+        if from == page && to == page + PAGE {
+            if !exact || written == 0 {
+                t.taken(&[page / PAGE]);
+            } else if land_taken_enabled() {
+                // A full protected read proves whether CPU-only
+                // changes raced our selective writes. If it cannot
+                // prove equality, leave the tracker dirty.
+                t.landed(page / PAGE, host, &mut title);
+            }
         }
         written
     }
@@ -3022,6 +3072,31 @@ pub(crate) mod tests {
         assert_eq!([read(10), read(20), read(30)], [0xaa, 0x11, 0xbb]);
         assert!(copy.tracked.as_ref().unwrap().changed(p / PAGE));
         copy.copy_back_done(p, len);
+        unregister(p, p as u64);
+    }
+
+    /// Exercise the source's landed-copy clean-skip with a marked
+    /// page in the real copy path. The second title write must still
+    /// dirty that page and be included by the next refresh.
+    #[test]
+    #[ignore = "requires VICTORY_LAND_TAKEN=1 and D3D12; run alone"]
+    fn exact_marked_landing_can_revalidate_the_completed_block() {
+        assert!(land_taken_enabled());
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).expect("registered copy");
+        copy.update(p, len);
+        copy.writing(p, PAGE, true);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        assert_eq!(copy.copy_back_marked_with(p, true), 1);
+        assert!(!copy.tracked.as_ref().unwrap().changed(p / PAGE));
+        copy.copy_back_done(p, PAGE);
+        // SAFETY: live test pool; its reinstalled guard tracks the write.
+        unsafe { ((p + 20) as *mut u8).write_volatile(0x11) };
+        assert!(copy.tracked.as_ref().unwrap().changed(p / PAGE));
+        assert!(copy.update(p, PAGE) > 0);
+        assert!(copy.clean());
         unregister(p, p as u64);
     }
 
