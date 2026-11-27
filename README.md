@@ -288,8 +288,16 @@ planner to the current write marks. It compares only joined whole
 unbounded root ranges compare their whole copy. Heap-indexed and
 title-memory shaders, unknown marks, and undeclared-only submissions
 fall back to full comparison. The default remains full coverage.
-The source's picked-view discovery and async relay are not imported.
-This optional range path needs real-adapter verification.
+Experimental `VICTORY_PICKED_WRITES=1` ports the reference's descriptor
+store classifier and found-copy discovery in observation-only mode.
+A bounded background queue analyzes shaders using this branch's native
+IR; the current UAV hulls and existing completed GPU comparison flags
+identify possible undeclared writes. Pieces intersecting a declaration
+or write mark are excluded, as are ambiguous title-memory submissions.
+No extra GPU compare, reduced coverage or automatic declaration/landing
+is introduced. The source's rotating probes, picked-write landing and
+async relay remain unported. These optional paths need real-adapter
+verification.
 Loose windows and exact-view arenas stay on the existing path. Run the
 ignored `carded_shadow_refresh_compare_and_copy_back` test with
 `VICTORY_CARD_BUFFERS=1` and `VICTORY_CARD_BUFFERS_MIN_KB=64` on a real

@@ -165,6 +165,15 @@ impl Viewed {
         }
     }
 
+    /// Source picked::shown input, taken from the current heap's UAV
+    /// hulls after descriptor synchronization rather than cached slots.
+    pub(crate) fn picked_ranges(&self) -> Vec<(Arc<Shadow>, usize, usize)> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values()
+            .filter(|(shadow, _, len, uav, _)| *uav && *len != 0 && shadow.card().is_some())
+            .map(|(shadow, address, len, _, _)| (shadow.clone(), *address as usize, *len as usize))
+            .collect()
+    }
+
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]

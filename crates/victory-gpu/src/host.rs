@@ -1280,6 +1280,8 @@ struct Deferred {
     budget_zeroed: bool,
     /// A shader may address buffers beyond its declared ranges.
     card_unbounded: bool,
+    /// A heap-writing shader may select its UAV dynamically.
+    card_picked: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -2554,6 +2556,10 @@ impl HostList {
     /// reference's declared ranges alone are insufficient here.
     pub(crate) fn note_card_unbounded(&self) {
         self.deferred().card_unbounded = true;
+    }
+
+    pub(crate) fn note_card_picked(&self) {
+        self.deferred().card_picked = true;
     }
 
     /// Shaders of the list take views from the heap itself

@@ -698,6 +698,11 @@ impl State {
         // to date at submission (`crate::bindless`).
         if p.stages.iter().any(|s| s.translated().host.heap) {
             let writes = p.stages.iter().any(|s| s.translated().host.heap_writes);
+            if writes && crate::picked::on() && p.stages.iter().any(|s|
+                s.translated().host.heap_writes && crate::picked::picks(&s.shader))
+            {
+                list.note_card_picked();
+            }
             if let Some(host) = (self.heaps[0] != 0)
                 .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                 .flatten()

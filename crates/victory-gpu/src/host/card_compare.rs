@@ -653,6 +653,62 @@ fn declared_scope(runs: &[&HostList]) -> Option<CardScope> {
     Some(scope)
 }
 
+/// The source's picked-view discovery adapted to the existing full
+/// compare. Do not change which pieces are hashed, fetched or landed.
+/// Only a current UAV hull with no declaration or mark for the entire
+/// flagged piece is reported. Ambiguous title-memory paths are skipped.
+struct PickedObservation {
+    shown: CardScope,
+    declared: CardScope,
+}
+
+fn picked_observation(runs: &[&HostList]) -> Option<PickedObservation> {
+    if !crate::picked::on() {
+        return None;
+    }
+    let mut shown = CardScope::new();
+    let mut declared = CardScope::new();
+    for list in runs {
+        let d = list.deferred();
+        if !d.after.is_empty() || !d.missed.is_empty()
+            || d.copies.iter().any(|s| matches!(s, Step::Memory(..)))
+        {
+            return None;
+        }
+        for step in &d.copies {
+            match step {
+                Step::Heap(viewed) if d.card_picked => {
+                    for (shadow, address, len) in viewed.picked_ranges() {
+                        add_range(&mut shown, &shadow, address, len, true);
+                    }
+                }
+                Step::GpuWrite(shadow, address, len, marked, _) => {
+                    add_range(&mut declared, shadow, *address, *len, *marked);
+                }
+                _ => {}
+            }
+        }
+    }
+    if shown.is_empty() {
+        return None;
+    }
+    for (shadow, address, len) in crate::shadow::card_mark_ranges()? {
+        add_range(&mut declared, &shadow, address, len, true);
+    }
+    Some(PickedObservation { shown, declared })
+}
+
+impl PickedObservation {
+    fn flagged(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, hi: usize) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let Some(shown) = self.shown.get(&key) else { return };
+        let declared = self.declared.get(&key).map_or(&[][..], Vec::as_slice);
+        if crate::picked::unexplained((lo, hi), shown, declared) {
+            crate::picked::found(shadow, lo);
+        }
+    }
+}
+
 /// Join the reference's 64 KiB piece runs. The comparison hashes a whole
 /// piece and updates its baseline, so fetch the whole piece too, not just
 /// a declared subrange. Distinct spans have disjoint result offsets.
@@ -739,6 +795,7 @@ impl Host {
             return;
         }
         let scope = declared_scope(runs);
+        let picked = picked_observation(runs);
         let plans: Vec<_> = copies.iter().enumerate().filter_map(|(copy, shadow)| {
             let card = shadow.card()?;
             let (start, _) = shadow.range();
@@ -787,6 +844,9 @@ impl Host {
                 for (i, flag) in flags.iter().enumerate() {
                     if flag & 1 != 0 {
                         let (from, to) = card_piece_of(start as usize, card.size as usize, &span, i as u32);
+                        if let Some(picked) = &picked {
+                            picked.flagged(shadow, from, to);
+                        }
                         match ranges.last_mut() {
                             Some(last) if last.1 == from => last.1 = to,
                             _ => ranges.push((from, to)),

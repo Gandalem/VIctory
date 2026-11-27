@@ -43,6 +43,8 @@ mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod picked;
+#[cfg(windows)]
 mod placement;
 #[cfg(windows)]
 mod primitive;
