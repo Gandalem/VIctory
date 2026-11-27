@@ -840,11 +840,11 @@ impl HostTexture {
         // SAFETY: plain query on a live resource.
         let desc = unsafe { texture.GetDesc() };
         let sampled = desc.Flags.0 & USES as i32 == 0;
-        let bytes = tile_bytes.unwrap_or_else(|| crate::host::host().map_or(0, |h| {
+        let bytes = crate::host::host().map_or(0, |h| {
             // SAFETY: valid descriptor.
             let size = unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
             if size == u64::MAX { 0 } else { size }
-        }));
+        });
         texture_kind_bytes(sampled).fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
