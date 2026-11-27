@@ -83,6 +83,7 @@ fn store_shader() -> Arc<Shader> {
             host,
             used: native.used,
         })),
+        picked: std::sync::atomic::AtomicU8::new(0),
     })
 }
 
