@@ -15,7 +15,7 @@ use super::shader::{Shader, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -459,6 +459,40 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
+}
+
+/// The scalar instruction defining an SSA value in this block and its operands.
+fn scalar_def<'a, const N: usize>(
+    block: &'a Block,
+    value: Value,
+    op: &str,
+) -> Option<(&'a Inst, [Operand; N])> {
+    let inst = block
+        .insts
+        .iter()
+        .find(|i| i.writes.iter().any(|w| w.1 == value))?;
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    (inst.name() == op).then_some((inst, src.as_slice().try_into().ok()?))
+}
+
+fn sgpr_operand(inst: &Inst, operand: Operand) -> Option<Value> {
+    match operand {
+        Operand::Scalar {
+            code: code @ 0..=101,
+            dwords: 1,
+        } => inst.read(Reg::S(code)),
+        _ => None,
+    }
+}
+
+fn scalar_constant(operand: Operand) -> Option<u32> {
+    match operand {
+        Operand::Const(code) => crate::resource::inline(code),
+        Operand::Literal(value) => Some(value),
+        _ => None,
+    }
 }
 
 /// The dwords an `s_load_dword*` reads.
@@ -5660,7 +5694,12 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        let mut guard = self.guard(b, i)?;
+        // A scalar result (`v_readlane`, `v_readfirstlane`) is written
+        // whatever EXEC holds.
+        let mut guard = match v.dst {
+            Some(Operand::Scalar { .. }) => None,
+            _ => self.guard(b, i)?,
+        };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
@@ -8084,9 +8123,54 @@ impl<'a> Lower<'a> {
         all
     }
 
+    /// Whether every lane enters IR block `b` along the edge the console's
+    /// wave takes, so that an SGPR joined there holds what that edge
+    /// brought: every branch into it is uniform (SCC values). The wave runs
+    /// one path; a per-lane branch into the join (an EXEC skip, a loop's
+    /// per-lane exit) is where lanes would take edges the wave did not, and
+    /// the console compiler's if/else always skips into its join that way.
+    /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
+    /// edge into its header; the others take the wave's.
+    fn uniform_join(&self, b: usize) -> bool {
+        let st = self.x.st;
+        let preds = &self.x.p.blocks[b].preds;
+        preds.iter().filter(|&&q| self.block[q].is_some()).all(|&q| match st.exits[q] {
+            LaneExit::Branch { when, taken, not_taken } if taken != not_taken => {
+                st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+            }
+            _ => true,
+        })
+    }
+
     /// Whether no lane goes from IR block `q` to `b`.
     fn never_taken(&self, q: usize, b: usize) -> bool {
         !self.x.st.bools.meet(&self.lane_edge(q, b))
+    }
+
+    /// Whether, at a per-lane join `b` of a lane mask whose register holds
+    /// data along edge `n`, some edge brings a mask and no lane taking edge
+    /// `n` is in any of them (a compare inside a region those lanes skip).
+    /// The console wave runs one path: on a mask edge, the lanes of edge `n`
+    /// read their bit of that mask, 0. The compiler merges no value for them,
+    /// so it holds none for them either where the whole wave skips (the data
+    /// there is a reused register): 0 is theirs.
+    fn no_mask_lane_on_edge(&self, b: usize, args: &[Value], n: usize) -> bool {
+        let st = self.x.st;
+        let preds = &self.x.p.blocks[b].preds;
+        let on_n = self.lane_edge(preds[n], b);
+        let mut some = false;
+        for (k, arg) in args.iter().enumerate() {
+            let Some(&m) = st.masks.get(arg).filter(|_| k != n) else {
+                continue;
+            };
+            some = true;
+            let mut lanes = on_n.clone();
+            lanes.push((m, true));
+            if st.bools.meet(&lanes) {
+                return false;
+            }
+        }
+        some
     }
 
     /// Whether IR block `b` can reach itself.
@@ -10433,6 +10517,171 @@ impl<'a> Lower<'a> {
         live
     }
 
+    /// An unguarded indexed write replaces the incoming value before a
+    /// consumer can observe it, either on this edge or in a counted loop.
+    fn overwritten_movreld_edge(&self, b: usize, phi: &Phi, edge: usize) -> Option<()> {
+        let Reg::V(reg) = phi.reg else { return None };
+        let p = self.x.p;
+        let block = &p.blocks[b];
+        if self.sections.contains_key(&b)
+            || self.sections.contains_key(&block.preds[edge])
+            || p.blocks
+                .iter()
+                .flat_map(|bb| &bb.phis)
+                .any(|ph| ph.args.contains(&phi.value))
+        {
+            return None;
+        }
+        let mut uses = p.blocks.iter().enumerate().flat_map(|(bb, block)| {
+            block.insts.iter().enumerate().filter_map(move |(i, inst)| {
+                inst.reads
+                    .iter()
+                    .any(|r| r.1 == phi.value)
+                    .then_some((bb, i, inst))
+            })
+        });
+        let (bb, i, mov) = uses.next()?;
+        if uses.next().is_some()
+            || bb != b
+            || self.x.st.guards[b][i].is_some()
+            || mov.name() != "v_movreld_b32"
+            || mov.read(phi.reg) != Some(phi.value)
+        {
+            return None;
+        }
+        let Fields::Valu(v) = &mov.fields else {
+            return None;
+        };
+        let (
+            Some(Operand::Vector {
+                reg: base,
+                dwords: 1,
+            }),
+            [
+                Operand::Vector {
+                    reg: src,
+                    dwords: 1,
+                },
+            ],
+        ) = (v.dst, v.src.as_slice())
+        else {
+            return None;
+        };
+        if v.dpp.is_some()
+            || v.sdwa.is_some()
+            || mov.read(Reg::V(*src))? == phi.value
+            || mov.write(phi.reg).is_none()
+        {
+            return None;
+        }
+        let index = u32::from(reg.checked_sub(base)?);
+        // Follow M0 to a copy of a scalar phi in this block, then the
+        // constant written on the corresponding predecessor.
+        let (copy, [src]) = scalar_def(block, mov.read(Reg::S(crate::ir::M0))?, "s_mov_b32")?;
+        let scalar = sgpr_operand(copy, src)?;
+        let index_phi = block.phis.iter().find(|ph| ph.value == scalar)?;
+        let (_, [initial]) = scalar_def(
+            &p.blocks[block.preds[edge]],
+            index_phi.args[edge],
+            "s_mov_b32",
+        )?;
+        let known = scalar_constant(initial)?;
+        if index == known {
+            return Some(());
+        }
+        if index < known {
+            return None; // Reaching this slot would require the index to wrap.
+        }
+        self.counted_movreld_index(b, edge, phi, index_phi, mov, index)
+    }
+
+    /// An unguarded move fills one more register on every iteration.
+    /// Values from before the loop can only survive in slots the index skips.
+    fn counted_movreld_index(
+        &self,
+        b: usize,
+        edge: usize,
+        phi: &Phi,
+        indices: &Phi,
+        mov: &Inst,
+        slot: u32,
+    ) -> Option<()> {
+        let p = self.x.p;
+        let st = self.x.st;
+        let block = &p.blocks[b];
+        let LaneExit::Branch {
+            when,
+            taken: latch,
+            not_taken: exit,
+        } = st.exits[b]
+        else {
+            return None;
+        };
+        let back = block.preds.iter().position(|&q| q == latch)?;
+        if block.preds.len() != 2
+            || back == edge
+            || b == latch
+            || b == exit
+            || exit == latch
+            || self.sections.contains_key(&latch)
+            || st.exits[latch] != LaneExit::Jump(b)
+            || p.blocks[latch].preds != [b]
+            || p.blocks[exit].preds != [b]
+            || st.exits[exit] != LaneExit::End
+            || self.rpo[b] >= self.rpo[latch]
+            || self.rpo[block.preds[edge]] >= self.rpo[b]
+        {
+            return None;
+        }
+        // The indexed result may only go around the loop as its own old
+        // value or be consumed in the normal exit block.
+        let result = mov.write(phi.reg)?;
+        if phi.args[back] != result {
+            return None;
+        }
+        for (bb, block) in p.blocks.iter().enumerate() {
+            if bb != exit
+                && block
+                    .insts
+                    .iter()
+                    .any(|inst| inst.reads.iter().any(|r| r.1 == result))
+            {
+                return None;
+            }
+            if block.phis.iter().any(|other| {
+                other
+                    .args
+                    .iter()
+                    .enumerate()
+                    .any(|(n, &arg)| arg == result && (other.value != phi.value || n != back))
+            }) {
+                return None;
+            }
+        }
+        // Follow the latch copy to the unit increment, then require that
+        // this very increment is compared for equality to the exit bound.
+        let (copy, [src]) = scalar_def(&p.blocks[latch], indices.args[back], "s_mov_b32")?;
+        let next = sgpr_operand(copy, src)?;
+        let (increment, [from, step]) = scalar_def(block, next, "s_add_i32")?;
+        if sgpr_operand(increment, from)? != indices.value || scalar_constant(step)? != 1 {
+            return None;
+        }
+        let (Atom::Uniform(scc), Bool::TRUE, Bool::FALSE) = st.bools.node(when)? else {
+            return None;
+        };
+        let branch = block.insts.last()?;
+        if branch.name() != "s_cbranch_scc0" || branch.read(Reg::Scc) != Some(scc) {
+            return None;
+        }
+        let (cmp, [tested, bound]) = scalar_def(block, scc, "s_cmp_eq_u32")?;
+        if sgpr_operand(cmp, tested)? != next {
+            return None;
+        }
+        let limit = scalar_constant(bound)?;
+        // The initial index is below this slot. The loop must pass it before exit.
+        (slot < limit).then_some(())
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         let live = self.live_edges();
@@ -10458,8 +10707,26 @@ impl<'a> Lower<'a> {
                             self.s.m.i32(0)
                         }
                     }
+                    // An input an unguarded counted `v_movreld` loop overwrites
+                    // before anything reads it (PR #457).
+                    (Some(Val::Missing("barycentrics read directly")), false)
+                        if read && self.overwritten_movreld_edge(b, phi, n).is_some() =>
+                    {
+                        self.s.m.undef(self.s.t.i32)
+                    }
                     (Some(Val::Bit(_)), false) if read => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                    }
+                    // A lane mask joined with data at a join every lane
+                    // enters along one edge: the register holds the mask's
+                    // number there (console lanes, so exact).
+                    _ if read
+                        && !bit
+                        && self.mask_data == MaskData::Console
+                        && (self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg))
+                        && self.uniform_join(b) =>
+                    {
+                        self.mask_dword(arg).map_err(|w| Stop::Retry(phi.value, w))?
                     }
                     (Some(Val::Missing(why)), _) if read => {
                         return Err(Stop::Retry(phi.value, why));
@@ -10484,11 +10751,20 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let arg = phi.args[n];
+                const UNTRACKED: Why = "a lane-mask join of an untracked mask";
+                // Data joined with masks where the wave takes one edge (the BVH
+                // walks pop masks from memory): with console lanes the lane's
+                // own bit of the number, as `Atom::Opaque`.
+                let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
+                let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
+                    (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
+                    (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
+                        self.s.m.bool(false)
+                    }
+                    (None, _) => return Err(unsupported(offset, UNTRACKED)),
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
@@ -11247,6 +11523,59 @@ mod tests {
         // Clearing the neg bit yields unmodified 1.0f (!= -1.0f), so s6 is dead.
         negated[3] = 0x0000_00F2; // v_mov_b32_e64 v1, 1.0
         lowers(&negated, group_ids_xy).expect("unmodified v_mov_b32_e64 still folds");
+    }
+
+    #[test]
+    fn a_mask_joined_with_data_needs_a_uniform_join() {
+        // s6: lanes below 24, then shifted (data) on each back edge; read
+        // after the loop. Lanes leaving the loop at different iterations
+        // (per lane) see different numbers than the console's register:
+        // refused. The uniform loop is `synthetic_tests::
+        // a_mask_joined_with_data_at_a_uniform_loop_is_its_number`.
+        let mut words = [
+            0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0
+            0x8706_7E6A, // s_and_b32 s6, vcc_lo, exec_lo
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0x9006_8406, // header: s_lshr_b32 s6, s6, 4
+            0x8007_8107, // s_add_u32 s7, s7, 1
+            0x7D88_0007, // v_cmp_gt_u32 vcc_lo, s7, v0
+            0x8A7E_6A7E, // s_andn2_b32 exec_lo, exec_lo, vcc_lo
+            0xBF89_FFFB, // s_cbranch_execnz header
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lowers(&words, 1 << 7) else {
+            panic!("a per-lane loop's mask join translated");
+        };
+        assert!(what.contains("lane mask"), "{what}");
+        // Leaving on a uniform condition instead: the mask's number.
+        words[5] = 0xBF0A_8207; // s_cmp_lt_u32 s7, 2
+        words[6] = 0xBF80_0000; // s_nop 0
+        words[7] = 0xBF85_FFFB; // s_cbranch_scc1 header
+        lowers(&words, 1 << 7).expect("a uniform loop's mask join");
+    }
+
+    #[test]
+    fn a_scalar_result_needs_no_exec() {
+        // s6 is 0 where every lane skips and the saved EXEC where some run:
+        // no lane mask at the per-lane join. EXEC taken from it guards only
+        // a `v_readlane` (written whatever EXEC holds) before it is restored
+        // (`CS_IrradianceCache_Shade`).
+        let words = [
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+            0xBF88_0001, // s_cbranch_execz +1
+            0xBE86_0304, // s_mov_b32 s6, s4
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6
+            0xD760_0002, // v_readlane_b32 s2, v0, 3
+            0x0001_0700,
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            S_ENDPGM,
+        ];
+        lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
     }
 
     #[test]
