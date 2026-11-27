@@ -205,6 +205,14 @@ fn card_send_order() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SEND_ORDER").is_some_and(|v| v == "1"))
 }
 
+/// Relay's changed-byte merge needs send-generation exclusion. This
+/// option does not enable overlapping submissions or background landing.
+pub(crate) fn card_relay_merge_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    card_send_order() && *ON.get_or_init(||
+        std::env::var_os("VICTORY_CARD_RELAY_MERGE").is_some_and(|v| v == "1"))
+}
+
 /// What went up, by send: its number, and the offsets, in order and joined
 /// (a refresh sends thousands of runs of a few words).
 #[derive(Default)]
@@ -687,6 +695,80 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// The relay's merge of a stretch of a copy (source relay). `now` is what the
+/// card's memory holds, read once; `held` is the copy's reference for the
+/// stretch (its snapshot, or the CPU's side of a copy in the card's
+/// memory): what the card's memory held when it was last looked at;
+/// `title` is title memory as just read. Every byte the card changed
+/// (`now` differs from `held`) goes into `title` and into `held`; every
+/// other byte of both stays as it is, so a byte the title wrote and the
+/// card did not keeps the title's value. Whether `title` changed.
+///
+/// Nothing is stored into `now`'s source: the card may be writing it for a
+/// later flight at this moment, and a store there, even of the value just
+/// read, could undo that write. (The merge of a waited-for submission
+/// stores every byte of a differing stretch back into the copy.)
+fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let mut differs = 0u8;
+    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+        let wrote = if *n != *h { 0xffu8 } else { 0 };
+        let merged = (*t & !wrote) | (*n & wrote);
+        differs |= merged ^ *t;
+        *t = merged;
+        *h = (*h & !wrote) | (*n & wrote);
+    }
+    differs != 0
+}
+
+/// Source card_merge_relay's exclusion and merge, also usable without a
+/// device or a title mapping in the regression tests.
+fn merge_relay_bytes(at: usize, gpu: &[u8], held: &mut [u8], title: &mut [u8],
+    dirty: &CardDirty, fetched_after: u64) -> bool
+{
+    debug_assert_eq!(gpu.len(), held.len());
+    debug_assert_eq!(gpu.len(), title.len());
+    let mut changed = false;
+    for (a, b) in dirty.landing_parts(fetched_after, at, at + gpu.len()) {
+        let (a, b) = (a - at, b - at);
+        changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+    }
+    changed
+}
+
+#[test]
+fn relay_merge_preserves_title_only_and_newer_send_bytes() {
+    // Offset is deliberately nonzero; newer send/dirty intervals are
+    // in copy-relative coordinates, not relative to the readback.
+    let dirty = CardDirty {
+        ranges: vec![(15, 16)],
+        sent: SentRuns::of(&[(13, 14, 8), (14, 15, 6)]),
+    };
+    let mut held = [1, 2, 3, 4, 5, 6];
+    let mut title = [1, 20, 30, 40, 50, 60];
+    let gpu = [10, 2, 33, 44, 55, 66];
+    assert!(merge_relay_bytes(11, &gpu, &mut held, &mut title, &dirty, 7));
+    // Index 1 is unchanged on GPU; index 2 has a newer send;
+    // index 4 has unsent CPU data. Earlier send at index 3 is eligible.
+    assert_eq!(held, [10, 2, 3, 44, 5, 66]);
+    assert_eq!(title, [10, 20, 30, 44, 50, 66]);
+    assert!(!merge_relay_bytes(11, &gpu, &mut held, &mut title, &dirty, 7));
+}
+
+#[test]
+fn relay_merge_does_not_copy_title_only_changes_into_held() {
+    let mut held = [0, 1, 2, 3];
+    let mut title = [8, 9, 10, 11];
+    assert!(!merge_relay_bytes(0, &[0, 1, 2, 3], &mut held, &mut title,
+        &CardDirty::default(), 0));
+    assert_eq!(held, [0, 1, 2, 3]);
+    assert_eq!(title, [8, 9, 10, 11]);
+    // A GPU write already present in title memory updates the held
+    // baseline without issuing a title write.
+    assert!(!merge_relay_bytes(0, &[8, 1, 2, 3], &mut held, &mut title,
+        &CardDirty::default(), 0));
+    assert_eq!(held, [8, 1, 2, 3]);
+}
+
 /// Opt in to the reference's selective copy-back; the existing full-piece
 /// path remains the default until game/hardware regression tests pass.
 fn exact_back() -> bool {
@@ -902,6 +984,53 @@ impl Shadow {
             // and the staging mapping is writable under the submission lock.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
         }
+    }
+
+    /// Source card_merge_relay, restricted here to a declared picked
+    /// range under the existing serial submission lock, with no
+    /// overlapping explicit declarations or GPU marks. The readback
+    /// fence completed. Keep title-only changes out of the held GPU
+    /// baseline; don't enqueue an upload that could undo GPU bytes.
+    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64,
+        title: &mut Vec<u8>) -> usize
+    {
+        let Some(card) = &self.card else { return 0 };
+        if at > self.len as usize || gpu.len() > self.len as usize - at {
+            return 0;
+        }
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: checked bounds, serial submission owns staging and
+        // the fetched bytes are disjoint from its allocation.
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let Some(first) = gpu.iter().zip(held.iter()).position(|(g, h)| g != h) else {
+            return 0;
+        };
+        let last = gpu.iter().zip(held.iter()).rposition(|(g, h)| g != h).unwrap_or(first);
+        let (at, n) = (at + first, last + 1 - first);
+        let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+        title.clear();
+        title.resize(n, 0);
+        let address = self.start as usize + at;
+        let mapped = crate::host::read_into(address as *const u8, title);
+        let was = title.clone();
+        let changed = {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            merge_relay_bytes(at, gpu, held, title, &dirty, fetched_after)
+        };
+        if !mapped || !changed {
+            return 0;
+        }
+        // Adapt the source's put_changed to this branch's write-watch
+        // API. Never use the full-piece fallback across excluded bytes.
+        // Leave title-only changes dirty for a later refresh, as source
+        // relay does; do not call card_changed or Tracked::taken here.
+        let mut written = 0;
+        for (off, len) in changed_runs(title, &was) {
+            let _writing = crate::watch::writing(address + off, len);
+            crate::host::write_mapped((address + off) as *mut u8, title[off..].as_ptr(), len);
+            written += len;
+        }
+        written
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a

@@ -2,7 +2,8 @@
 //! Source: DoubleGhosty/cool_fox@f4b48ad766ddbec1a1867022cd42f7645b0dd55e, host.rs (CARD_COMPARE, card_pass,
 //! make_card_work), shadow.rs (CardSpan, range helpers and tests), host/torn.rs
 //! (CPU hash). The optional two-sided Shadow path keeps existing CPU
-//! copy-back and fences; relay/async landing are deliberately not imported.
+//! copy-back and fences; optional relay merge of declared picked ranges
+//! uses the same serial submission contract, not background landing.
 
 use super::*;
 const PIECE: usize = 64 << 10;
@@ -696,16 +697,59 @@ pub(super) fn prepare_picked(runs: &[&HostList]) -> Vec<crate::picked::Range> {
     ranges
 }
 
+/// The reference's direct changed-byte relay is only safe here for the
+/// already-declared picked ranges, not arbitrary hash discoveries.
+/// Select after the title fence, before any fetch lands. The existing
+/// picked candidate selection excludes overlapping declared writes.
+pub(super) type RelayPicked = std::collections::BTreeMap<usize, (usize, usize)>;
+
+pub(super) fn relay_picked(ranges: &[crate::picked::Range], withholding: bool) -> RelayPicked {
+    if !crate::shadow::card_relay_merge_enabled() || withholding || ranges.is_empty() {
+        return RelayPicked::new();
+    }
+    let Some(marks) = crate::shadow::card_mark_ranges() else { return RelayPicked::new() };
+    ranges.iter().filter(|range| !marks.iter().any(|mark| crate::picked::overlaps(range, mark)))
+        .filter_map(|(shadow, address, len)| {
+            let (start, size) = shadow.range();
+            let from = address.checked_sub(start as usize)?;
+            let to = from.checked_add(*len)?;
+            (from < to && to <= size as usize)
+                .then_some((std::sync::Arc::as_ptr(shadow) as usize, (from, to)))
+        }).collect()
+}
+
+fn relay_overlap(lo: usize, hi: usize, range: Option<&(usize, usize)>) -> Option<(usize, usize)> {
+    let &(from, to) = range?;
+    let (a, b) = (lo.max(from), hi.min(to));
+    (a < b).then_some((a, b))
+}
+
+#[test]
+fn relay_fetch_only_merges_the_declared_intersection() {
+    assert_eq!(relay_overlap(0, 64, Some(&(16, 48))), Some((16, 48)));
+    assert_eq!(relay_overlap(32, 64, Some(&(16, 48))), Some((32, 48)));
+    assert_eq!(relay_overlap(16, 48, Some(&(0, 64))), Some((16, 48)));
+    assert_eq!(relay_overlap(48, 64, Some(&(16, 48))), None);
+    assert_eq!(relay_overlap(0, 16, None), None);
+}
+
 /// Reference picked::with / hand_back: land newly written bytes before
 /// the title's completion signal. The current branch's mark and withholding
 /// semantics take precedence; release cancelled snapshots without merging.
-pub(super) fn finish_picked(ranges: &[crate::picked::Range], withholding: bool) {
+pub(super) fn finish_picked(ranges: &[crate::picked::Range], withholding: bool, relay: &RelayPicked) {
     if ranges.is_empty() {
         return;
     }
     let marks = if withholding { None } else { crate::shadow::card_mark_ranges() };
     for range in ranges {
         let (shadow, address, len) = range;
+        if relay.contains_key(&(std::sync::Arc::as_ptr(shadow) as usize)) {
+            // Its changed pieces have landed directly from the fenced
+            // fetch. Release the pending declaration/snapshot without
+            // remerging or marking the GPU bytes dirty for upload.
+            shadow.keep_writes(*address, *len);
+            continue;
+        }
         let safe = marks.as_ref().is_some_and(|marks|
             !marks.iter().any(|mark| crate::picked::overlaps(range, mark)));
         if safe {
@@ -1073,7 +1117,7 @@ impl Host {
     /// the fence and land flagged full pieces before the CPU merge.
     /// Full coverage is the default and the conservative fallback.
     pub(super) fn card_back(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>],
-        runs: &[&HostList], tail: Option<CardCheck>, submitted: &mut u64)
+        runs: &[&HostList], tail: Option<CardCheck>, relay: &RelayPicked, submitted: &mut u64)
     {
         if copies.is_empty() {
             return;
@@ -1142,6 +1186,7 @@ impl Host {
         // allocation intact and pack_fetches divides the work safely.
         let pool = self.card_fetch_at_least(total).unwrap_or_else(||
             fail(format_args!("no admitted GPU readback pool")));
+        let mut relay_title = Vec::new();
         for batch in pack_fetches(&fetches, pool.size) {
             let list = self.card_list(CardPhase::Fetch);
             for piece in &batch {
@@ -1187,7 +1232,24 @@ impl Host {
                 // the pool contents stable until the next batch.
                 let bytes = unsafe { std::slice::from_raw_parts(
                     (pool.data as *const u8).add(piece.at as usize), piece.hi - piece.lo) };
-                copies[piece.copy].land_card(piece.lo, bytes, fetched_after);
+                let shadow = &copies[piece.copy];
+                let owner = std::sync::Arc::as_ptr(shadow) as usize;
+                if let Some((lo, hi)) = relay_overlap(piece.lo, piece.hi, relay.get(&owner)) {
+                    // Only this intersection is a declared picked write.
+                    // Outside it update the staging mirror as before,
+                    // never turn an undeclared discovery into title data.
+                    let (a, b) = (lo - piece.lo, hi - piece.lo);
+                    if a != 0 {
+                        shadow.land_card(piece.lo, &bytes[..a], fetched_after);
+                    }
+                    let n = shadow.card_merge_relay(lo, &bytes[a..b], fetched_after, &mut relay_title);
+                    COPY_BACK[1].fetch_add(n as u64, Ordering::Relaxed);
+                    if b < bytes.len() {
+                        shadow.land_card(hi, &bytes[b..], fetched_after);
+                    }
+                } else {
+                    shadow.land_card(piece.lo, bytes, fetched_after);
+                }
             }
         }
     }

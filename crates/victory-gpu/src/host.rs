@@ -1841,8 +1841,9 @@ impl Host {
             .collect();
         // The title fence has completed. Restore changed GPU pieces to
         // the CPU side before the existing marked/declared merge paths.
-        self.card_back(&carded, runs, tail, &mut submitted);
-        card_compare::finish_picked(&picked, withholding);
+        let relay = card_compare::relay_picked(&picked, withholding);
+        self.card_back(&carded, runs, tail, &relay, &mut submitted);
+        card_compare::finish_picked(&picked, withholding, &relay);
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();

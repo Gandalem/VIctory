@@ -353,10 +353,21 @@ and outside-range logic: taking dirty intervals records them against
 the upcoming sync fence; readback landing excludes unsent intervals
 and sends newer than the fetch fence. Previous entries retire when
 the next serial submission has consumed all older fetches. This
-protects the CPU staging mirror, not an independent asynchronous
-title-memory merge. Concurrent relay needs a different retirement
-watermark and mapping/snapshot ownership before it can be enabled.
-The default remains the existing serial landing path. Run the ignored
+protects the CPU staging mirror.
+Experimental `VICTORY_CARD_RELAY_MERGE=1` together with
+`VICTORY_CARD_SEND_ORDER=1` and `VICTORY_PICKED_WRITES=2` ports
+the reference's `merge_piece` and `card_merge_relay` into the
+completed fetch path for previously discovered, declared picked
+ranges only. GPU-changed bytes enter title memory and the held GPU
+baseline; title-only bytes stay in title memory for the next refresh.
+Newer sent or unsent CPU ranges are excluded. Never re-upload the
+merged GPU bytes or repeat the old picked copy-back. Unknown marks,
+overlapping marks, withheld memory and other writes use the existing
+serial path. Undeclared parts of a fetched piece still only update
+the staging mirror. This does not enable background landing or
+overlapping submissions; these need a different retirement watermark
+and mapping/snapshot ownership. The default remains the existing
+serial landing path. Run the ignored
 `owned_card_send_keeps_original_bytes_after_staging_changes` test with
 the card-buffer options and `VICTORY_SEND_OWN=1` on a real adapter.
 Run the ignored `card_check_tail_shares_title_fence` test on an adapter
@@ -366,7 +377,9 @@ test with the card-buffer options and `VICTORY_CARD_HASH_LEN=1`.
 Run the ignored `deferred_card_hash_does_not_repeat_a_fetched_change`
 test with the card-buffer options and `VICTORY_CARD_LOOK_ONLY=1`.
 Run the ignored `picked_writes_land_only_after_discovery` test with
-the card-buffer options and `VICTORY_PICKED_WRITES=2` on an adapter.
+the card-buffer options and `VICTORY_PICKED_WRITES=2` on an adapter,
+including a separate run with `VICTORY_CARD_SEND_ORDER=1` and
+`VICTORY_CARD_RELAY_MERGE=1`.
 These optional paths need real-adapter verification.
 Loose windows and exact-view arenas stay on the existing path. Run the
 ignored `carded_shadow_refresh_compare_and_copy_back` test with
