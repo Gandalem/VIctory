@@ -844,6 +844,11 @@ pub(crate) fn prepare_ahead(
     {
         return None;
     }
+    // Sparse waiting requests belong to the submitter. Never let an
+    // ahead worker consume dirty state before backing admission.
+    if copy.tiled.as_ref().is_some_and(|m| !m.lock().unwrap_or_else(|e| e.into_inner()).fully_backed()) {
+        return None;
+    }
     let staging = staging(resource, &copy.texture)?;
     if staging.tracked.as_ref().is_some_and(|t| t.bit().is_none())
         || !copy.staging.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
@@ -1024,6 +1029,22 @@ impl Staging {
             }
         }
         Ok(upload)
+    }
+
+    /// Conservative set a normal refresh may record. First upload and
+    /// unsupported source formats retain the existing full-chain rule.
+    pub(crate) fn source_backing_mask(&self, mips: u32) -> u32 {
+        if self.range_capable {
+            self.last.lock().unwrap_or_else(|e| e.into_inner()).requested(mips)
+        } else {
+            u32::MAX
+        }
+    }
+
+    /// A newly admitted group must be refreshed even when its source
+    /// tracker/digest is unchanged. The ordinary refresh owns the bytes.
+    pub(crate) fn retry_after_backing(&self) {
+        self.retry.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether its memory may have changed since it was last detiled (an

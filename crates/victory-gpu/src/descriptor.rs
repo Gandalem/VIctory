@@ -377,6 +377,11 @@ fn bake_read(
         {
             continue;
         }
+        // A bake publishes a descriptor immediately after its fence.
+        // Partial backing waits in the normal submission path instead.
+        if copy.tiled.as_ref().is_some_and(|m| !m.lock().unwrap_or_else(|e| e.into_inner()).fully_backed()) {
+            continue;
+        }
         let identity = Arc::as_ptr(&copy) as usize;
         let ok = if let Some(&ok) = completed.get(&identity) {
             ok

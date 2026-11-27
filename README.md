@@ -472,13 +472,28 @@ test texel copies tagged as source uploads, checking abandoned recording,
 partial expansion, completion masks and readback.
 
 This connects recorded source uploads to the sparse mapper; it does
-not activate live partial allocation. Initial title resources are still
-fully mapped and the advisory held judgement does not narrow source
-uploads. The reference's pressure-driven waiting/retry of unbacked
-source MIPs, safe visibility of non-contiguous MIPs and in-submission
-descriptor changes remain unported or unvalidated. Windows build and
-GPU readback verification are required before enabling partial title
-maps. Like the reference, mapped tiles are not returned while
+not activate live partial allocation. The reference's one-second
+waiting-source retry is adapted for nonmandatory bindless refreshes:
+before detiling, missing backing is admitted only when there is room.
+A failed admission leaves the dirty tracker and hashes untouched and
+waits before retrying. Successful new backing forces a fresh source
+read; no upload buffer is retained during the wait. Explicit table/copy
+requests and recorded GPU writes retain mandatory admission. Ahead and
+baked uploads decline incomplete backing so they cannot consume the
+waiting source's dirty state.
+
+The SRV clamp now limits a partial descriptor to a contiguous visible
+run inside its requested MIP range, using the reference LOD adjustment.
+A request with no overlap, or an implicit/unsupported partial view,
+takes the existing null-view fallback. The complete visibility mask,
+not only its first bit, invalidates existing placed and recorded table
+2D SRVs when a hole fills. The full-chain path keeps the original SRV.
+
+Production creation still maps the full chain. The observed held
+judgement does not narrow initial allocations or uploads, and the
+existing first-upload full-chain rule remains. In-submission descriptor
+changes, live partial admission and GPU readback remain unverified;
+Windows build and hardware validation are required before activation. Like the reference, mapped tiles are not returned while
 the resource lives. This option is disabled by
 default: the dedicated initialization fence and zero fill may outweigh
 pooling savings; validate both correctness and performance on Windows.

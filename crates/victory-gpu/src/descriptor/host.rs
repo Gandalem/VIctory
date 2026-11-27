@@ -493,8 +493,8 @@ impl HostHeap {
         let Some(copy) = crate::resource::made_copy(r) else { return };
         let Some(mapping) = &copy.tiled else { return };
         if !self.table_slot_owns(index, &copy) { return; }
-        let first = mapping.lock().unwrap_or_else(|e| e.into_inner()).first_shown();
-        let shown = Mutex::new(first);
+        let visible = mapping.lock().unwrap_or_else(|e| e.into_inner()).visible_mask();
+        let shown = Mutex::new(visible);
         let owner = Arc::downgrade(&copy);
         let identity = Arc::downgrade(&self.viewed);
         let resource = r as usize;
@@ -504,7 +504,7 @@ impl HostHeap {
         list.defer_host(move || {
             let Some(copy) = owner.upgrade() else { return };
             let Some(mapping) = &copy.tiled else { return };
-            let current = mapping.lock().unwrap_or_else(|e| e.into_inner()).first_shown();
+            let current = mapping.lock().unwrap_or_else(|e| e.into_inner()).visible_mask();
             let mut shown = shown.lock().unwrap_or_else(|e| e.into_inner());
             if *shown == current { return; }
             // Called under the submission lock, after all earlier GPU
@@ -520,7 +520,7 @@ impl HostHeap {
                     return false;
                 }
                 let Some(gpu) = host() else { return false };
-                if current.is_none() { return false; }
+                if current == 0 { return false; }
                 shader_texture_view(&gpu.device, resource as crate::object::This,
                     &copy, Some(&words), h.cpu(index)).is_some()
             }).unwrap_or(false);
@@ -1790,12 +1790,21 @@ fn shader_texture_view(
     }
     if let Some(d) = desc.as_mut() {
         shift_view_levels(crate::resource::dropped(resource, texture), d);
-        if let Some(mapping) = &copy.tiled
-            && let Some(first) = mapping.lock().unwrap_or_else(|e| e.into_inner()).first_shown()
-        {
-            // SAFETY: the live reserved texture supplies the retained level count.
-            let levels = u32::from(unsafe { texture.GetDesc() }.MipLevels);
-            crate::tiles::show_from(d, first, levels);
+    }
+    if let Some(mapping) = &copy.tiled {
+        let visible = mapping.lock().unwrap_or_else(|e| e.into_inner()).visible_mask();
+        // SAFETY: live resource descriptor.
+        let levels = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+        if let Some(d) = desc.as_mut() {
+            if !crate::tiles::clamp_visible(d, visible, levels) {
+                return None;
+            }
+        } else {
+            let all = if levels >= 32 { u32::MAX } else { (1u32 << levels) - 1 };
+            if visible & all != all {
+                // An implicit SRV cannot safely describe a partial chain.
+                return None;
+            }
         }
     }
     if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {

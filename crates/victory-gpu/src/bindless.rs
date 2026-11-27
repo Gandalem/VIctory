@@ -435,6 +435,7 @@ pub(crate) fn uploads(
             }
         }
     }
+    let mandatory = work.len();
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -483,6 +484,32 @@ pub(crate) fn uploads(
         for (staging, copy, _) in &work {
             staging.observe_held(copy, &hints);
         }
+    }
+    // The reference's waiting-source path is applied before detiling,
+    // only to opportunistic heap reads. Explicit table/copy requests
+    // retain mandatory admission and the existing full-chain fallback.
+    // In the production full-map path this makes no allocation.
+    if work.iter().skip(mandatory).any(|(_, copy, _)| copy.tiled.is_some()) {
+        let gpu = crate::host::host()?;
+        let mut index = 0;
+        work.retain(|(staging, copy, mips)| {
+            let explicit = index < mandatory;
+            index += 1;
+            if explicit || copy.tiled.is_none() { return true; }
+            // SAFETY: this upload pass runs under the submission lock,
+            // before preludes or any detiling for this batch.
+            match unsafe { crate::tiles::prepare_optional_source(gpu, copy, staging.source_backing_mask(*mips)) } {
+                Some(added) => {
+                    if added { staging.retry_after_backing(); }
+                    true
+                }
+                None => false, // dirty state untouched; retry when due
+            }
+        });
+        // The ready-list validator indexes work by staging identity.
+        // Filtering waiting work may have moved those indices.
+        staged.clear();
+        staged.extend(work.iter().enumerate().map(|(i, (staging, _, _))| (Arc::as_ptr(staging), i)));
     }
     let mut recorded = false;
     let mut readable = Vec::new();

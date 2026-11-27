@@ -219,6 +219,9 @@ pub(crate) struct Mapping {
     /// Title-source bytes actually copied by a completed GPU upload.
     /// Full-chain zero initialization alone does not set these bits.
     source_uploaded: u32,
+    /// The reference checks waiting source levels about once a second.
+    /// No prepared upload allocation is retained across that wait.
+    source_retry_at: Option<std::time::Instant>,
     card: u32,
     /// Packed-group claims are acquired at submission, never recording.
     /// Production initializes every group before a list records a write.
@@ -227,7 +230,7 @@ pub(crate) struct Mapping {
 
 impl Mapping {
     fn new(groups: Vec<Group>) -> Self {
-        Self { groups, mapped: 0, leases: Vec::new(), held: 0, observed_held: None, source_uploaded: 0, card: 0, claimed: 0 }
+        Self { groups, mapped: 0, leases: Vec::new(), held: 0, observed_held: None, source_uploaded: 0, source_retry_at: None, card: 0, claimed: 0 }
     }
 
     fn every_level(&self) -> u32 {
@@ -252,21 +255,21 @@ impl Mapping {
     /// acknowledges unbacked writes. Preserve exact authored subresources,
     /// rather than marking the entire packed tail as GPU-written.
     pub(crate) fn card_wrote(&mut self, levels: u32) -> bool {
-        let previous = self.first_shown();
+        let previous = self.visible_mask();
         self.card |= levels & self.mapped;
         self.unclaim(levels);
-        previous != self.first_shown()
+        previous != self.visible_mask()
     }
 
     /// Finish the reference held-level upload only after the actual
     /// GPU copy has run. Mapping or preparing a staging buffer does not
     /// publish newly backed MIPs. Preserve the separate GPU-write mask.
     pub(crate) fn source_wrote(&mut self, levels: u32) -> bool {
-        let previous = self.first_shown();
+        let previous = self.visible_mask();
         let completed = levels & self.mapped;
         self.source_uploaded |= completed;
         self.held |= completed;
-        previous != self.first_shown()
+        previous != self.visible_mask()
     }
 
     pub(crate) fn observe_held(&mut self, levels: u32) -> bool {
@@ -276,10 +279,20 @@ impl Mapping {
         changed
     }
 
+    /// Unlike the reference's single first_shown value, retain every
+    /// shown bit so a hole filling behind the first level can also
+    /// invalidate a descriptor. The normal full-chain path is unchanged.
+    pub(crate) fn visible_mask(&self) -> u32 {
+        (self.held | self.card) & self.mapped
+    }
+
+    pub(crate) fn fully_backed(&self) -> bool {
+        self.mapped == self.every_level()
+    }
+
     /// Reference first_shown: first held or card-authored mapped level.
-    /// The title path still publishes only fully mapped initialized chains.
-    pub(crate) fn first_shown(&self) -> Option<u32> {
-        let shown = (self.held | self.card) & self.mapped;
+    fn first_shown(&self) -> Option<u32> {
+        let shown = self.visible_mask();
         (shown != 0).then(|| shown.trailing_zeros())
     }
 
@@ -359,6 +372,48 @@ pub(crate) unsafe fn prepare_backing(
     let result = unsafe { state.map_more(host, &copy.texture, &desc, missing, before) };
     state.unclaim(missing);
     result.is_some_and(|mapped| mapped & requested == requested)
+}
+
+/// Adapt cool_fox's one-second waiting-source retry. Only ordinary
+/// nonmandatory heap refreshes that have not been detiled or recorded
+/// may use this gate. Required copies and GPU writes remain mandatory.
+/// Returns Some(true) when new backing needs a fresh source read;
+/// None defers the refresh, preserving its dirty state.
+fn retry_due(now: std::time::Instant, deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_none_or(|until| now >= until)
+}
+
+/// SAFETY: same submission-lock and state-prelude exclusion as
+/// prepare_backing. No GPU command has been recorded for this source.
+pub(crate) unsafe fn prepare_optional_source(
+    host: &crate::host::Host,
+    copy: &crate::resource::HostTexture,
+    levels: u32,
+) -> Option<bool> {
+    let Some(mapping) = &copy.tiled else { return Some(false) };
+    let now = std::time::Instant::now();
+    {
+        let mut state = mapping.lock().unwrap_or_else(|e| e.into_inner());
+        if group_mask(&state.groups, levels) & !state.mapped == 0 {
+            state.source_retry_at = None;
+            return Some(false);
+        }
+        if !retry_due(now, state.source_retry_at) {
+            return None;
+        }
+        // Bound pressure and allocation-failure retries alike, without
+        // consuming a tracker bit or keeping a stale upload buffer.
+        state.source_retry_at = Some(now + std::time::Duration::from_secs(1));
+    }
+    if crate::shadow::memory_pressured() || crate::host::video_memory_pressured() {
+        return None;
+    }
+    // SAFETY: the caller holds the submission lock and no prelude ran.
+    if !unsafe { prepare_backing(host, copy, levels) } {
+        return None;
+    }
+    mapping.lock().unwrap_or_else(|e| e.into_inner()).source_retry_at = None;
+    Some(true)
 }
 
 /// The resource itself retains the shared mapping state through
@@ -680,6 +735,54 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
     }
 }
 
+/// A sparse SRV must not span holes or expand beyond the title's
+/// requested MIP range. Start with the most detailed visible level in
+/// that range, then end at the first hole. None means a null view.
+fn visible_run(mask: u32, most: u32, mips: u32, levels: u32) -> Option<(u32, u32)> {
+    let levels = levels.min(32);
+    let end = most.saturating_add(mips).min(levels);
+    if most >= end { return None; }
+    let first = (most..end).find(|&i| mask & (1u32 << i) != 0)?;
+    let until = (first..end).find(|&i| mask & (1u32 << i) == 0).unwrap_or(end);
+    Some((first, until - first))
+}
+
+/// Keep the reference's LOD adjustment, then cap its range at the end
+/// of the safe run. The full-chain case preserves the original view.
+pub(crate) fn clamp_visible(
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, mask: u32, levels: u32,
+) -> bool {
+    let all = if levels >= 32 { u32::MAX } else { (1u32 << levels) - 1 };
+    if levels != 0 && mask & all == all { return true; }
+    let (most, mips) = match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the dimension selects this union member.
+            let view = unsafe { desc.Anonymous.Texture2D };
+            (view.MostDetailedMip, view.MipLevels)
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the dimension selects this union member.
+            let view = unsafe { desc.Anonymous.Texture2DArray };
+            (view.MostDetailedMip, view.MipLevels)
+        }
+        _ => return false,
+    };
+    let Some((first, count)) = visible_run(mask, most, mips, levels) else { return false };
+    show_from(desc, first, levels);
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the dimension selects this union member.
+            unsafe { desc.Anonymous.Texture2D.MipLevels = count };
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the dimension selects this union member.
+            unsafe { desc.Anonymous.Texture2DArray.MipLevels = count };
+        }
+        _ => unreachable!(),
+    }
+    true
+}
+
 /// Production remains fully mapped before first publication. The
 /// incremental allocator is shared with the isolated sparse GPU test;
 /// live partial mapping is NOT enabled until descriptor/write tracking
@@ -754,6 +857,54 @@ mod tests {
         assert!(state.observe_held(1 << 6));
         assert!(!state.observe_held(1 << 6));
         assert_eq!(state.first_shown(), Some(3), "observation cannot change published levels");
+    }
+
+    #[test]
+    fn waiting_source_retries_only_after_the_interval() {
+        let now = std::time::Instant::now();
+        let until = now + std::time::Duration::from_secs(1);
+        assert!(retry_due(now, None));
+        assert!(!retry_due(now, Some(until)));
+        assert!(retry_due(until, Some(until)));
+    }
+
+    #[test]
+    fn visible_runs_never_span_holes_or_leave_the_requested_range() {
+        assert_eq!(visible_run(0b100110, 0, u32::MAX, 6), Some((1, 2)));
+        assert_eq!(visible_run(0b100110, 3, 3, 6), Some((5, 1)));
+        assert_eq!(visible_run(0b100110, 3, 2, 6), None);
+        assert_eq!(visible_run(u32::MAX, 31, u32::MAX, 32), Some((31, 1)));
+        assert_eq!(visible_run(0, 0, 4, 4), None);
+        assert_eq!(visible_run(0b1111, 0, 0, 4), None);
+
+        let mut view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0, MipLevels: u32::MAX,
+                    ResourceMinLODClamp: 2.0, PlaneSlice: 0,
+                },
+            },
+            ..Default::default()
+        };
+        assert!(clamp_visible(&mut view, 0b100110, 6));
+        // SAFETY: the dimension selects Texture2D.
+        let v = unsafe { view.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels), (1, 2));
+        assert_eq!(v.ResourceMinLODClamp, 1.0);
+        assert!(!clamp_visible(&mut view, 0b100000, 6));
+    }
+
+    #[test]
+    fn a_filled_hole_changes_visibility_even_with_the_same_first_mip() {
+        let mut state = Mapping::new(groups(&[16, 4, 1], 4, 2, 23).unwrap());
+        state.mapped = state.every_level();
+        assert!(state.source_wrote(1));
+        assert!(state.source_wrote(1 << 2));
+        assert_eq!(state.first_shown(), Some(0));
+        assert!(state.card_wrote(1 << 1));
+        assert_eq!(state.visible_mask(), 0b111);
+        assert_eq!(state.first_shown(), Some(0));
     }
 
     #[test]
