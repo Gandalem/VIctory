@@ -273,6 +273,29 @@ impl Mapping {
         self.leases.iter().map(|lease| u64::from(lease.count) * TILE).sum()
     }
 
+    /// Port the reference Tiled::uploaded_on admission policy: title-held
+    /// MIPs may wait for memory room; GPU-authored MIPs never wait.
+    /// Existing backing is kept even if a later title judgement shrinks.
+    /// Returns (first shown changed, named levels still missing).
+    ///
+    /// SAFETY: same queue/state exclusion as map_more. Newly admitted
+    /// groups are zero-initialized, not yet filled from title memory.
+    /// Live partial publication needs the actual upload fence as well.
+    unsafe fn admit_held(
+        &mut self, host: &crate::host::Host, texture: &ID3D12Resource,
+        desc: &D3D12_RESOURCE_DESC, held: u32, room: bool,
+        before: D3D12_RESOURCE_STATES,
+    ) -> Option<(bool, bool)> {
+        let previous = self.first_shown();
+        let held = held & self.every_level();
+        let named = held | self.card;
+        let wanted = if room { named } else { self.card };
+        // SAFETY: inherited caller's queue and state exclusion.
+        let mapped = unsafe { self.map_more(host, texture, desc, wanted, before) }?;
+        self.held = held;
+        Some((previous != self.first_shown(), named & !mapped != 0))
+    }
+
     /// Add only the missing groups. Allocation is transactional until the
     /// queue is touched; a failed admission returns every tentative run.
     /// Once the queue is touched initialize() either finishes its fence
@@ -653,10 +676,12 @@ pub(crate) fn make(host: &crate::host::Host, desc: &D3D12_RESOURCE_DESC,
     let mut state = mapping.lock().unwrap_or_else(|e| e.into_inner());
     let all = state.every_level();
     // SAFETY: reserve returned an unpublished COMMON-state resource.
-    if unsafe { state.map_more(host, &texture, &desc, all, D3D12_RESOURCE_STATE_COMMON) }? != all {
+    let (_, waiting) = unsafe {
+        state.admit_held(host, &texture, &desc, all, true, D3D12_RESOURCE_STATE_COMMON)
+    }?;
+    if waiting || state.mapped != all {
         return None;
     }
-    state.held = all;
     let bytes = state.given_bytes();
     drop(state);
     Some((texture, bytes, mapping))
@@ -870,6 +895,58 @@ mod tests {
         drop(texture);
         assert!(usage().0 > before);
         drop(retained);
+        assert_eq!(usage().0, before);
+    }
+
+    #[test]
+    #[ignore = "requires a tiled-resource tier-2 D3D12 adapter; run alone"]
+    fn held_mip_admission_waits_for_room_and_keeps_existing_backing() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        let host = crate::host::host().expect("D3D12 device");
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024, Height: 1024, DepthOrArraySize: 1, MipLevels: 8,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let before = usage().0;
+        let (texture, desc, mapping) = reserve(host, &desc, &[]).expect("reserved texture");
+        {
+            let mut state = mapping.lock().unwrap();
+            let tail = group_mask(&state.groups, 1 << 7);
+            let all = state.every_level();
+            assert_ne!(tail, all);
+            // SAFETY: this resource is unpublished, in COMMON, and no
+            // other list accesses it. Each mapper pass waits for its fence.
+            assert_eq!(unsafe { state.admit_held(host, &texture, &desc,
+                1 << 7, false, D3D12_RESOURCE_STATE_COMMON) }, Some((false, true)));
+            assert_eq!(state.mapped, 0);
+            assert_eq!(usage().0, before);
+            assert_eq!(unsafe { state.admit_held(host, &texture, &desc,
+                1 << 7, true, D3D12_RESOURCE_STATE_COMMON) }, Some((true, false)));
+            assert_eq!(state.mapped, tail);
+            assert_eq!(state.first_shown(), Some(7));
+            let tail_bytes = state.given_bytes();
+            // A new held level waits without discarding the existing tail.
+            assert_eq!(unsafe { state.admit_held(host, &texture, &desc,
+                all, false, D3D12_RESOURCE_STATE_COMMON) }, Some((false, true)));
+            assert_eq!(state.given_bytes(), tail_bytes);
+            assert_eq!(unsafe { state.admit_held(host, &texture, &desc,
+                all, true, D3D12_RESOURCE_STATE_COMMON) }, Some((true, false)));
+            assert_eq!(state.mapped, all);
+            assert_eq!(state.first_shown(), Some(0));
+            let bytes = state.given_bytes();
+            assert!(bytes > tail_bytes);
+            // The reference keeps backing until the resource is released.
+            assert_eq!(unsafe { state.admit_held(host, &texture, &desc,
+                1 << 7, true, D3D12_RESOURCE_STATE_COMMON) }, Some((true, false)));
+            assert_eq!(state.mapped, all);
+            assert_eq!(state.given_bytes(), bytes);
+        }
+        assert_eq!(read_texels(host, &texture, &desc, [0, 7]), [0, 0]);
+        drop(mapping);
+        drop(texture);
         assert_eq!(usage().0, before);
     }
 

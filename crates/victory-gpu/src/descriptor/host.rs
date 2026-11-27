@@ -472,6 +472,72 @@ impl HostHeap {
         self.note_address(index, Some(view));
     }
 
+    /// The reference builds the table's descriptors from recorded views.
+    /// Preserve that snapshot when the tiled resource's visible level
+    /// changes between recording and execution. Unlike a title slot,
+    /// a dynamic table must not be re-resolved from later title records.
+    pub(crate) fn make_table_at(
+        &self, list: &crate::host::HostList, heap: usize, index: u32, view: &View,
+    ) {
+        use std::sync::Arc;
+        self.make_at(index, view);
+        if !crate::tiles::enabled() || self.sampler || index < self.count
+            || index >= self.count + self.dynamic
+        {
+            return;
+        }
+        let View::Placed(false, resource, desc) = view else { return };
+        if resource[0] == 1 || desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 { return; }
+        let address = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+        let Some(r) = crate::resource::existing_placed_texture(address, resource) else { return };
+        let Some(copy) = crate::resource::made_copy(r) else { return };
+        let Some(mapping) = &copy.tiled else { return };
+        if !self.table_slot_owns(index, &copy) { return; }
+        let first = mapping.lock().unwrap_or_else(|e| e.into_inner()).first_shown();
+        let shown = Mutex::new(first);
+        let owner = Arc::downgrade(&copy);
+        let identity = Arc::downgrade(&self.viewed);
+        let resource = r as usize;
+        let words: [u32; 10] = desc[..10].try_into().expect("ten descriptor words");
+        // This callback belongs to the same recorded list as the dynamic
+        // slot. Reset discards it. Keep no extra strong texture owner.
+        list.defer_host(move || {
+            let Some(copy) = owner.upgrade() else { return };
+            let Some(mapping) = &copy.tiled else { return };
+            let current = mapping.lock().unwrap_or_else(|e| e.into_inner()).first_shown();
+            let mut shown = shown.lock().unwrap_or_else(|e| e.into_inner());
+            if *shown == current { return; }
+            // Called under the submission lock, after all earlier GPU
+            // work, before any list in this submission reaches the GPU.
+            let remade = crate::descriptor::with_host(heap, |h| {
+                let Some(identity) = identity.upgrade() else { return false };
+                if !Arc::ptr_eq(&identity, &h.viewed) { return false; }
+                let Some(at) = index.checked_sub(h.count) else { return false };
+                let next = h.next.lock().unwrap_or_else(|e| e.into_inner());
+                if !next.1.get(at as usize).copied().unwrap_or(false)
+                    || !h.table_slot_owns(index, &copy)
+                {
+                    return false;
+                }
+                let Some(gpu) = host() else { return false };
+                if current.is_none() { return false; }
+                shader_texture_view(&gpu.device, resource as crate::object::This,
+                    &copy, Some(&words), h.cpu(index)).is_some()
+            }).unwrap_or(false);
+            if !remade {
+                crate::host::fail(format_args!("could not re-publish recorded tiled table SRV at {index}"));
+            }
+            *shown = current;
+        });
+    }
+
+    fn table_slot_owns(&self, index: u32, copy: &crate::resource::HostTexture) -> bool {
+        use windows::core::Interface;
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+            .get(index as usize).and_then(Option::as_ref)
+            .is_some_and(|(texture, shadow)| shadow.is_none() && texture.as_raw() == copy.texture.as_raw())
+    }
+
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
     /// unordered access (`uav`), of `bytes` of `buffer` from byte `first`
     /// (both multiples of 4), which it holds; a null one for no buffer, or

@@ -486,10 +486,25 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    upload_mask(list, resource, texture, u32::MAX);
+}
+
+/// Adapt cool_fox upload_from: a placed table SRV supplies its requested
+/// MIP range. Retain the existing eligibility and retained-MIP conversion
+/// rather than reinterpreting title levels as host subresources.
+pub(crate) fn upload_from(
+    list: &HostList, resource: This, texture: &ID3D12Resource,
+    words: Option<&[u32; 10]>,
+) {
+    let mips = crate::descriptor::host::srv_mip_mask(resource, words, texture);
+    upload_mask(list, resource, texture, mips);
+}
+
+fn upload_mask(list: &HostList, resource: This, texture: &ID3D12Resource, mips: u32) {
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    // Once per list for each host texture, however many title textures of
-    // its memory the list samples.
+    // Requests of one staging owner are coalesced per list, including
+    // every distinct table range.
     if is_host_written(resource) {
         #[cfg(feature = "diagnostics")]
         {
@@ -503,15 +518,17 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         }
         return;
     }
-    if !list.first_use(texture.as_raw() as usize) {
-        return;
-    }
     let (Some(staging), Some(copy)) = (staging(resource, texture), crate::resource::host_copy(resource)) else {
         return;
     };
     // Each list recorded the copy before (run perf7: 149 textures uploaded
     // 3,195 times in a frame, 17 ms of GPU time), changed or not.
-    list.defer_texture(staging, copy);
+    // A later table may request another range, or an explicit copy may
+    // require the whole chain. The list unions them instead of dropping
+    // every request after the first one.
+    if copy.texture.as_raw() == texture.as_raw() {
+        list.defer_texture(staging, copy, mips);
+    }
 }
 
 /// Records into `list` the copy of `buffer` (laid out as `staging` says)

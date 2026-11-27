@@ -367,8 +367,11 @@ selection in ff33360. For sampled single-slice RGBA8 2D textures, heap
 SRV masks use the same retained-MIP shift as the real host descriptors.
 Duplicates, rewrites, multiple heaps and aliases contribute to the union
 before the submission prepares a texture. Initial uploads cover all MIPs;
-default or unsupported SRVs, explicit table reads and texture copies keep
-the full-range request. Hidden dirty levels stay pending even after dirty
+default or unsupported SRVs and explicit texture copies keep the
+full-range request. The placed-table SRV path also adapts cool_fox's
+`upload_from`: per-list requests of the same staging owner union their
+ranges, then merge across lists and bindless heaps. A whole-resource
+copy request dominates every narrower request. Hidden dirty levels stay pending even after dirty
 pages are consumed or a clean content hash is observed. Since current
 upload buffers are submission-owned, their source bytes are read again
 when a pending MIP becomes visible rather than retaining stale staging.
@@ -426,8 +429,14 @@ that changes the first shown level triggers a scan of all live view
 heaps, checking the record generation and exact retained host resource
 before rebuilding a matching slot. Stale or failed publication uses the
 ordinary null/read retry path. No new host texture is created by this
-pass. Other SRV forms and already recorded dynamic table slots still
-require coordination before live sparse admission.
+pass. Fresh dynamic tables retain their recorded placed 2D SRV words and
+weak identity of the actual host copy. A deferred submission callback
+refreshes the descriptor if its first shown level changed since the
+table was made or last submitted. It rechecks the heap identity, live
+dynamic allocation and retained resource; it must not resolve a
+different title texture or use a recycled slot. A list reset discards
+its callback. Other SRV forms and changes inside a running submission
+still require coordination before live sparse admission.
 
 `VICTORY_TILED_MIP_JUDGEMENT=1` (with the tile pool enabled) also ports
 the reference's placed-view first-level and next-start judgement and
@@ -442,9 +451,15 @@ Unsupported layouts conservatively report all retained levels.
 The observed mask is deliberately separate from the active held mask.
 Production still fully backs and initializes every retained MIP, so
 its first shown level is zero. The observation does not change uploads,
-allocation or sampling. Live partial admission and full descriptor/table
-coordination remain unported and require Windows GPU readback
-verification. Like the reference, mapped tiles are not returned while
+allocation or sampling. The reference `uploaded_on` policy is ported
+as `admit_held`: under pressure, held source levels can wait while
+card-authored levels cannot, and existing tile leases are retained.
+Production creation uses this policy with the full mask. The ignored
+`held_mip_admission_waits_for_room_and_keeps_existing_backing` GPU test
+exercises sparse admission and expansion with simulated room changes.
+Live partial source admission and coordination with the actual upload
+fence are not enabled; other view forms and in-submission changes
+remain unvalidated and need Windows GPU readback verification. Like the reference, mapped tiles are not returned while
 the resource lives. This option is disabled by
 default: the dedicated initialization fence and zero fill may outweigh
 pooling savings; validate both correctness and performance on Windows.

@@ -395,7 +395,7 @@ pub(crate) fn prepare_ahead(viewed: &Arc<Viewed>) {
 /// submission shows from the next one on.
 pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
-    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+    textures: &[crate::texture::RefreshWork],
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
@@ -420,15 +420,19 @@ pub(crate) fn uploads(
     let mut work: Vec<crate::texture::RefreshWork> = Vec::new();
     let mut staged = HashMap::new();
     let range_mode = crate::texture::srv_ranges_enabled();
-    for (staging, copy) in textures {
+    for (staging, copy, requested) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded).
         if copy.host_written.load(Relaxed) {
             continue;
         }
-        if let std::collections::hash_map::Entry::Vacant(e) = staged.entry(Arc::as_ptr(staging)) {
-            e.insert(work.len());
-            work.push((staging.clone(), copy.clone(), u32::MAX));
+        let mask = if range_mode { *requested } else { u32::MAX };
+        match staged.entry(Arc::as_ptr(staging)) {
+            std::collections::hash_map::Entry::Occupied(e) => work[*e.get()].2 |= mask,
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(work.len());
+                work.push((staging.clone(), copy.clone(), mask));
+            }
         }
     }
     let mut done = std::collections::HashSet::new();
@@ -460,7 +464,8 @@ pub(crate) fn uploads(
             if let Some(staging) = crate::texture::staging(r as This, &texture.texture) {
                 let mask = if range_mode { inner.requested_mips(r) } else { u32::MAX };
                 // Union across heaps and title aliases before reading once.
-                // Explicit table/copy requests were inserted as full masks.
+                // Explicit copy requests carry full masks; table reads
+                // carry their requested range when the option is enabled.
                 match staged.entry(Arc::as_ptr(&staging)) {
                     std::collections::hash_map::Entry::Occupied(e) => work[*e.get()].2 |= mask,
                     std::collections::hash_map::Entry::Vacant(e) => {

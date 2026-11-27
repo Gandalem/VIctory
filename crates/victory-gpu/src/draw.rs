@@ -1345,7 +1345,7 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(view) => {
-                        host.make_at(index, &view);
+                        host.make_table_at(list, std::ptr::from_ref(heap) as usize, index, &view);
                         if let Some(u) = used {
                             readable(list, u, &view, true);
                         }
@@ -1912,7 +1912,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         }
     }
     match (view, u.kind) {
-        (View::Shader(resource, _), ResourceType::Srv) => {
+        (View::Shader(resource, words), ResourceType::Srv) => {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
             if let Some(a) = crate::resource::alias_source(*resource as This) {
@@ -1921,7 +1921,11 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             if let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(&t)
             {
-                crate::texture::upload(list, *resource as This, &t);
+                if placed.is_some() {
+                    crate::texture::upload_from(list, *resource as This, &t, words.as_ref());
+                } else {
+                    crate::texture::upload(list, *resource as This, &t);
+                }
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]

@@ -717,6 +717,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn recorded_texture_requests_union_ranges_and_full_copies() {
+        let Some(host) = host() else { return };
+        let address = crate::watch::tests::pool(1) as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 4 << 16, 28, 1, 0, 0x100, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut object = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(std::ptr::null(), address, words.as_ptr().cast(),
+            0, std::ptr::null(), &iid, &mut object), 0);
+        let copy = crate::resource::host_copy(object).expect("host texture");
+        let staging = crate::texture::staging(object, &copy.texture).expect("staging");
+        let list = host.new_list().unwrap();
+        let requested = || {
+            let d = list.deferred();
+            let masks: Vec<_> = d.copies.iter().filter_map(|s| match s {
+                Step::Texture(_, _, mips) => Some(*mips),
+                _ => None,
+            }).collect();
+            masks
+        };
+        list.defer_texture(staging.clone(), copy.clone(), 1);
+        list.defer_texture(staging.clone(), copy.clone(), 4);
+        assert_eq!(requested(), [5]);
+        list.defer_texture(staging.clone(), copy.clone(), u32::MAX);
+        assert_eq!(requested(), [u32::MAX]);
+        list.close();
+        list.reset();
+        assert!(requested().is_empty());
+        list.defer_texture(staging, copy, 2);
+        assert_eq!(requested(), [2]);
+    }
+
+    #[test]
     fn dxgi_pressure_tracks_the_actual_budget_and_recovers_with_hysteresis() {
         assert!(!next_video_pressure(false, 0, 100, 90));
         assert!(!next_video_pressure(false, 100, 89, 90));
@@ -1155,7 +1187,7 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>),
+    Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>, u32),
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
     Heap(std::sync::Arc<crate::bindless::Viewed>),
@@ -1184,6 +1216,9 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Where a staging owner's upload request is recorded. Several
+    /// table views of the same texture must union their requested MIPs.
+    texture_requests: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1430,7 +1465,7 @@ impl Host {
                     .copies
                     .iter()
                     .filter_map(|s| match s {
-                        Step::Texture(staging, copy) => Some((staging.clone(), copy.clone())),
+                        Step::Texture(staging, copy, mips) => Some((staging.clone(), copy.clone(), *mips)),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -2566,8 +2601,22 @@ impl HostList {
         &self,
         staging: std::sync::Arc<crate::texture::Staging>,
         copy: std::sync::Arc<crate::resource::HostTexture>,
+        mips: u32,
     ) {
-        self.deferred().copies.push(Step::Texture(staging, copy));
+        let key = std::sync::Arc::as_ptr(&staging) as usize;
+        let mut d = self.deferred();
+        if let Some(&index) = d.texture_requests.get(&key) {
+            if let Step::Texture(_, owner, requested) = &mut d.copies[index] {
+                debug_assert!(std::sync::Arc::ptr_eq(owner, &copy));
+                *requested |= mips;
+            } else {
+                unreachable!("a texture request must name its recorded step");
+            }
+        } else {
+            let index = d.copies.len();
+            d.texture_requests.insert(key, index);
+            d.copies.push(Step::Texture(staging, copy, mips));
+        }
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
