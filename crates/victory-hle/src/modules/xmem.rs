@@ -382,7 +382,7 @@ fn section_window_enabled() -> bool {
     *ON
 }
 
-/// Source xmem::lean's commit-elision stage. Other map calls remain unchanged.
+/// Source xmem::lean: elide redundant section commits and placeholder splits.
 fn lean() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_MAP_LEAN").is_some_and(|v| v == "1"));
     *ON
@@ -540,10 +540,26 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Source Physical::holes: placeholders left by complete successful
+    /// unmaps. The title can coalesce/release them, so these are hints,
+    /// never proof of a live reservation. Cap retained hints.
+    holes: HashMap<usize, usize>,
     /// Where each slice (section, page index) is mapped: the addresses of
     /// its page in every view showing it (the GPU side's change tracking
     /// follows writes through one view to the others, `aliases`).
     shown: HashMap<(usize, usize), Vec<usize>>,
+}
+
+impl Physical {
+    fn note_hole(&mut self, base: usize, len: usize) {
+        const MAX_HOLES: usize = 65_536;
+        if self.holes.len() >= MAX_HOLES {
+            // Losing a hint only means another normal split; bound
+            // this cache even as the title moves to new address ranges.
+            self.holes.clear();
+        }
+        self.holes.insert(base, len);
+    }
 }
 
 impl Slice {
@@ -1017,27 +1033,70 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
-    let view = unsafe {
+    map_with(physical, base, len, slice, lean())
+}
+
+fn map_with(physical: &mut Physical, base: usize, len: usize, slice: Slice, lean: bool) -> bool {
+    let own = physical.holes.remove(&base) == Some(len) && lean;
+    if !show(base, len, &slice, own) {
+        return false;
+    }
+    // New contents, read-write: the GPU side's copies no longer guard it.
+    victory_gpu::title_memory_remapped(base, len);
+    for k in 0..len / PAGE {
+        let shown = physical.shown.entry(slice.key(k)).or_default();
+        // Pages shown elsewhere already: guarded here too if they are there.
+        victory_gpu::title_memory_aliased(base + k * PAGE, shown);
+        shown.push(base + k * PAGE);
+    }
+    physical.views.insert(base, (len, slice));
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    static MAP_SPLITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Cuts `[base, base + len)` out of the placeholder it is in (which fails
+/// harmlessly when the range is the whole placeholder).
+fn split(base: usize, len: usize) {
+    // SAFETY: acts only on a placeholder.
+    #[cfg(test)]
+    MAP_SPLITS.with(|n| n.set(n.get() + 1));
+    unsafe {
         VirtualFree(
             base as *mut c_void,
             len,
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
-        MapViewOfFile3(
-            slice.section.handle,
-            GetCurrentProcess(),
-            base as *const c_void,
-            (slice.index * PAGE) as u64,
-            len,
-            MEM_REPLACE_PLACEHOLDER,
-            PAGE_READWRITE,
-            std::ptr::null_mut(),
-            0,
         )
     };
+}
+
+/// The system calls of [`map`]; `own`: the placeholder at `base` is `len`
+/// long already.
+fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
+    let map_view = || {
+        // SAFETY: maps the section over a placeholder; acts only on one.
+        unsafe {
+            MapViewOfFile3(
+                slice.section.handle,
+                GetCurrentProcess(),
+                base as *const c_void,
+                (slice.index * PAGE) as u64,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
+    };
+    let mut view = if own { map_view() } else { MEMORY_MAPPED_VIEW_ADDRESS { Value: std::ptr::null_mut() } };
+    if view.Value as usize != base {
+        split(base, len);
+        view = map_view();
+    }
     if view.Value as usize != base {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -1052,15 +1111,6 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
-    for k in 0..len / PAGE {
-        let shown = physical.shown.entry(slice.key(k)).or_default();
-        // Pages shown elsewhere already: guarded here too if they are there.
-        victory_gpu::title_memory_aliased(base + k * PAGE, shown);
-        shown.push(base + k * PAGE);
-    }
-    physical.views.insert(base, (len, slice));
     true
 }
 
@@ -1159,6 +1209,10 @@ fn refusal_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
+    unmap_with(physical, base, len, lean());
+}
+
+fn unmap_with(physical: &mut Physical, base: usize, len: usize, lean: bool) {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
@@ -1193,7 +1247,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        let gone = unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1202,12 +1256,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        if lean && gone != 0 && at >= base && at + size <= end {
+            physical.note_hole(at, size);
+        }
         if at < base {
-            map(physical, at, base - at, slice.clone());
+            map_with(physical, at, base - at, slice.clone(), lean);
         }
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            map_with(physical, end, at + size - end, Slice { index, ..slice }, lean);
         }
     }
 }
@@ -1526,6 +1583,74 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// Source pages_mapped_again_hold_what_they_held. Exercise the
+    /// actual Windows placeholder path without changing process-wide
+    /// environment switches: exact holes skip a split, a hint made stale
+    /// by coalescing retries with the original split/map calls.
+    #[test]
+    fn lean_placeholder_hints_skip_splits_and_retry_after_coalescing() {
+        let pages = allocate(2);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE,
+            MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let base = a as usize;
+        {
+            let mut p = physical();
+            let _changing = victory_gpu::title_memory_remapping();
+            let first = p.pages[&pages[0]].clone();
+            let second = p.pages[&pages[1]].clone();
+            assert!(map_with(&mut p, base, PAGE, first.clone(), true));
+            assert!(map_with(&mut p, base + PAGE, PAGE, second.clone(), true));
+            // SAFETY: live read-write views of our allocated section.
+            unsafe {
+                a.cast::<u8>().write(0x51);
+                a.cast::<u8>().add(PAGE).write(0x62);
+            }
+            unmap_with(&mut p, base, 2 * PAGE, true);
+            assert_eq!(p.holes.get(&base), Some(&PAGE));
+            assert_eq!(p.holes.get(&(base + PAGE)), Some(&PAGE));
+            MAP_SPLITS.with(|n| n.set(0));
+            assert!(map_with(&mut p, base, PAGE, first.clone(), true));
+            assert_eq!(MAP_SPLITS.with(|n| n.get()), 0);
+            // SAFETY: the page's original contents survive the remap.
+            assert_eq!(unsafe { a.cast::<u8>().read() }, 0x51);
+            unmap_with(&mut p, base, PAGE, true);
+            // The title can join placeholders without informing our
+            // hint cache. The first map then fails; split and retry.
+            // SAFETY: both adjacent views are now placeholders.
+            assert_ne!(unsafe { VirtualFree(a, 2 * PAGE, MEM_RELEASE | 1) }, 0);
+            assert_eq!(p.holes.get(&base), Some(&PAGE));
+            MAP_SPLITS.with(|n| n.set(0));
+            assert!(map_with(&mut p, base, PAGE, first, true));
+            assert_eq!(MAP_SPLITS.with(|n| n.get()), 1);
+            assert!(map_with(&mut p, base + PAGE, PAGE, second, true));
+            // SAFETY: both remapped views are live.
+            unsafe {
+                assert_eq!(a.cast::<u8>().read(), 0x51);
+                assert_eq!(a.cast::<u8>().add(PAGE).read(), 0x62);
+            }
+            unmap_with(&mut p, base, 2 * PAGE, true);
+            p.holes.remove(&base);
+            p.holes.remove(&(base + PAGE));
+        }
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+        // SAFETY: these are the test's two adjacent empty placeholders.
+        unsafe {
+            assert_ne!(VirtualFree(a, 2 * PAGE, MEM_RELEASE | 1), 0);
+            assert_ne!(VirtualFree(a, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn placeholder_hint_cache_is_bounded() {
+        let mut p = Physical::default();
+        for k in 0..65_537 {
+            p.note_hole((k + 1) * PAGE, PAGE);
+        }
+        assert_eq!(p.holes.len(), 1);
+        assert_eq!(p.holes.get(&(65_537 * PAGE)), Some(&PAGE));
     }
 
     #[test]

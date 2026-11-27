@@ -491,8 +491,17 @@ title aliases, join exact adjacent/overlapping ranges, and pin
 the original Slice even after its opaque page number is freed.
 On a failed later mapping report the successfully written prefix.
 The existing GPU guards still round notices to 64 KiB blocks.
-No placeholder-split elision, parallel remapping or GPU journal
-is enabled.
+With `VICTORY_MAP_LEAN=1`, the reference's Physical::holes,
+map/show/split logic also tracks exact placeholders left by
+successful whole-view unmaps. Try an exact-size hint before
+splitting; if the title has coalesced or replaced that placeholder,
+retry using the old split-and-map path. Partial views are still
+split and their surviving neighbors remapped. Cap the hint cache
+at 65,536 entries (discarding hints only costs a redundant split).
+Keep the existing physical reverse map, mapping transaction and
+guard notifications. Real Windows tests exercise split elision,
+stale-hint fallback and retained contents. Parallel remapping and
+the GPU alternate-view journal remain unported.
 Run the ignored `parallel_staging_landing_preserves_pending_cpu_bytes`
 test with the send-order and landing options. No GPU compare
 coverage or submission waits are removed.
