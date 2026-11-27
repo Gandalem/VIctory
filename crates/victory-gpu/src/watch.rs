@@ -531,6 +531,22 @@ impl Tracked {
         (copy, zero)
     }
 
+    /// Read-only equivalent of the source write-watch journal query.
+    /// Untracked portions are unknown (therefore stale). Do not take,
+    /// protect or clear any pages while a title flight is in the air.
+    pub(crate) fn stale_in(&self, from: usize, to: usize) -> bool {
+        if from >= to {
+            return false;
+        }
+        if from < self.start || to > self.end
+            || self.untracked.iter().any(|&(a, b)| a < to && b > from)
+        {
+            return true;
+        }
+        self.changed.0.lock().unwrap_or_else(|e| e.into_inner())
+            .range(from / PAGE..to.div_ceil(PAGE)).next().is_some()
+    }
+
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed

@@ -490,6 +490,24 @@ through that boundary. Run the ignored
 This is completed-flight CPU ownership, not per-flight GPU bitmap
 binding: global write/read bitmaps, hashes and copy-back still
 require serial settlement. The default flag path is unchanged.
+The reference's stale_under_flights and stale_under_writes now
+classify dirty refresh intersections of pending copies using this
+branch's guard/alias tracker, without consuming write-watch state.
+Repeated refreshes of one copy are joined into a hull; untracked
+overlaps are conservatively stale. The pump still settles before
+any further preparation, even where no dirty overlap is found.
+Experimental `VICTORY_LATE_EXACT=1` with `VICTORY_CARD_SEND_ORDER=1`
+and full card comparison adapts the carded merge_page_under_writes
+path during fenced preparation of tracked pending declarations.
+Read a page's title bytes, update the CPU-side staging reference
+only where different, and register those exact upload runs. Keep
+guard-saved bytes and declared snapshots synchronized. A 512-run
+budget per refresh and unreadable-page fallback retain the previous
+full refresh path; untracked and unmapped paths are unchanged.
+This is NOT the reference's concurrent merge_under_writes yet:
+shared-memory GPU writes, overlapping flights and journal-based
+skip decisions remain disabled. Run the ignored
+`exact_under_writes_refresh_only_enqueues_changed_bytes` test.
 Run the ignored
 `late_title_flight_retains_recording_and_publishes_on_settle` test.
 The default remains synchronous. Run the ignored

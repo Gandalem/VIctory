@@ -822,6 +822,44 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// The source's per-page changed-run budget, kept conservative while
+/// a refresh is still serialized. Compute all runs before touching the
+/// reference; an over-budget page takes the original full-copy path.
+fn merge_under_runs(title: &[u8], held: &mut [u8], left: &mut usize) -> Option<Vec<(usize, usize)>> {
+    assert_eq!(title.len(), held.len());
+    let runs = changed_runs(title, held);
+    if runs.len() > *left {
+        return None;
+    }
+    *left -= runs.len();
+    for &(r, n) in &runs {
+        held[r..r + n].copy_from_slice(&title[r..r + n]);
+    }
+    Some(runs)
+}
+
+fn exact_under_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_EXACT").is_some_and(|v| v == "1"))
+        && card_send_order()
+        && !std::env::var_os("VICTORY_CARD_COMPARE_RANGES").is_some_and(|v| v == "1")
+}
+
+#[test]
+fn under_write_merge_updates_only_changed_runs_within_budget() {
+    let mut held = [0u8; 8];
+    let title = [0, 7, 8, 0, 0, 9, 0, 0];
+    let mut left = 1;
+    assert!(merge_under_runs(&title, &mut held, &mut left).is_none());
+    assert_eq!(held, [0; 8], "no partial mutation on budget failure");
+    assert_eq!(left, 1);
+    left = 2;
+    assert_eq!(merge_under_runs(&title, &mut held, &mut left), Some(vec![(1, 2), (5, 1)]));
+    assert_eq!(held, title);
+    assert_eq!(left, 0);
+    assert_eq!(merge_under_runs(&title, &mut held, &mut left), Some(Vec::new()));
+}
+
 /// The relay's merge of a stretch of a copy (source relay). `now` is what the
 /// card's memory holds, read once; `held` is the copy's reference for the
 /// stretch (its snapshot, or the CPU's side of a copy in the card's
@@ -1496,6 +1534,26 @@ impl Shadow {
         self.tracked.as_ref().and_then(crate::watch::Tracked::bit)
     }
 
+    /// Source writes_pending/stale_under_writes. Query the current
+    /// tracker's dirty pages over the intersection with pending
+    /// declarations. Unlike its write-watch journal, this tracker
+    /// also has guarded aliases and untracked subranges; an unknown
+    /// portion conservatively requires settlement. Do not mutate it.
+    pub(crate) fn writes_pending(&self) -> bool {
+        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
+    pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return false;
+        }
+        let busy = self.pending.lock().unwrap_or_else(|e| e.into_inner()).overlapping(from, to);
+        busy.into_iter().any(|(a, e)| self.tracked.as_ref()
+            .is_none_or(|t| t.stale_in(a.max(from), e.min(to))))
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -1577,9 +1635,28 @@ impl Shadow {
             }
         };
         let mut copied = 0;
+        // Only the device-local staging side has a separate GPU
+        // baseline. The current submission guard means all previous
+        // GPU work has landed and none of this submission has run.
+        let exact = busy && self.card.is_some() && exact_under_enabled();
+        let mut left = 512usize;
+        let mut scratch = Vec::new();
         for (a, b) in runs {
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            if exact {
+                let mut lo = a;
+                while lo < b {
+                    let hi = ((lo / PAGE + 1) * PAGE).min(b);
+                    copied += self.merge_page_under_writes(lo, hi, &mut left, &mut scratch)
+                        .unwrap_or_else(|| self.copy(lo, hi));
+                    // Synchronize the whole intersecting reference,
+                    // including bytes equal to the CPU staging side.
+                    sync_before(lo, hi);
+                    lo = hi;
+                }
+            } else {
+                copied += self.copy(a, b);
+                sync_before(a, b);
+            }
         }
         for (a, b) in unmapped {
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
@@ -1610,6 +1687,37 @@ impl Shadow {
             add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
         }
         copied
+    }
+
+    /// Source merge_page_under_writes's carded branch, restricted to
+    /// this renderer's fenced preparation. A successful read updates
+    /// the CPU-side reference, registers only differing upload runs,
+    /// and updates any saved guard bytes. Missing memory or budget
+    /// exhaustion leaves this page to the existing full refresh.
+    /// Never use this helper concurrently with a GPU landing.
+    fn merge_page_under_writes(&self, lo: usize, hi: usize, left: &mut usize,
+        scratch: &mut Vec<u8>) -> Option<usize>
+    {
+        debug_assert!(self.card.is_some());
+        let at = lo - self.start as usize;
+        scratch.resize(hi - lo, 0);
+        if !crate::host::read_into(lo as *const u8, scratch) {
+            return None;
+        }
+        // SAFETY: tracked run clipped to this copy. The caller owns
+        // the submission and before locks; this is CPU staging, not
+        // the device-local resource.
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), scratch.len()) };
+        let runs = merge_under_runs(scratch, held, left)?;
+        for (r, n) in runs {
+            self.card_changed(at + r, at + r + n);
+        }
+        if let Some(t) = &self.tracked {
+            t.refreshed(lo, held);
+        }
+        // Existing preparation accounting measures bytes refreshed,
+        // not bytes later uploaded by card_before.
+        Some(hi - lo)
     }
 
     /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer).
@@ -2774,6 +2882,42 @@ pub(crate) mod tests {
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// The same tracked dirty page can contain many equal bytes.
+    /// Check exact staging updates, dirty upload intervals and the
+    /// pending declaration's snapshot before GPU work is submitted.
+    #[test]
+    #[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_SEND_ORDER=1 VICTORY_LATE_EXACT=1, ranges off and D3D12; run alone"]
+    fn exact_under_writes_refresh_only_enqueues_changed_bytes() {
+        assert!(exact_under_enabled());
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).expect("registered copy");
+        let card = copy.card().expect("device-local copy");
+        let gpu = host().expect("D3D12 device");
+        let warm = gpu.new_list().unwrap();
+        copy.refresh(&warm, p as u64, len as u64);
+        warm.close();
+        gpu.execute(&[&warm]);
+        copy.writing(p, PAGE, false);
+        assert!(!copy.stale_under_writes(p, PAGE));
+        // SAFETY: live title page; the write-watch guards track it.
+        unsafe { ((p + 31) as *mut u8).write_volatile(0xa5) };
+        assert!(copy.stale_under_writes(p, PAGE));
+        assert!(copy.stale_under_writes(p, PAGE), "query does not consume dirty state");
+        assert!(!copy.stale_under_writes(p + PAGE, PAGE));
+        copy.update(p, PAGE);
+        assert!(!copy.stale_under_writes(p, PAGE));
+        {
+            let dirty = card.dirty.lock().unwrap();
+            assert_eq!(dirty.ranges, [(31, 32)]);
+            let before = copy.before.lock().unwrap();
+            assert_eq!(before.0[0].1[31], 0xa5);
+        }
+        copy.copy_back_done(p, PAGE);
         unregister(p, p as u64);
     }
 

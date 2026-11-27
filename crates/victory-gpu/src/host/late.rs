@@ -64,6 +64,7 @@ pub(crate) enum SettleWhy {
     Fill,
     Texture,
     Refresh,
+    StaleRefresh,
     Write,
     Unknown,
     MemoryWait,
@@ -231,10 +232,40 @@ impl Host {
     }
 }
 
+/// Source stale_under_flights: gather each pending copy's refresh
+/// hull once rather than recheck every repeated draw's declaration.
+/// This query is only diagnostic/admission evidence; the current
+/// branch must settle even when no stale overlap is found.
+fn stale_under_flights(runs: &[&HostList]) -> bool {
+    use std::sync::Arc;
+    let mut spans = std::collections::BTreeMap::<usize, (Arc<crate::shadow::Shadow>, usize, usize)>::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step {
+                if *len == 0 {
+                    continue;
+                }
+                let end = address.saturating_add(*len);
+                let key = Arc::as_ptr(shadow) as usize;
+                spans.entry(key).and_modify(|span| {
+                    span.1 = span.1.min(*address);
+                    span.2 = span.2.max(end);
+                }).or_insert_with(|| (shadow.clone(), *address, end));
+            }
+        }
+    }
+    spans.values().any(|(shadow, from, to)| shadow.writes_pending()
+        && shadow.stale_under_writes(*from, to - from))
+}
+
 impl PendingTitle<'_> {
     pub(crate) fn late_blocked(&self, next: &[Detached]) -> SettleWhy {
         let runs: Vec<&HostList> = next.iter().map(Detached::host).collect();
-        self.writes.blocked_by(&runs).unwrap_or(SettleWhy::SharedState)
+        let blocked = self.writes.blocked_by(&runs);
+        if matches!(blocked, None | Some(SettleWhy::Refresh)) && stale_under_flights(&runs) {
+            return SettleWhy::StaleRefresh;
+        }
+        blocked.unwrap_or(SettleWhy::SharedState)
     }
 
     pub(crate) fn read_reason(&self, at: usize, len: usize) -> SettleWhy {
