@@ -43,6 +43,8 @@ mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod picked;
+#[cfg(windows)]
 mod placement;
 #[cfg(windows)]
 mod primitive;
@@ -63,6 +65,10 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod texture_workers;
+#[cfg(windows)]
+mod tiles;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;
@@ -73,6 +79,6 @@ pub use copystat::CountingAlloc;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
+    Writing as KernelWrite, title_memory_aliased, title_memory_remapped, title_memory_remapping,
     writing as kernel_will_write,
 };

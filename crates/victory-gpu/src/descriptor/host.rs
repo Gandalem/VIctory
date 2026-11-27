@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -19,12 +20,13 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`].
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Sparse index of placed title records (opt-in observation only).
+    placed_hints: Mutex<PlacedHints>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -61,6 +63,58 @@ pub(crate) struct HostHeap {
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
 }
 
+/// Subset of cool_fox's Spans: track the address and lowest requested
+/// title MIP of each slot, without its destructive stale-overlap policy.
+#[derive(Default)]
+struct PlacedHints(BTreeMap<u32, (u64, u32)>);
+
+impl PlacedHints {
+    fn note(&mut self, slot: u32, hint: Option<(u64, u32)>) {
+        if let Some(hint) = hint {
+            self.0.insert(slot, hint);
+        } else {
+            self.0.remove(&slot);
+        }
+    }
+
+    fn collect(&self, out: &mut BTreeMap<u64, u32>) {
+        for &(start, first) in self.0.values() {
+            out.entry(start).and_modify(|old| *old = (*old).min(first)).or_insert(first);
+        }
+    }
+}
+
+fn placed_hint(view: &View) -> Option<(u64, u32)> {
+    let View::Placed(unordered, resource, words) = view else { return None };
+    if resource[0] == 1 { return None; }
+    let start = u64::from(words[10]) | (u64::from(words[11]) << 32);
+    if start == 0 { return None; }
+    // The original placed view's first level is word 4. Unknown views
+    // and UAVs conservatively request level zero.
+    let first = if !unordered && words[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 {
+        words[4]
+    } else { 0 };
+    Some((start, first))
+}
+
+/// The key of the title record, not the GPU descriptor's contents.
+/// Port the original flip generation check; an unmapped record is stale.
+fn view_record_key([tag, index, generation]: [u32; 3]) -> u64 {
+    if tag == VIEW_TAG && generation != 0 {
+        u64::from(generation) << 32 | u64::from(index)
+    } else { 0 }
+}
+
+fn record_key(handle: u64) -> u64 {
+    let mut bytes = [0u8; 12];
+    if !crate::host::read_into(handle as *const u8, &mut bytes) {
+        return 0;
+    }
+    view_record_key(std::array::from_fn(|i| {
+        u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
+    }))
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -84,20 +138,40 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
-/// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
-
-/// Slots past the title's in a view heap, for tables a draw needs made
-/// afresh (constant buffers copied per draw). A list holds the slots it
-/// took until it is reset (its submissions have run) or released.
-/// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
-/// each a device removal shortly after; #59).
+/// Slots for per-draw tables and minimum room for persistent raw pairs.
 const DYNAMIC: u32 = 1 << 18;
+const PAIR_RESERVE: u32 = 1 << 14;
+const NULL_SLOTS: u32 = 3;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
+/// Select a common capacity for the runtime and shader translation.
+pub(crate) fn probe_view_limit() -> u32 {
+    static CAPACITY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        use victory_shader::emit::{HEAP_VIEWS, LARGE_HEAP_VIEWS, configure_view_heap_capacity};
+        let requested = host().map_or(HEAP_VIEWS, |host| {
+            // SAFETY: plain descriptor heap creation with a valid description.
+            let probe: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: LARGE_HEAP_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+            };
+            if probe.is_ok() { LARGE_HEAP_VIEWS } else { HEAP_VIEWS }
+        });
+        let capacity = configure_view_heap_capacity(requested);
+        tracing::info!(capacity, "host view-heap capacity fixed for shader translation");
+        capacity
+    })
+}
+
+/// Partition into mirrored slots, dynamic tables, persistent pairs, nulls.
+fn view_layout(requested: u32, capacity: u32) -> (u32, u32, u32) {
+    let pairs_end = capacity - NULL_SLOTS;
+    let title = requested.min(pairs_end - DYNAMIC - PAIR_RESERVE);
+    (title, DYNAMIC, pairs_end)
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -119,16 +193,31 @@ impl HostHeap {
                     })
             }
         };
-        // Every slot a shader can index (title slots, also past a capped
-        // heap, and dynamic ones): shaders read the table as a root view,
-        // which has no bounds, at indices clamped below `HEAP_VIEWS`.
-        let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
-            .flatten()
-            .map(|(buffer, data)| (buffer, data as usize));
+        // Never silently allocate a heap smaller than the shader clamp.
+        let (heap, count, extra, pairs_end, strides) = if sampler {
+            let heap = make(count.max(victory_shader::emit::HEAP_SAMPLERS)).ok()?;
+            (heap, count, 0, 0, None)
+        } else {
+            let views = probe_view_limit();
+            let (mirrored, dynamic, pairs_end) = view_layout(count, views);
+            if mirrored != count {
+                tracing::warn!(requested = count, mirrored, views, "title view heap exceeds host mirroring capacity");
+            }
+            let heap = match make(views) {
+                Ok(heap) => heap,
+                Err(e) => {
+                    tracing::warn!(error = %e, views, "no host view heap at configured capacity");
+                    return None;
+                }
+            };
+            let (buffer, data) = host.upload_buffer(u64::from(views) * 4)?;
+            // SAFETY: the complete, writable stride table is mapped.
+            unsafe { std::ptr::write_bytes(data, 0, views as usize * 4) };
+            (heap, mirrored, dynamic, pairs_end, Some((buffer, data as usize)))
+        };
         let marks = (!sampler)
             .then(|| {
-                let bytes = u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 8;
+                let bytes = u64::from(victory_shader::emit::view_heap_capacity()) * 8;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 crate::host::name(&buffer, || "view marks".into());
                 // Every slot unmarked (all ones) until a view is made there.
@@ -137,38 +226,6 @@ impl HostHeap {
                 Some((buffer, data as usize))
             })
             .flatten();
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
-        // Translated shaders clamp their indices below `HEAP_VIEWS` or
-        // `HEAP_SAMPLERS`: slots up to there exist and stay null.
-        let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
-        let (heap, count, extra) = if sampler {
-            match make(count.max(samplers)) {
-                Ok(heap) => (heap, count, 0),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
-            }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
-            (heap, count, DYNAMIC)
-        } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
-            }
-        };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -195,13 +252,11 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            placed_hints: Mutex::default(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
-                null if !sampler && null > count + extra && null < total => null - 1,
-                _ => total,
-            },
+            pairs_end,
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
@@ -217,17 +272,18 @@ impl HostHeap {
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, total) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+            return None;
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::NULL_BUFFER_VIEW;
-        if !sampler && null > count + extra && null < total {
+        if !sampler {
+            let null = victory_shader::emit::null_buffer_view();
+            debug_assert_eq!(total, victory_shader::emit::view_heap_capacity());
+            debug_assert_eq!(pairs_end, null - 1);
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
-        } else if !sampler {
-            tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
         }
         Some(h)
     }
@@ -416,6 +472,72 @@ impl HostHeap {
         self.note_address(index, Some(view));
     }
 
+    /// The reference builds the table's descriptors from recorded views.
+    /// Preserve that snapshot when the tiled resource's visible level
+    /// changes between recording and execution. Unlike a title slot,
+    /// a dynamic table must not be re-resolved from later title records.
+    pub(crate) fn make_table_at(
+        &self, list: &crate::host::HostList, heap: usize, index: u32, view: &View,
+    ) {
+        use std::sync::Arc;
+        self.make_at(index, view);
+        if !crate::tiles::enabled() || self.sampler || index < self.count
+            || index >= self.count + self.dynamic
+        {
+            return;
+        }
+        let View::Placed(false, resource, desc) = view else { return };
+        if resource[0] == 1 || desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 { return; }
+        let address = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+        let Some(r) = crate::resource::existing_placed_texture(address, resource) else { return };
+        let Some(copy) = crate::resource::made_copy(r) else { return };
+        let Some(mapping) = &copy.tiled else { return };
+        if !self.table_slot_owns(index, &copy) { return; }
+        let visible = mapping.lock().unwrap_or_else(|e| e.into_inner()).visible_mask();
+        let shown = Mutex::new(visible);
+        let owner = Arc::downgrade(&copy);
+        let identity = Arc::downgrade(&self.viewed);
+        let resource = r as usize;
+        let words: [u32; 10] = desc[..10].try_into().expect("ten descriptor words");
+        // This callback belongs to the same recorded list as the dynamic
+        // slot. Reset discards it. Keep no extra strong texture owner.
+        list.defer_host(move || {
+            let Some(copy) = owner.upgrade() else { return };
+            let Some(mapping) = &copy.tiled else { return };
+            let current = mapping.lock().unwrap_or_else(|e| e.into_inner()).visible_mask();
+            let mut shown = shown.lock().unwrap_or_else(|e| e.into_inner());
+            if *shown == current { return; }
+            // Called under the submission lock, after all earlier GPU
+            // work, before any list in this submission reaches the GPU.
+            let remade = crate::descriptor::with_host(heap, |h| {
+                let Some(identity) = identity.upgrade() else { return false };
+                if !Arc::ptr_eq(&identity, &h.viewed) { return false; }
+                let Some(at) = index.checked_sub(h.count) else { return false };
+                let next = h.next.lock().unwrap_or_else(|e| e.into_inner());
+                if !next.1.get(at as usize).copied().unwrap_or(false)
+                    || !h.table_slot_owns(index, &copy)
+                {
+                    return false;
+                }
+                let Some(gpu) = host() else { return false };
+                if current == 0 { return false; }
+                shader_texture_view(&gpu.device, resource as crate::object::This,
+                    &copy, Some(&words), h.cpu(index)).is_some()
+            }).unwrap_or(false);
+            if !remade {
+                crate::host::fail(format_args!("could not re-publish recorded tiled table SRV at {index}"));
+            }
+            *shown = current;
+        });
+    }
+
+    fn table_slot_owns(&self, index: u32, copy: &crate::resource::HostTexture) -> bool {
+        use windows::core::Interface;
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+            .get(index as usize).and_then(Option::as_ref)
+            .is_some_and(|(texture, shadow)| shadow.is_none() && texture.as_raw() == copy.texture.as_raw())
+    }
+
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
     /// unordered access (`uav`), of `bytes` of `buffer` from byte `first`
     /// (both multiples of 4), which it holds; a null one for no buffer, or
@@ -477,6 +599,9 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        if index < self.count && crate::tiles::judgement_enabled() {
+            self.placed_hints.lock().unwrap_or_else(|e| e.into_inner()).note(index, None);
+        }
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -500,11 +625,10 @@ impl HostHeap {
 
     fn write_stride(&self, index: u32, stride: u32) {
         let Some((_, data)) = &self.strides else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        if index >= victory_shader::emit::view_heap_capacity() {
             return;
         }
-        // SAFETY: a dword of the mapped table, which has one per slot below
-        // the larger of the title's count and `HEAP_VIEWS`.
+        // SAFETY: the mapped table has exactly the configured heap capacity.
         unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
     }
 
@@ -518,12 +642,11 @@ impl HostHeap {
     /// none for anything else.
     pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32)>) {
         let Some((_, data)) = &self.marks else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        if index >= victory_shader::emit::view_heap_capacity() {
             return;
         }
         let entry = entry.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
-        // SAFETY: two dwords of the mapped table, which has two per slot
-        // below the larger of the title's count and `HEAP_VIEWS`.
+        // SAFETY: the mapped table has two dwords per configured heap slot.
         unsafe {
             let at = (*data as *mut u32).add(2 * index as usize);
             at.write_volatile(entry.0);
@@ -815,6 +938,9 @@ impl HostHeap {
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
+            if !self.sampler && crate::tiles::judgement_enabled() {
+                self.placed_hints.lock().unwrap_or_else(|e| e.into_inner()).note(index, placed_hint(&view));
+            }
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -830,6 +956,57 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// Merge every live heap's observations. The caller has synced the
+    /// title heaps, and these are hints, not proof of shader consumption.
+    pub(crate) fn collect_placed_hints(&self, out: &mut BTreeMap<u64, u32>) {
+        self.placed_hints.lock().unwrap_or_else(|e| e.into_inner()).collect(out);
+    }
+
+    /// Adapt the reference texture_views_remade to the fenced renderer.
+    /// Only existing placed SRVs of the exact changed host copy qualify.
+    /// The heap is live, and no GPU submission is running. Never resolve
+    /// a new host texture or replace a slot with a different resource.
+    pub(crate) fn texture_views_remade(
+        &self, start: u64, step: u64,
+        changed: &BTreeMap<usize, std::sync::Arc<crate::resource::HostTexture>>,
+    ) {
+        use windows::core::Interface;
+        if self.sampler { return; }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let candidates: Vec<_> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            kept.iter().take(self.count as usize).enumerate().filter_map(|(i, slot)| {
+                let (texture, shadow) = slot.as_ref()?;
+                if shadow.is_some() { return None; }
+                let copy = changed.get(&(texture.as_raw() as usize))?;
+                Some((i as u32, copy.clone()))
+            }).collect()
+        };
+        let Some(gpu) = host() else { return };
+        for (index, copy) in candidates {
+            let key = made[index as usize];
+            let handle = start + u64::from(index) * step;
+            if key == 0 || record_key(handle) != key { continue; }
+            let Some(View::Placed(false, resource, desc)) = view_at(key as u32, (key >> 32) as u32) else { continue };
+            if resource[0] == 1 || desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 { continue; }
+            let address = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+            let Some(r) = crate::resource::existing_placed_texture(address, &resource) else { continue };
+            if !crate::resource::made_copy(r).is_some_and(|current| std::sync::Arc::ptr_eq(&current, &copy)) {
+                continue;
+            }
+            let words: &[u32; 10] = desc[..10].try_into().expect("ten descriptor words");
+            if record_key(handle) != key { continue; }
+            let remade = shader_texture_view(&gpu.device, r, &copy, Some(words), self.cpu(index)).is_some();
+            if !remade || record_key(handle) != key {
+                // A failed or superseded write must not leave a stale
+                // descriptor. The ordinary mirror/read path retries it.
+                made[index as usize] = 0;
+                self.make_null(index);
+                crate::shadow::forget_read(index);
+            }
+        }
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -910,6 +1087,77 @@ impl HostHeap {
         (is_placed_texture(&view) && !kept).then_some(view)
     }
 
+    /// The original bake path is limited to already deferred, title-fed
+    /// placed SRVs. Do not change the eager buffer/UAV/table path.
+    pub(crate) fn prepare_bake_slot(&self, index: u32, handle: u64) -> Option<(View, u64)> {
+        if index >= self.count || self.sampler { return None; }
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let key = *made.get(index as usize)?;
+        if key == 0 || record_key(handle) != key { return None; }
+        let view = view_at(key as u32, (key >> 32) as u32)?;
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.get(index as usize)?.is_some()
+            || !matches!(&view, View::Placed(false, resource, _) if resource[0] != 1)
+        {
+            return None;
+        }
+        Some((view, key))
+    }
+
+    /// Publish only the same slot generation and resource whose upload
+    /// completed. The caller holds the submission lock and a live heap.
+    pub(crate) fn publish_uploaded_slot(
+        &self, index: u32, handle: u64, key: u64, resolved: &View,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::Arc;
+        use windows::core::Interface;
+        if index >= self.count || key == 0 || self.sampler { return false; }
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made[index as usize] != key || record_key(handle) != key
+            || self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
+        {
+            return false;
+        }
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else { return false };
+        let View::Placed(false, resource, desc) = &view else { return false };
+        if resource[0] == 1 { return false; }
+        let View::Shader(r, words) = resolved else { return false };
+        let address = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+        // Revalidate the already-existing placed object; never create
+        // another host texture while publishing an older upload.
+        if crate::resource::existing_placed_texture(address, resource).map(|r| r as usize) != Some(*r)
+            || words.as_ref().map(|w| w.as_slice()) != Some(&desc[..10])
+        {
+            return false;
+        }
+        if copy.host_written.load(Relaxed)
+            || !crate::resource::made_copy(*r as crate::object::This)
+                .is_some_and(|current| Arc::ptr_eq(&current, copy))
+            || record_key(handle) != key
+        {
+            return false;
+        }
+        // Use the checked resolved view, not another resolution of the
+        // placed record. The submitted texture remains the slot's owner.
+        let Some(gpu) = host() else { return false };
+        let Some(Some(kept)) = shader_texture_view(&gpu.device, *r as crate::object::This, copy, words.as_ref(), self.cpu(index)) else {
+            null_for(&view, self.cpu(index));
+            return false;
+        };
+        if kept.0.as_raw() != copy.texture.as_raw() || record_key(handle) != key {
+            null_for(&view, self.cpu(index));
+            return false;
+        }
+        self.set_stride(index, Some(&view));
+        self.note_address(index, Some(&view));
+        self.set_mark(index, None);
+        self.viewed.set(index, Some(resolved), true);
+        self.keep(index, Some(kept));
+        true
+    }
+
     /// A shader read slot `index` through the heap: the texture it views
     /// was used now.
     pub(crate) fn stamp_read(&self, index: u32) {
@@ -944,6 +1192,77 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Map an explicit SRV's levels onto a texture whose largest levels are
+/// omitted. The union member follows its actual D3D12 view dimension.
+fn shift_view_levels(drop: u32, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
+    if drop == 0 {
+        return;
+    }
+    let shift = crate::resource::shift_levels;
+    // SAFETY: the dimension selects the corresponding union member.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                shift(drop, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Convert an explicit 2D SRV into a mask of retained host MIPs.
+/// Default, malformed, array and unsupported views request all levels.
+pub(crate) fn srv_mip_mask(
+    resource: crate::object::This,
+    words: Option<&[u32; 10]>,
+    texture: &ID3D12Resource,
+) -> u32 {
+    if !crate::texture::srv_ranges_enabled() {
+        return u32::MAX;
+    }
+    let Some(words) = words else { return u32::MAX };
+    // SAFETY: the caller holds a live host resource.
+    let actual = unsafe { texture.GetDesc() };
+    if !crate::texture::srv_mip_eligible(&actual) {
+        return u32::MAX;
+    }
+    let mut view = srv_desc(words);
+    if view.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
+        return u32::MAX;
+    }
+    shift_view_levels(crate::resource::dropped(resource, texture), &mut view);
+    // SAFETY: checked Texture2D dimension.
+    let v = unsafe { view.Anonymous.Texture2D };
+    if v.PlaneSlice != 0 {
+        return u32::MAX;
+    }
+    mip_mask(v.MostDetailedMip, v.MipLevels, u32::from(actual.MipLevels))
+}
+
+fn mip_mask(first: u32, count: u32, levels: u32) -> u32 {
+    if levels == 0 || levels > 32 || first >= levels || count == 0 {
+        return u32::MAX;
+    }
+    let end = if count == u32::MAX { levels } else { first.saturating_add(count) };
+    if end > levels {
+        return u32::MAX;
+    }
+    (first..end).fold(0, |mask, i| mask | (1u32 << i))
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -1456,6 +1775,58 @@ fn typed_store(format: u32) -> bool {
     ok
 }
 
+/// The same SRV construction is used for first creation and for a
+/// fenced re-publication of an already-owned tiled texture.
+fn shader_texture_view(
+    device: &ID3D12Device, resource: crate::object::This,
+    copy: &crate::resource::HostTexture, desc: Option<&[u32; 10]>,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
+    copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
+    let texture = &copy.texture;
+    let mut desc = desc.map(srv_desc);
+    if desc.is_none() && !default_view(resource) {
+        return None;
+    }
+    if let Some(desc) = desc.as_mut()
+        && desc.Format.0 == 0
+        && let Some(format) = crate::resource::view_format_for(resource, texture)
+    {
+        desc.Format = DXGI_FORMAT(format as i32);
+    }
+    if let Some(d) = desc.as_mut() {
+        shift_view_levels(crate::resource::dropped(resource, texture), d);
+    }
+    if let Some(mapping) = &copy.tiled {
+        let visible = mapping.lock().unwrap_or_else(|e| e.into_inner()).visible_mask();
+        // SAFETY: live resource descriptor.
+        let levels = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+        if let Some(d) = desc.as_mut() {
+            if !crate::tiles::clamp_visible(d, visible, levels) {
+                return None;
+            }
+        } else {
+            let all = if levels >= 32 { u32::MAX } else { (1u32 << levels) - 1 };
+            if visible & all != all {
+                // An implicit SRV cannot safely describe a partial chain.
+                return None;
+            }
+        }
+    }
+    if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
+        return None;
+    }
+    // SAFETY: a live texture and a slot of our heap.
+    unsafe {
+        device.CreateShaderResourceView(
+            texture,
+            desc.as_ref().map(std::ptr::from_ref),
+            at,
+        )
+    };
+    Some(Some((texture.clone(), None)))
+}
+
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
@@ -1493,30 +1864,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(copy) = crate::resource::host_copy(resource) {
-                copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
-                let texture = &copy.texture;
-                let mut desc = desc.as_ref().map(srv_desc);
-                if desc.is_none() && !default_view(resource) {
-                    return None;
-                }
-                if let Some(desc) = desc.as_mut()
-                    && desc.Format.0 == 0
-                    && let Some(format) = crate::resource::view_format(resource)
-                {
-                    desc.Format = DXGI_FORMAT(format as i32);
-                }
-                if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
-                    return None;
-                }
-                // SAFETY: a live texture and a slot of our heap.
-                unsafe {
-                    device.CreateShaderResourceView(
-                        texture,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    )
-                };
-                Some(Some((texture.clone(), None)))
+                shader_texture_view(device, resource, &copy, desc.as_ref(), at)
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -1824,6 +2172,92 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placed_hints_merge_heap_views_and_remove_rewritten_slots() {
+        let mut a = PlacedHints::default();
+        let mut b = PlacedHints::default();
+        a.note(1, Some((0x10000, 3)));
+        a.note(2, Some((0x10000, 1)));
+        b.note(1, Some((0x10000, 2)));
+        b.note(3, Some((0x18000, 0)));
+        let mut out = BTreeMap::new();
+        a.collect(&mut out);
+        b.collect(&mut out);
+        assert_eq!(out.get(&0x10000), Some(&1));
+        a.note(2, Some((0x20000, 4)));
+        a.note(1, None);
+        out.clear();
+        a.collect(&mut out);
+        b.collect(&mut out);
+        assert_eq!(out.get(&0x10000), Some(&2));
+        assert_eq!(out.get(&0x20000), Some(&4));
+        b.note(1, None);
+        out.clear();
+        a.collect(&mut out);
+        b.collect(&mut out);
+        assert!(!out.contains_key(&0x10000));
+    }
+
+    #[test]
+    fn baked_publication_rejects_rewritten_slot_and_uses_checked_owner() {
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let null = std::ptr::null();
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let resource = placed_tex_desc(4, 4, 28, 0);
+        let old = placed_tex_srv_desc(placed_memory(), 28);
+        crate::descriptor::create_placed_srv(null, &resource, &old, handle);
+        assert!(heap.mirror(0, handle, false).is_some());
+        assert!(!heap.kept(0));
+        let (view, key) = heap.prepare_bake_slot(0, handle).unwrap();
+        let resolved = placed_texture(&view).unwrap();
+        let View::Shader(r, _) = &resolved else { panic!("placed shader view") };
+        let copy = crate::resource::host_copy(*r as crate::object::This).unwrap();
+        copy.stamp();
+
+        // A title rewrite can occur while the earlier upload is queued.
+        // Even when it completes, it may not overwrite the new record.
+        let new = placed_tex_srv_desc(placed_memory(), 28);
+        crate::descriptor::create_placed_srv(null, &resource, &new, handle);
+        assert!(!heap.publish_uploaded_slot(0, handle, key, &resolved, &copy));
+        assert!(!heap.kept(0));
+        assert!(heap.mirror(0, handle, false).is_some());
+        let (view, new_key) = heap.prepare_bake_slot(0, handle).unwrap();
+        assert_ne!(key, new_key);
+        let resolved = placed_texture(&view).unwrap();
+        let View::Shader(r, _) = &resolved else { panic!("placed shader view") };
+        let new_copy = crate::resource::host_copy(*r as crate::object::This).unwrap();
+        new_copy.stamp();
+        // Simulate the new job's checked completion; this standalone
+        // heap never participates in actual GPU shader execution.
+        assert!(!heap.publish_uploaded_slot(0, handle, new_key, &resolved, &copy));
+        assert!(heap.publish_uploaded_slot(0, handle, new_key, &resolved, &new_copy));
+        assert!(heap.kept(0));
+        assert!(!heap.publish_uploaded_slot(0, handle, new_key, &resolved, &new_copy));
+    }
+
+    #[test]
+    fn baked_descriptor_record_keys_distinguish_rewrites() {
+        let old = view_record_key([VIEW_TAG, 7, 1]);
+        assert_eq!(old, (1u64 << 32) | 7);
+        assert_ne!(old, view_record_key([VIEW_TAG, 7, 2]));
+        assert_ne!(old, view_record_key([VIEW_TAG, 8, 1]));
+        assert_eq!(view_record_key([VIEW_TAG, 7, 0]), 0);
+        assert_eq!(view_record_key([VIEW_TAG ^ 1, 7, 1]), 0);
+    }
+
+    #[test]
+    fn srv_mip_masks_handle_tail_full_and_invalid_ranges() {
+        assert_eq!(mip_mask(2, 2, 6), 0b001100);
+        assert_eq!(mip_mask(3, u32::MAX, 6), 0b111000);
+        assert_eq!(mip_mask(0, u32::MAX, 32), u32::MAX);
+        assert_eq!(mip_mask(31, 1, 32), 1 << 31);
+        assert_eq!(mip_mask(4, 3, 6), u32::MAX);
+        assert_eq!(mip_mask(6, 1, 6), u32::MAX);
+        assert_eq!(mip_mask(0, 0, 6), u32::MAX);
+        assert_eq!(mip_mask(0, 1, 33), u32::MAX);
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
@@ -2141,7 +2575,7 @@ mod tests {
     /// NVIDIA, make such tables; the shader read past the buffer.)
     ///
     /// Any heap size the host takes will do: a title heap of 4 slots leaves
-    /// dynamic slots past it either way ([`DYNAMIC`] or [`MIN_DYNAMIC`]).
+    /// dynamic slots past it ([`DYNAMIC`]).
     #[test]
     fn view_addresses_cover_tables_made_afresh() {
         let Some(heap) = HostHeap::new(false, 4) else {
@@ -2213,17 +2647,38 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    #[test]
+    fn view_layout_reserves_dynamic_pairs_and_nulls_on_both_capacities() {
+        use victory_shader::emit::{HEAP_VIEWS, LARGE_HEAP_VIEWS};
+        for capacity in [HEAP_VIEWS, LARGE_HEAP_VIEWS] {
+            for requested in [0, 4, 720_000, 1_200_000, u32::MAX] {
+                let (count, dynamic, end) = view_layout(requested, capacity);
+                assert!(count <= requested);
+                assert_eq!(dynamic, DYNAMIC);
+                assert!(end - count - dynamic >= PAIR_RESERVE);
+                assert_eq!(end + NULL_SLOTS, capacity);
+            }
+        }
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
-        // SAFETY: plain queries of live heaps.
+        // SAFETY: queries of live heaps and their mapped stride table.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let capacity = victory_shader::emit::view_heap_capacity();
+            assert_eq!(heap.heap.GetDesc().NumDescriptors, capacity);
+            assert_eq!(heap.pairs_end, capacity - NULL_SLOTS);
+            assert!(heap.pairs_end >= heap.count + heap.dynamic + PAIR_RESERVE);
+            let (_, data) = heap.strides.as_ref().unwrap();
+            let table = *data as *const u32;
+            let null = victory_shader::emit::null_buffer_view() as usize;
+            assert_eq!(table.add(null).read_volatile(), 4);
+            assert_eq!(table.add(null - 1).read_volatile(), 4);
+            assert_eq!(table.add(capacity as usize - 1).read_volatile(), 0);
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }

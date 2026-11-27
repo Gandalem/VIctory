@@ -531,6 +531,22 @@ impl Tracked {
         (copy, zero)
     }
 
+    /// Read-only equivalent of the source write-watch journal query.
+    /// Untracked portions are unknown (therefore stale). Do not take,
+    /// protect or clear any pages while a title flight is in the air.
+    pub(crate) fn stale_in(&self, from: usize, to: usize) -> bool {
+        if from >= to {
+            return false;
+        }
+        if from < self.start || to > self.end
+            || self.untracked.iter().any(|&(a, b)| a < to && b > from)
+        {
+            return true;
+        }
+        self.changed.0.lock().unwrap_or_else(|e| e.into_inner())
+            .range(from / PAGE..to.div_ceil(PAGE)).next().is_some()
+    }
+
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed
@@ -557,6 +573,59 @@ impl Tracked {
             self.changed.taken(page);
         }
         set_dirty(self.changed.2, !changed.is_empty());
+    }
+
+    /// Adapt source Shadow::landed to the guard-based tracker: only
+    /// the copy that actually landed bytes can be noted as current.
+    /// The reference proves this with its copied generation, journal
+    /// and published block bit. This branch has no such journal, so
+    /// revalidate one *whole* block under a stable mapping and guard.
+    ///
+    /// Never clear a saved/armed write mark, untracked/partial page,
+    /// busy write, or physical alias. The original dirty state stays
+    /// on any failure. A later title write faults normally and marks
+    /// all holders dirty again.
+    pub(crate) fn landed(&self, page: usize, held: &[u8], scratch: &mut Vec<u8>) -> bool {
+        let Some(from) = page.checked_mul(PAGE) else { return false };
+        let Some(to) = from.checked_add(PAGE) else { return false };
+        if held.len() != PAGE || from < self.start || to > self.end
+            || self.untracked.iter().any(|&(a, b)| a < to && b > from)
+        {
+            return false;
+        }
+        scratch.resize(PAGE, 0);
+        // Never wait for a mapping transaction while holding a
+        // submission/copy lock. The runtime takes MAPPING before
+        // notifying GUARDS of changes.
+        let Some(_mapping) = title_memory_reading_now() else { return false };
+        let mut g = guards();
+        if !g.holders.get(&page).is_some_and(|holders|
+            holders.iter().any(|holder| Arc::ptr_eq(holder, &self.changed)))
+            || g.alias_of.get(&page).is_some_and(|links| !links.is_empty())
+            || g.busy.iter().any(|&(a, b)| (a..b).contains(&page))
+        {
+            return false;
+        }
+        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !changed.contains(&page) {
+            return false;
+        }
+        let saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.armed(page) || saved.bytes.contains_key(&page) {
+            return false;
+        }
+        // protect may also report an unmapped page as taken: that is
+        // insufficient proof here. Only a genuinely protected block
+        // and a successful kernel read can make a landing current.
+        if protect(&mut g, &[page]).is_empty() || !g.protected.contains(&page) {
+            return false;
+        }
+        if !crate::host::read_into(from as *const u8, scratch) || held != scratch.as_slice() {
+            return false;
+        }
+        changed.remove(&page);
+        set_dirty(self.changed.2, !changed.is_empty());
+        true
     }
 
     /// Whether no page changed since it was taken: then [`Tracked::take`]
@@ -806,6 +875,89 @@ pub fn writing(at: usize, len: usize) -> Writing {
     g.busy.push((first, last));
     changed(&mut g, first, last, true);
     Writing { first, last }
+}
+
+/// Serializes the HLE's physical mapping transactions, including the gap
+/// where a larger view is taken away and its unaffected pages mapped again.
+/// Adapted from cool_fox's MAPPING/Remapping and CHANGES (f4b48ad).
+static MAPPING: Mutex<()> = Mutex::new(());
+
+/// Odd while a mapping transaction is under way, even after it finishes.
+static CHANGES: AtomicU64 = AtomicU64::new(0);
+
+#[must_use = "hold the guard until the mapping transaction is complete"]
+pub struct Remapping {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        CHANGES.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Held across the whole physical view unmap/remap operation, even on error.
+pub fn title_memory_remapping() -> Remapping {
+    let guard = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    CHANGES.fetch_add(1, Ordering::SeqCst);
+    Remapping { _guard: guard }
+}
+
+/// Source title_memory_reading_now: a nonblocking stable mapping
+/// view. This branch uses a mutex instead of the reference's RwLock.
+/// A missed reservation merely leaves the landing dirty.
+fn title_memory_reading_now() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match MAPPING.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// For `again_after_change`: sampled before the copy that may fail.
+pub(crate) fn changes() -> u64 {
+    CHANGES.load(Ordering::SeqCst)
+}
+
+/// `f` failed to read or write title memory, at some time since [`changes`]
+/// said `since`. If the runtime changed a mapping in that time, the pages
+/// may have been away for that moment only ([`MAPPING`]): again, when the
+/// change is done. Whether `f` did it.
+pub(crate) fn again_after_change(since: u64, mut f: impl FnMut() -> bool) -> bool {
+    let mut since = since;
+    for _ in 0..4 {
+        let now = change_done();
+        if now == since {
+            return false;
+        }
+        since = now;
+        if f() {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`changes`], when no change is under way (or one has been for a second).
+fn change_done() -> u64 {
+    let mut tries = 0;
+    let mut started = None;
+    loop {
+        let now = changes();
+        if now.is_multiple_of(2) {
+            return now;
+        }
+        tries += 1;
+        if tries < 100 {
+            std::hint::spin_loop();
+            continue;
+        }
+        if started.get_or_insert_with(std::time::Instant::now).elapsed().as_secs() >= 1 {
+            return now;
+        }
+        // SAFETY: gives the processor to another thread.
+        unsafe { windows_sys::Win32::System::Threading::Sleep(u32::from(tries > 200)) };
+    }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1435,6 +1587,70 @@ pub(crate) mod tests {
             "aliasing a busy page marks the tracked one"
         );
         drop(busy_c);
+    }
+
+    /// The source landing clean-skip is allowed only for the exact
+    /// full block proved equal after the write, not an older read or
+    /// merely a matching changed subrange. Other holders stay dirty.
+    #[test]
+    fn landed_revalidates_complete_block_and_preserves_later_writes() {
+        let p = pool(2);
+        let copy = track_copy(p, 2 * PAGE, true).unwrap();
+        let other = track(p, 2 * PAGE, true).unwrap();
+        assert_eq!(copy.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        assert_eq!(other.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        let mut held = vec![0u8; PAGE];
+        held[19] = 0x42;
+        {
+            let _write = writing(p + 19, 1);
+            // SAFETY: this test owns the mapped pool.
+            unsafe { ((p + 19) as *mut u8).write_volatile(0x42) };
+        }
+        let mut scratch = Vec::new();
+        let page = p / PAGE;
+        assert!(copy.changed(page) && other.changed(page));
+        assert!(!copy.landed(page, &held[..PAGE - 1], &mut scratch));
+        {
+            let _write = writing(p + 42, 1);
+            // SAFETY: a different byte of the test pool.
+            unsafe { ((p + 42) as *mut u8).write_volatile(0x77) };
+        }
+        assert!(!copy.landed(page, &held, &mut scratch));
+        assert!(copy.changed(page), "an unrelated title write must be refreshed");
+        held[42] = 0x77;
+        assert!(copy.landed(page, &held, &mut scratch));
+        assert!(copy.clean());
+        assert!(other.changed(page));
+        assert!(!copy.changed(page + 1));
+        // SAFETY: the revalidated guard faults and records later writes.
+        unsafe { ((p + 100) as *mut u8).write_volatile(0x11) };
+        assert!(copy.changed(page));
+        assert_eq!(copy.take(p, p + 2 * PAGE), [(p, p + PAGE)]);
+    }
+
+    #[test]
+    fn landed_refuses_busy_armed_aliased_and_remapping_pages() {
+        let p = pool(1);
+        let copy = track_copy(p, PAGE, true).unwrap();
+        let held = vec![0u8; PAGE];
+        let mut scratch = Vec::new();
+        let page = p / PAGE;
+        {
+            let _write = writing(p, 1);
+            assert!(!copy.landed(page, &held, &mut scratch));
+        }
+        copy.arm(p, p + PAGE);
+        assert!(!copy.landed(page, &held, &mut scratch));
+        copy.disarm();
+        {
+            let _remapping = title_memory_remapping();
+            assert!(!copy.landed(page, &held, &mut scratch));
+        }
+        let (a, _) = twin_views(1);
+        let alias = track_copy(a, PAGE, true).unwrap();
+        assert!(!alias.landed(a / PAGE, &held, &mut scratch));
+        assert!(alias.changed(a / PAGE));
+        assert!(copy.changed(page));
     }
 
     /// A write or mapping that runs past the end of the address space (a

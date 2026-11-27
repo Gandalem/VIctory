@@ -10,8 +10,8 @@
 //! `crate::watch`).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 
 use crate::descriptor::View;
 use crate::host::HostList;
@@ -24,7 +24,7 @@ enum Seen {
     /// `len` bytes at `address` of a buffer's host copy; unordered access.
     Buffer(Arc<Shadow>, u64, u64, bool),
     /// A title texture (resource object) whose contents the title writes.
-    Texture(usize),
+    Texture(usize, u32),
     /// A view left without a host view (textures the title placed itself),
     /// by kind (diagnostics: `KINDS`), with a placed texture's address and
     /// console bytes.
@@ -40,6 +40,8 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 #[derive(Default)]
 pub(crate) struct Viewed {
     inner: Mutex<Inner>,
+    ahead_queued: AtomicBool,
+    ahead_cursor: Mutex<Option<usize>>,
 }
 
 type Range = (usize, u64, u64, bool);
@@ -53,6 +55,9 @@ struct Inner {
     slots: HashMap<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
+    /// Reference counts of restricted SRV masks; full views are implicit
+    /// in the difference from the total texture count.
+    texture_masks: BTreeMap<usize, BTreeMap<u32, u32>>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
@@ -79,6 +84,14 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
+    fn requested_mips(&self, resource: usize) -> u32 {
+        let Some(masks) = self.texture_masks.get(&resource) else { return u32::MAX };
+        if masks.values().sum::<u32>() != self.textures.get(&resource).copied().unwrap_or(0) {
+            return u32::MAX;
+        }
+        masks.keys().fold(0, |mask, &m| mask | m)
+    }
+
     fn count(&mut self, seen: &Seen, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
@@ -114,11 +127,22 @@ impl Inner {
                     }
                 }
             }
-            Seen::Texture(r) => {
+            Seen::Texture(r, mask) => {
                 let n = self.textures.entry(*r).or_insert(0);
                 step(n);
                 if *n == 0 {
                     self.textures.remove(r);
+                    self.texture_masks.remove(r);
+                } else if *mask != u32::MAX {
+                    let masks = self.texture_masks.entry(*r).or_default();
+                    let count = masks.entry(*mask).or_insert(0);
+                    step(count);
+                    if *count == 0 {
+                        masks.remove(mask);
+                    }
+                    if masks.is_empty() {
+                        self.texture_masks.remove(r);
+                    }
                 }
             }
             Seen::Left(_) => {}
@@ -141,6 +165,15 @@ impl Viewed {
         }
     }
 
+    /// Source picked::shown input, taken from the current heap's UAV
+    /// hulls after descriptor synchronization rather than cached slots.
+    pub(crate) fn picked_ranges(&self) -> Vec<(Arc<Shadow>, usize, usize)> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values()
+            .filter(|(shadow, _, len, uav, _)| *uav && *len != 0 && shadow.card().is_some())
+            .map(|(shadow, address, len, _, _)| (shadow.clone(), *address as usize, *len as usize))
+            .collect()
+    }
+
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]
@@ -153,10 +186,11 @@ impl Viewed {
 fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
-    if let View::Shader(resource, _) = view
+    if let View::Shader(resource, desc) = view
         && let Some(texture) = crate::resource::made_copy(*resource as This)
     {
-        return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource));
+        let mask = crate::descriptor::host::srv_mip_mask(*resource as This, desc.as_ref(), &texture.texture);
+        return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource, mask));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {
@@ -186,6 +220,178 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
     }
 }
 
+// Reverse-port ac64cdb1 and e6be9a0c. Unlike the older renderer,
+// the current staging pool is recycled every submission: ahead jobs
+// own private upload buffers, and never acknowledge a discarded upload.
+const AHEAD_COUNT: usize = 32;
+const AHEAD_BYTES: u64 = 16 << 20;
+const AHEAD_MS: u128 = 8;
+const READY_LIMIT: usize = 8;
+const READY_AGE_MS: u128 = 250;
+
+struct Ready {
+    viewed: Weak<Viewed>,
+    made: std::time::Instant,
+    list: Option<HostList>,
+    entries: Vec<crate::texture::AheadUpload>,
+}
+
+static READY: Mutex<Vec<Ready>> = Mutex::new(Vec::new());
+
+fn worker_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_WORKER").as_deref() == Ok("1"))
+}
+
+fn ready_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    // ff33360: the speculative full dirty list cannot know the actual
+    // submission's SRV union. Keep CPU preparation in range mode.
+    worker_enabled() && !crate::texture::srv_ranges_enabled()
+        && *ON.get_or_init(|| std::env::var("VICTORY_HEAP_READY_LISTS").as_deref() == Ok("1"))
+}
+
+fn ahead_pressured() -> bool {
+    crate::shadow::memory_pressured() || crate::host::video_memory_pressured()
+}
+
+fn ready_live(age_ms: u128, heap_alive: bool, pressure: bool) -> bool {
+    !pressure && heap_alive && age_ms <= READY_AGE_MS
+}
+
+/// Called under the submission lock. Dropped entries leave their
+/// staging retry flag set until mandatory preparation replaces them.
+pub(crate) fn maintain_ready() {
+    if !worker_enabled() {
+        return;
+    }
+    let pressure = ahead_pressured();
+    READY.lock().unwrap_or_else(|e| e.into_inner())
+        .retain(|r| ready_live(r.made.elapsed().as_millis(), r.viewed.strong_count() != 0, pressure));
+}
+
+fn publish_ready(ready: Ready) {
+    let mut queue = READY.lock().unwrap_or_else(|e| e.into_inner());
+    queue.retain(|r| !Weak::ptr_eq(&r.viewed, &ready.viewed)
+        && ready_live(r.made.elapsed().as_millis(), r.viewed.strong_count() != 0, false));
+    if queue.len() >= READY_LIMIT {
+        queue.remove(0);
+    }
+    queue.push(ready);
+}
+
+fn take_ready(viewed: &Arc<Viewed>) -> Option<Ready> {
+    let key = Arc::downgrade(viewed);
+    let mut queue = READY.lock().unwrap_or_else(|e| e.into_inner());
+    let i = queue.iter().position(|r| Weak::ptr_eq(&r.viewed, &key))?;
+    Some(queue.remove(i))
+}
+
+struct AheadJob {
+    viewed: Weak<Viewed>,
+}
+
+impl Drop for AheadJob {
+    fn drop(&mut self) {
+        if let Some(viewed) = self.viewed.upgrade() {
+            viewed.ahead_queued.store(false, Relaxed);
+        }
+    }
+}
+
+/// Never queue a raw title pointer or wait for room in the queue.
+pub(crate) fn kick(viewed: &Arc<Viewed>) {
+    if !worker_enabled() || ahead_pressured() {
+        return;
+    }
+    static WORKER: OnceLock<Option<mpsc::SyncSender<AheadJob>>> = OnceLock::new();
+    let Some(sender) = WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<AheadJob>(8);
+        match std::thread::Builder::new().name("victory-heap-ahead".into()).spawn(move || {
+            for job in rx {
+                if let Some(viewed) = job.viewed.upgrade()
+                    && let Some(host) = crate::host::host()
+                {
+                    host.prepare_heap_ahead(&viewed);
+                }
+                drop(job);
+            }
+        }) {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                tracing::warn!(error = %e, "heap preparation worker unavailable");
+                None
+            }
+        }
+    }) else { return };
+    if viewed.ahead_queued.swap(true, Relaxed) {
+        return;
+    }
+    let _ = sender.try_send(AheadJob { viewed: Arc::downgrade(viewed) });
+}
+
+fn ahead_keys(textures: &BTreeMap<usize, u32>, cursor: Option<usize>, count: usize) -> Vec<usize> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    match cursor {
+        Some(last) => textures.range((Excluded(last), Unbounded))
+            .chain(textures.range(..=last)).take(count).map(|(&key, _)| key).collect(),
+        None => textures.keys().take(count).copied().collect(),
+    }
+}
+
+/// The host holds its submission lock. Only made, recent, title-fed
+/// copies qualify. The heap lock keeps the title object alive while
+/// reading it, but published entries own only host objects and staging.
+pub(crate) fn prepare_ahead(viewed: &Arc<Viewed>) {
+    maintain_ready();
+    if ahead_pressured() {
+        return;
+    }
+    let Ok(inner) = viewed.inner.try_lock() else { return };
+    let Ok(mut cursor) = viewed.ahead_cursor.try_lock() else { return };
+    let keys = ahead_keys(&inner.textures, *cursor, AHEAD_COUNT);
+    let started = std::time::Instant::now();
+    let mut left = AHEAD_BYTES;
+    let mut entries: Vec<crate::texture::AheadUpload> = Vec::new();
+    for key in keys {
+        if left == 0 || started.elapsed().as_millis() >= AHEAD_MS || ahead_pressured() {
+            break;
+        }
+        *cursor = Some(key);
+        let Some(copy) = crate::resource::made_copy(key as This) else { continue };
+        if !copy.used_recently() || copy.host_written.load(Relaxed)
+            || entries.iter().any(|e| Arc::ptr_eq(e.copy(), &copy))
+        {
+            continue;
+        }
+        if let Some((cost, prepared)) = crate::texture::prepare_ahead(key as This, copy, left) {
+            left = left.saturating_sub(cost);
+            if let Some(prepared) = prepared {
+                entries.push(prepared);
+            }
+        }
+    }
+    drop(inner);
+    drop(cursor);
+    if entries.is_empty() || ahead_pressured() {
+        return;
+    }
+    let list = if ready_enabled() && entries.iter().all(crate::texture::AheadUpload::can_record) {
+        crate::host::host().and_then(|host| host.new_list().ok()).inspect(|list| {
+            list.set_ours();
+            let readable: Vec<_> = entries.iter().filter_map(|e| e.record(list, false)).collect();
+            if !readable.is_empty() {
+                // SAFETY: an open list naming live, owned textures.
+                unsafe { list.list.ResourceBarrier(&readable) };
+            }
+            list.close();
+        })
+    } else {
+        None
+    };
+    publish_ready(Ready { viewed: Arc::downgrade(viewed), made: started, list, entries });
+}
+
 /// At submission, before anything else of it: the textures the heaps of its
 /// heap-indexing lists view, and `textures` (staging and host texture of
 /// those its lists read through tables, `crate::texture::upload`), are
@@ -197,45 +403,43 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 /// submission shows from the next one on.
 pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
-    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+    textures: &[crate::texture::RefreshWork],
 ) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
+    // The submission lock, not the pool mutex, serializes the current
+    // renderer. Take ownership of the list and release the pool lock.
     crate::texture::recycle();
-    match &guard.0 {
-        // Closed by the last submission, which has run.
-        Some(list) => list.reset(),
-        // Made open.
-        None => {
-            let list = crate::host::host()?.new_list().ok()?;
-            list.set_ours();
-            guard.0 = Some(list);
-        }
-    }
-    let list = guard.0.as_ref()?;
+    let owned = take_upload_list()?;
+    let list = &owned;
     // What to bring up: the textures lists read through tables, and those
     // the heaps view that shaders read lately. Collected under the heaps'
     // locks and brought up without them, several at a time: reading title
     // memory, detiling and making staging buffers took half the submitting
     // thread in a new shot, and title threads setting views waited on the
     // lock meanwhile (run evict5).
-    let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
-    let mut staged = std::collections::HashSet::new();
-    for (staging, copy) in textures {
+    let mut work: Vec<crate::texture::RefreshWork> = Vec::new();
+    let mut staged: HashMap<*const crate::texture::Staging, usize> = HashMap::new();
+    let range_mode = crate::texture::srv_ranges_enabled();
+    for (staging, copy, requested) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded).
         if copy.host_written.load(Relaxed) {
             continue;
         }
-        if staged.insert(Arc::as_ptr(staging)) {
-            work.push((staging.clone(), copy.clone()));
+        let mask = if range_mode { *requested } else { u32::MAX };
+        match staged.entry(Arc::as_ptr(staging)) {
+            std::collections::hash_map::Entry::Occupied(e) => work[*e.get()].2 |= mask,
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(work.len());
+                work.push((staging.clone(), copy.clone(), mask));
+            }
         }
     }
+    let mandatory = work.len();
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         for &r in inner.textures.keys() {
-            if !done.insert(r) {
+            if !range_mode && !done.insert(r) {
                 continue;
             }
             // Not made (given up, or never read): nothing to bring up.
@@ -257,17 +461,91 @@ pub(crate) fn uploads(
             if texture.host_written.load(Relaxed) {
                 continue;
             }
-            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
-                && staged.insert(Arc::as_ptr(&staging))
-            {
-                work.push((staging, texture));
+            if let Some(staging) = crate::texture::staging(r as This, &texture.texture) {
+                let mask = if range_mode { inner.requested_mips(r) } else { u32::MAX };
+                // Union across heaps and title aliases before reading once.
+                // Explicit copy requests carry full masks; table reads
+                // carry their requested range when the option is enabled.
+                match staged.entry(Arc::as_ptr(&staging)) {
+                    std::collections::hash_map::Entry::Occupied(e) => work[*e.get()].2 |= mask,
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(work.len());
+                        work.push((staging, texture, mask));
+                    }
+                }
             }
         }
     }
+    // Observe title-held levels independently of dirty hashes and ahead
+    // reuse. Do not narrow allocations, uploads or published SRVs.
+    if crate::tiles::judgement_enabled() && work.iter().any(|(_, copy, _)| copy.tiled.is_some()) {
+        let hints = crate::descriptor::placed_judgements();
+        for (staging, copy, _) in &work {
+            staging.observe_held(copy, &hints);
+        }
+    }
+    // The reference's waiting-source path is applied before detiling,
+    // only to opportunistic heap reads. Explicit table/copy requests
+    // retain mandatory admission and the existing full-chain fallback.
+    // In the production full-map path this makes no allocation.
+    if work.iter().skip(mandatory).any(|(_, copy, _)| copy.tiled.is_some()) {
+        let gpu = crate::host::host()?;
+        let mut index = 0;
+        work.retain(|(staging, copy, mips)| {
+            let explicit = index < mandatory;
+            index += 1;
+            if explicit || copy.tiled.is_none() { return true; }
+            // SAFETY: this upload pass runs under the submission lock,
+            // before preludes or any detiling for this batch.
+            match unsafe { crate::tiles::prepare_optional_source(gpu, copy, staging.source_backing_mask(*mips)) } {
+                Some(added) => {
+                    if added { staging.retry_after_backing(); }
+                    true
+                }
+                None => false, // dirty state untouched; retry when due
+            }
+        });
+        // The ready-list validator indexes work by staging identity.
+        // Filtering waiting work may have moved those indices.
+        staged.clear();
+        staged.extend(work.iter().enumerate().map(|(i, (staging, _, _))| (Arc::as_ptr(staging), i)));
+    }
     let mut recorded = false;
-    // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
-    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
+    let mut accepted = Vec::new();
+    if worker_enabled() && !ahead_pressured() {
+        let mut used = std::collections::HashSet::new();
+        for viewed in heaps {
+            let Some(ready) = take_ready(viewed) else { continue };
+            // All or nothing for a recorded list. The actual submission
+            // work set contains current owners, including explicit reads.
+            if !ready_live(ready.made.elapsed().as_millis(), true, false)
+                || !ready.entries.iter().all(|entry| {
+                    let key = Arc::as_ptr(entry.staging());
+                    !used.contains(&key) && staged.get(&key)
+                        .is_some_and(|&i| entry.revalidate(&work[i]))
+                })
+            {
+                continue;
+            }
+            for entry in &ready.entries {
+                let key = Arc::as_ptr(entry.staging());
+                let mips = work[staged[&key]].2;
+                let (copied, barrier) = entry.accept(ready.list.is_none().then_some(list), mips);
+                used.insert(key);
+                readable.extend(barrier);
+                if copied {
+                    recorded |= ready.list.is_none();
+                    #[cfg(feature = "diagnostics")]
+                    UPLOADED.fetch_add(1, Relaxed);
+                }
+            }
+            accepted.push(ready);
+        }
+        work.retain(|(staging, _, _)| !used.contains(&Arc::as_ptr(staging)));
+    }
+    // The textures copied into stay alive in `work` until recorded.
+    for ((staging, copy, _), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
         if let Some(upload) = upload {
             readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
             recorded = true;
@@ -281,22 +559,74 @@ pub(crate) fn uploads(
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    if recorded || !accepted.is_empty() {
+        Some(Uploads { ready: accepted, fallback: recorded, list: Some(owned) })
+    } else {
+        return_upload_list(owned);
+        None
+    }
 }
 
-/// The upload list, used under its lock only.
-pub(crate) struct Holder(Option<HostList>);
-// SAFETY: D3D12 objects are free-threaded; the list is used by one
-// submission at a time, under the lock.
-unsafe impl Send for Holder {}
+/// Adapt the reference's fresh/recycled-list ownership rather than
+/// borrow a MutexGuard for the entire lifetime of the submission.
+/// This cache stores only closed, unsubmitted or completed lists.
+static UPLOAD_LIST: Mutex<Option<HostList>> = Mutex::new(None);
 
-/// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
+fn take_upload_list() -> Option<HostList> {
+    let idle = UPLOAD_LIST.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match idle {
+        Some(list) => {
+            list.reset();
+            Some(list)
+        }
+        None => {
+            let list = crate::host::host()?.new_list().ok()?;
+            list.set_ours();
+            Some(list)
+        }
+    }
+}
+
+fn return_upload_list(list: HostList) {
+    // No submitted list is returned before the checked fence and
+    // settlement. A prepared-but-unused list may also be returned.
+    // Never execute the cached list before its next Reset.
+    list.release_texture_pieces();
+    let mut idle = UPLOAD_LIST.lock().unwrap_or_else(|e| e.into_inner());
+    if idle.is_none() {
+        *idle = Some(list);
+    }
+}
+
+/// Own the fallback list, accepted ahead lists and private upload
+/// buffers through the checked submission fence. No pool guard is
+/// carried across the send/settle boundary. Callers must retain this
+/// until settlement (or drop an unsubmitted recording).
+pub(crate) struct Uploads {
+    ready: Vec<Ready>,
+    fallback: bool,
+    list: Option<HostList>,
+}
 
 impl Uploads {
-    pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
+    pub(crate) fn lists(&self) -> impl Iterator<Item = &HostList> {
+        self.ready.iter().filter_map(|r| r.list.as_ref())
+            .chain(self.list.as_ref().filter(|_| self.fallback))
     }
+}
+
+impl Drop for Uploads {
+    fn drop(&mut self) {
+        if let Some(list) = self.list.take() {
+            return_upload_list(list);
+        }
+    }
+}
+
+#[test]
+fn upload_owners_do_not_carry_a_pool_guard() {
+    fn needs_send<T: Send>() {}
+    needs_send::<Uploads>();
 }
 
 /// Per submission: brings the buffer ranges a heap's views reach up to date
@@ -358,7 +688,8 @@ pub(crate) fn forget(resource: usize) {
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.textures.remove(&resource).is_some() {
-            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
+            inner.texture_masks.remove(&resource);
+            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r, _) if *r == resource));
         }
     }
 }
@@ -379,7 +710,7 @@ pub(crate) fn log(frames: f64) {
         for seen in inner.slots.values() {
             match seen {
                 Seen::Buffer(..) => buffers += 1,
-                Seen::Texture(_) => textures += 1,
+                Seen::Texture(..) => textures += 1,
                 Seen::Left((k, address, bytes)) => {
                     left[*k] += 1;
                     if *k == 2 {
@@ -426,6 +757,59 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ahead_cursor_wraps_without_repeating_entries() {
+        let textures = BTreeMap::from([(1, 1), (3, 1), (7, 1), (9, 1)]);
+        assert_eq!(ahead_keys(&textures, None, 2), [1, 3]);
+        assert_eq!(ahead_keys(&textures, Some(3), 3), [7, 9, 1]);
+        assert_eq!(ahead_keys(&textures, Some(6), 8), [7, 9, 1, 3]);
+        assert!(ahead_keys(&BTreeMap::new(), Some(9), 4).is_empty());
+    }
+
+    #[test]
+    fn rejected_or_finished_ahead_job_clears_queue_flag() {
+        let viewed = Arc::new(Viewed::default());
+        viewed.ahead_queued.store(true, Relaxed);
+        let (tx, _rx) = mpsc::sync_channel::<AheadJob>(0);
+        assert!(tx.try_send(AheadJob { viewed: Arc::downgrade(&viewed) }).is_err());
+        assert!(!viewed.ahead_queued.load(Relaxed));
+        viewed.ahead_queued.store(true, Relaxed);
+        drop(AheadJob { viewed: Arc::downgrade(&viewed) });
+        assert!(!viewed.ahead_queued.load(Relaxed));
+    }
+
+    #[test]
+    fn ready_lists_expire_or_are_dropped_under_pressure() {
+        assert!(ready_live(0, true, false));
+        assert!(ready_live(READY_AGE_MS, true, false));
+        assert!(!ready_live(READY_AGE_MS + 1, true, false));
+        assert!(!ready_live(0, false, false));
+        assert!(!ready_live(0, true, true));
+    }
+
+    #[test]
+    fn texture_srv_union_tracks_duplicate_rewrites_and_full_views() {
+        let mut inner = Inner::default();
+        let a = Seen::Texture(11, 0b0011);
+        let b = Seen::Texture(11, 0b1100);
+        let full = Seen::Texture(11, u32::MAX);
+        inner.count(&a, true);
+        inner.count(&a, true);
+        inner.count(&b, true);
+        assert_eq!(inner.requested_mips(11), 0b1111);
+        inner.count(&a, false);
+        assert_eq!(inner.requested_mips(11), 0b1111);
+        inner.count(&a, false);
+        assert_eq!(inner.requested_mips(11), 0b1100);
+        inner.count(&full, true);
+        assert_eq!(inner.requested_mips(11), u32::MAX);
+        inner.count(&full, false);
+        assert_eq!(inner.requested_mips(11), 0b1100);
+        inner.count(&b, false);
+        assert!(inner.textures.is_empty());
+        assert!(inner.texture_masks.is_empty());
+    }
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -547,6 +931,57 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     const LINEAR: u32 = 0x100;
+
+    /// Drive the production picked path with real GPU copies and a UAV
+    /// hull, but without an explicit GpuWrite for the first two submissions.
+    /// The first discovery must not land; only a later declared change may.
+    #[test]
+    #[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_PICKED_WRITES=2 and D3D12; run alone"]
+    fn picked_writes_land_only_after_discovery() {
+        let host = crate::host::host().expect("D3D12 device");
+        const PAGE: usize = 1 << 16;
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).expect("registered copy");
+        assert!(copy.card().is_some() && copy.marked(), "tracked card buffer required");
+        assert!(crate::picked::lands());
+        // SAFETY: owned test pages, initialized before their first refresh.
+        unsafe {
+            (p as *mut u32).write_unaligned(0);
+            ((p + PAGE) as *mut u32).write_unaligned(0);
+        }
+        let viewed = Arc::new(Viewed::default());
+        {
+            let mut inner = viewed.inner.lock().unwrap();
+            let seen = Seen::Buffer(copy.clone(), p as u64, len as u64, true);
+            inner.count(&seen, true);
+            inner.slots.insert(0, seen);
+        }
+        let submit = |value: u32, explicit: bool| {
+            let (upload, data) = host.upload_buffer(4).unwrap();
+            // SAFETY: four mapped bytes in a live upload buffer.
+            unsafe { data.cast::<u32>().write_unaligned(value) };
+            let list = host.new_list().unwrap();
+            list.defer_heap(&viewed);
+            list.note_card_picked();
+            if explicit {
+                copy.refresh(&list, (p + PAGE) as u64, 4);
+                copy.gpu_writes(&list, (p + PAGE) as u64, 4, false);
+            }
+            list.keep(&upload);
+            // SAFETY: live buffers, valid four-byte copy, open command list.
+            unsafe { list.list.CopyBufferRegion(&copy.buffer, 0, &upload, 0, 4) };
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: owned mapped pages after completed submission.
+            unsafe { (p as *const u32).read_unaligned() }
+        };
+        assert_eq!(submit(0x12345678, false), 0, "discovery is not retroactive");
+        assert_eq!(submit(0xabcdef01, false), 0xabcdef01, "new write lands");
+        assert_eq!(submit(0x55667788, true), 0xabcdef01, "explicit declaration owns copy");
+        crate::shadow::unregister(p, p as u64);
+    }
 
     /// A copy's hull is its live ranges' first start to last end, kept as
     /// slots come and go; a copy no slot views any more has none.

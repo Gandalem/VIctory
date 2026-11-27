@@ -126,6 +126,11 @@ struct List {
     segment: std::sync::atomic::AtomicUsize,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// The closed recording's detached upload/draw owner, retained by
+    /// the title until Reset in case the same recording is submitted
+    /// again. Every queued segment holds its own reference.
+    #[cfg(windows)]
+    detached: std::sync::Mutex<Option<RecordingOwner>>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -158,17 +163,92 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     Some(unsafe { &*current })
 }
 
-/// A title list's host lists, in order: what a submission of it runs.
+/// Source Detached carries the uploads and draw state alongside a host
+/// list. Here a title recording may contain several waited segments, and
+/// the same closed recording may be submitted again without a Reset.
+/// Share one owner across all such segments rather than move it to a
+/// single last segment or replace a repeat submission with an empty list.
 #[cfg(windows)]
-pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>> {
+struct Kept {
+    _uploads: Vec<Upload>,
+    _state: crate::draw::State,
+}
+
+// SAFETY: identical ownership to the old leave callback: the recording
+// is not modified after transfer, and these resources are only dropped
+// once the last holder is gone. The mutex supplies shared synchronization.
+#[cfg(windows)]
+unsafe impl Send for Kept {}
+
+#[cfg(windows)]
+type RecordingOwner = std::sync::Arc<std::sync::Mutex<Kept>>;
+
+#[cfg(windows)]
+pub(crate) struct Detached {
+    host: std::sync::Arc<crate::host::HostList>,
+    _recording: Option<RecordingOwner>,
+}
+
+#[cfg(windows)]
+impl Detached {
+    pub(crate) fn host(&self) -> &crate::host::HostList {
+        &self.host
+    }
+
+    /// Called after this segment's checked execution and copy-back.
+    /// Other queued uses and the title's closed recording may retain
+    /// the owner, so neither dynamic tables nor uploads are freed early.
+    pub(crate) fn recycle(self) {
+        let Self { host, _recording } = self;
+        recycle(host);
+        drop(_recording);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn detach_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_DETACH").is_some_and(|v| v == "1"))
+}
+
+/// Adapt source detach's transfer of uploads/state, once per recording.
+/// The title does not record into a submitted closed list until Reset.
+/// Keep the owner on the title as well to support repeated submissions.
+#[cfg(windows)]
+fn take_recording(list: &List) -> RecordingOwner {
+    let mut owner = list.detached.lock().unwrap_or_else(|e| e.into_inner());
+    owner.get_or_insert_with(|| {
+        let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
+        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        std::sync::Arc::new(std::sync::Mutex::new(Kept { _uploads: uploads, _state: state }))
+    }).clone()
+}
+
+/// A title list's host segments, in their original order, with ownership
+/// for the recording. The default path retains the old Arc/leave behavior.
+#[cfg(windows)]
+pub(crate) fn segments(this: This) -> Vec<Detached> {
+    detach(this, detach_enabled())
+}
+
+#[cfg(windows)]
+fn detach(this: This, enabled: bool) -> Vec<Detached> {
     if this.is_null() {
         return Vec::new();
     }
-    // SAFETY: the title passes one of our lists.
+    // SAFETY: the title passes a closed list; no recording/reset occurs
+    // concurrently with its submission, as in the original segments.
     let list = unsafe { &*this.cast::<List>() };
     let k = list.segment.load(std::sync::atomic::Ordering::Relaxed);
     let hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
-    hosts.iter().take(k + 1).cloned().collect()
+    if hosts.is_empty() {
+        return Vec::new();
+    }
+    let owner = enabled.then(|| take_recording(list));
+    hosts.iter().take(k + 1).map(|host| Detached {
+        host: host.clone(),
+        _recording: owner.clone(),
+    }).collect()
 }
 
 /// Waits recorded after commands: the title list goes on in a new host
@@ -244,26 +324,37 @@ fn next_segment<'a>(this: This) -> Option<&'a crate::host::HostList> {
 /// queue and replaced. The last one left so, which should keep what the
 /// title list owned.
 #[cfg(windows)]
-fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
+fn restart(this: This) -> Result<Option<std::sync::Arc<crate::host::HostList>>, HRESULT> {
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
-    let used = list.segment.swap(0, std::sync::atomic::Ordering::Relaxed);
     let mut hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
+    // Preflight all replacements before resetting any list or releasing
+    // title resources. A failed allocation must not let recording resume
+    // into a list the queue still owns. Holding hosts excludes acquisition
+    // of new references by submission.
+    let mut replacements = Vec::with_capacity(hosts.len());
+    for h in hosts.iter() {
+        let fresh = if std::sync::Arc::strong_count(h) > 1 {
+            let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            Some(spare.map(Ok).or_else(|| crate::host::host().map(|host| host.new_list()))
+                .and_then(Result::ok).ok_or(crate::object::E_OUTOFMEMORY)?)
+        } else {
+            None
+        };
+        replacements.push(fresh);
+    }
+    let used = list.segment.swap(0, std::sync::atomic::Ordering::Relaxed);
     let mut left = None;
-    for (k, h) in hosts.iter_mut().enumerate() {
-        if std::sync::Arc::strong_count(h) > 1 {
+    for (k, (h, fresh)) in hosts.iter_mut().zip(replacements).enumerate() {
+        if let Some(fresh) = fresh {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(segment = k, "a list reset while a queue still holds part of it: that part keeps its own host list");
-            let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
-            match spare.map(Ok).or_else(|| crate::host::host().map(|host| host.new_list())) {
-                Some(Ok(fresh)) => left = Some(std::mem::replace(h, std::sync::Arc::new(fresh))),
-                _ => continue,
-            }
+            left = Some(std::mem::replace(h, std::sync::Arc::new(fresh)));
         } else if k <= used {
             h.reset();
         }
     }
-    left
+    Ok(left)
 }
 
 /// Host lists [`restart`] left to a queue, back once they ran: the next
@@ -275,7 +366,7 @@ static SPARE: std::sync::Mutex<Vec<crate::host::HostList>> = std::sync::Mutex::n
 /// A host list a queue has run: one no title list holds any more is reset
 /// and kept for [`restart`].
 #[cfg(windows)]
-pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
+fn recycle(list: std::sync::Arc<crate::host::HostList>) {
     const KEPT: usize = 64;
     if let Ok(list) = std::sync::Arc::try_unwrap(list) {
         list.reset();
@@ -292,11 +383,8 @@ pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
 /// (the list's last held one, so the last to run) is gone.
 #[cfg(windows)]
 fn leave(to: Option<std::sync::Arc<crate::host::HostList>>, uploads: Vec<Upload>, state: crate::draw::State) {
-    struct Kept(#[allow(dead_code)] Vec<Upload>, #[allow(dead_code)] crate::draw::State);
-    // SAFETY: only dropped, with the host list, after it has run.
-    unsafe impl Send for Kept {}
     if let Some(held) = to {
-        let kept = Kept(uploads, state);
+        let kept = Kept { _uploads: uploads, _state: state };
         held.defer_after(move || {
             let _ = &kept;
         });
@@ -402,6 +490,8 @@ fn new_list(
             state.set_pipeline(pipeline);
             std::sync::Mutex::new(state)
         },
+        #[cfg(windows)]
+        detached: Default::default(),
     });
     let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     if hr == S_OK {
@@ -436,9 +526,13 @@ extern "system" fn list_release(this: This) -> u32 {
         if held.is_some() {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!("a list released while a queue still holds part of it: that part runs on its own");
-            let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
-            leave(held, uploads, state);
+            // A detached recording is already owned by every queued
+            // segment. Do not attach another completion callback.
+            if list.detached.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
+                let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+                leave(held, uploads, state);
+            }
         }
     }
     object::release_boxed::<List>(this)
@@ -458,19 +552,29 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // A queue may still hold what the list recorded (`restart`, `leave`).
+    // A queue may still hold what the list recorded. First obtain all
+    // replacements, without consuming uploads/state on failure.
+    #[cfg(windows)]
+    let held = match restart(this) {
+        Ok(held) => held,
+        Err(hr) => return hr,
+    };
     // SAFETY: the title passes one of our lists.
-    let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
+    let list = unsafe { &*this.cast::<List>() };
+    let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(windows)]
     {
-        let held = restart(this);
-        // SAFETY: the title passes one of our lists.
-        let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
+        let owner = list.detached.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::mem::take(&mut *state);
         state.reset(pipeline);
         drop(state);
-        leave(held, uploads, old);
+        if owner.is_none() {
+            leave(held, uploads, old);
+        }
+        // Other detached segment references pin the recording even
+        // after the title's Reset or Release.
+        drop(owner);
     }
     #[cfg(not(windows))]
     drop(uploads);
@@ -648,20 +752,30 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
-        if let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
+        if let (Some(destination), Some(from)) = (
+            crate::resource::host_copy(dst),
             crate::resource::host_resource(src),
         ) {
+            let to = destination.texture.clone();
+            let levelwise = crate::resource::dropped(dst, &to) != crate::resource::dropped(src, &from);
+            if levelwise && !crate::resource::matching_copy_shape(dst, src) {
+                tracing::warn!("incompatible whole-texture copy with omitted mip levels");
+                return;
+            }
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_writes(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(&to, &from) };
+            if levelwise {
+                copy_retained_levels(list, dst, &destination, src, &from);
+            } else {
+                crate::texture::host_writes_mask(list, &destination, u32::MAX);
+                // SAFETY: an open list and live textures.
+                unsafe { list.list.CopyResource(&to, &from) };
+            }
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -671,6 +785,36 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
+}
+
+/// Copy every title mip present on both host textures, with independent
+/// host subresource numbering for each array slice.
+#[cfg(windows)]
+fn copy_retained_levels(
+    list: &crate::host::HostList,
+    dst: This,
+    destination: &std::sync::Arc<crate::resource::HostTexture>,
+    src: This,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let to = &destination.texture;
+    let location = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: the borrowed resource is kept alive by the list.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+    };
+    let n = crate::resource::title_subresources(dst).min(crate::resource::title_subresources(src));
+    let mut written = 0;
+    for index in 0..n {
+        let (Some(d), Some(s)) = (crate::resource::host_subresource(dst, to, index),
+                                  crate::resource::host_subresource(src, from, index)) else { continue };
+        // SAFETY: both retained subresources have matching title dimensions.
+        unsafe { list.list.CopyTextureRegion(&location(to, d), 0, 0, 0, &location(from, s), None) };
+        written |= crate::texture::host_mip_bit(d);
+    }
+    crate::texture::host_writes_mask(list, destination, written);
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -712,12 +856,20 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        let Some(destination) = crate::resource::host_copy(dst.resource) else {
             if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
                 read_back(list, &dst, [x, y, z], &src, source_box);
             }
             return;
         };
+        let to = destination.texture.clone();
+        let mut dst = dst;
+        if dst.kind != FOOTPRINT && crate::resource::dropped(dst.resource, &to) > 0 {
+            let Some(index) = crate::resource::host_subresource(dst.resource, &to, dst.footprint.offset as u32) else {
+                return; // explicitly omitted high-resolution mip
+            };
+            dst.footprint.offset = u64::from(index);
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -747,6 +899,12 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::resource::dropped(src.resource, &texture) > 0 {
+                let Some(index) = crate::resource::host_subresource(src.resource, &texture, src.footprint.offset as u32) else {
+                    return; // explicitly omitted high-resolution mip
+                };
+                from.footprint.offset = u64::from(index);
+            }
             if crate::texture::title_written(&texture) {
                 crate::texture::upload(list, src.resource, &texture);
             }
@@ -754,7 +912,9 @@ extern "system" fn copy_texture_region(
             from.resource = texture.as_raw().cast_const().cast();
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_writes(list, dst.resource);
+        let written = if dst.kind == FOOTPRINT { u32::MAX }
+            else { crate::texture::host_mip_bit(dst.footprint.offset as u32) };
+        crate::texture::host_writes_mask(list, &destination, written);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -830,11 +990,14 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     };
     // SAFETY: the title's box (same layout as the host's) or null; a live texture.
     let (b, desc) = unsafe { (source_box.cast::<D3D12_BOX>().as_ref(), texture.GetDesc()) };
+    let Some(host_index) = crate::resource::host_subresource(src.resource, &texture, src.footprint.offset as u32) else {
+        refused!("a mip omitted by the low-VRAM profile");
+    };
     let size = match b {
         Some(b) => [b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top), b.back.saturating_sub(b.front)],
         None => {
             // A subresource index shares the footprint's first dword.
-            let mip = src.footprint.offset as u32 % u32::from(desc.MipLevels.max(1));
+            let mip = host_index % u32::from(desc.MipLevels.max(1));
             let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(desc.DepthOrArraySize) } else { 1 };
             [((desc.Width >> mip) as u32).max(1), (desc.Height >> mip).max(1), (depth >> mip).max(1)]
         }
@@ -864,6 +1027,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint.offset = 0;
     from.resource = texture.as_raw().cast_const().cast();
+    from.footprint.offset = u64::from(host_index);
     #[cfg(feature = "diagnostics")]
     {
         let text = || {
@@ -935,11 +1099,12 @@ extern "system" fn resolve(
 ) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
-        && let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
+        && let (Some(destination), Some(from)) = (
+            crate::resource::host_copy(dst),
             crate::resource::host_resource(src),
         )
     {
+        let to = destination.texture.clone();
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -948,9 +1113,13 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        if crate::resource::dropped(dst, &to) > 0 || crate::resource::dropped(src, &from) > 0 {
+            tracing::warn!("resolve involving omitted mip levels is unsupported");
+            return;
+        }
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_writes(list, dst);
+        crate::texture::host_writes_mask(list, &destination, crate::texture::host_mip_bit(dst_sub));
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -2021,6 +2190,119 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// The source's upload/state transfer occurs once, and title Reset
+    /// must not free a recording still held by submitted segments.
+    #[cfg(windows)]
+    #[test]
+    fn detached_recording_owner_survives_reset_and_duplicate_capture() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut title = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut title), S_OK);
+        let p = allocate_upload(title, 16, 16);
+        assert!(!p.is_null());
+        // SAFETY: sixteen owned bytes returned by allocate_upload.
+        unsafe { p.write_bytes(0xa5, 16) };
+        assert_eq!(close(title), S_OK);
+        // SAFETY: the title object is live until list_release.
+        let list = unsafe { &*title.cast::<List>() };
+        let first = take_recording(list);
+        let repeated = take_recording(list);
+        assert!(Arc::ptr_eq(&first, &repeated));
+        let weak = Arc::downgrade(&first);
+        assert_eq!(first.lock().unwrap()._uploads.len(), 1);
+        assert!(list.uploads.lock().unwrap().is_empty());
+        assert_eq!(reset(title, allocator, null), S_OK);
+        assert!(list.detached.lock().unwrap().is_none());
+        let mut bytes = [0; 16];
+        assert!(crate::host::read_into(p, &mut bytes));
+        assert_eq!(bytes, [0xa5; 16]);
+        assert_eq!(list_release(title), 0);
+        drop(first);
+        assert!(weak.upgrade().is_some());
+        drop(repeated);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(allocator_release(allocator), 0);
+    }
+
+    /// The first late-wait stage owns detached lists through the
+    /// title fence and publishes the pipe value only on settlement.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires D3D12 adapter; run alone"]
+    fn late_title_flight_retains_recording_and_publishes_on_settle() {
+        let host = crate::host::host().expect("D3D12 device");
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut title = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut title), S_OK);
+        let mut value = 0u64;
+        host_list(title).unwrap().defer_write((&raw mut value).cast(),
+            crate::queue::Written::Value(0x1234), 8);
+        assert_eq!(close(title), S_OK);
+        let flight = host.execute_late(detach(title, true));
+        assert_eq!(flight.read_reason((&raw const value) as usize, 8), crate::host::SettleWhy::Write);
+        assert_eq!(value, 0);
+        assert_eq!(list_release(title), 0);
+        flight.settle(crate::host::SettleWhy::Fence);
+        assert_eq!(value, 0x1234);
+        assert_eq!(allocator_release(allocator), 0);
+    }
+
+    /// Actual held segments and repeated submissions preserve every
+    /// command list and the shared recording until GPU completion.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires D3D12 adapter; run alone"]
+    fn detached_segments_survive_title_reset_and_release() {
+        let host = crate::host::host().expect("D3D12 device");
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut title = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut title), S_OK);
+        let p = allocate_upload(title, 16, 16);
+        assert!(!p.is_null());
+        // SAFETY: live upload memory.
+        unsafe { p.write_bytes(0x5a, 16) };
+        host_list(title).unwrap().defer_after(|| {});
+        wait(title, crate::hold::ValueWait {
+            address: p as u64, bytes: 4, comparison: 8, reference: 0, mask: u64::MAX,
+        });
+        assert_eq!(close(title), S_OK);
+        let first = detach(title, true);
+        let repeated = detach(title, true);
+        assert_eq!(first.len(), 2);
+        assert_eq!(repeated.len(), 2);
+        let owner = first[0]._recording.as_ref().unwrap();
+        let weak = Arc::downgrade(owner);
+        for (a, b) in first.iter().zip(&repeated) {
+            assert!(Arc::ptr_eq(&a.host, &b.host));
+            assert!(Arc::ptr_eq(owner, a._recording.as_ref().unwrap()));
+            assert!(Arc::ptr_eq(owner, b._recording.as_ref().unwrap()));
+        }
+        assert_eq!(reset(title, allocator, null), S_OK);
+        assert!(!std::ptr::eq(host_list(title).unwrap(), first[0].host()));
+        assert_eq!(close(title), S_OK);
+        assert_eq!(list_release(title), 0);
+        for segment in first {
+            host.execute(&[segment.host()]);
+            segment.recycle();
+            assert!(weak.upgrade().is_some());
+        }
+        let mut bytes = [0; 16];
+        assert!(crate::host::read_into(p, &mut bytes));
+        assert_eq!(bytes, [0x5a; 16]);
+        for segment in repeated {
+            host.execute(&[segment.host()]);
+            segment.recycle();
+        }
+        assert!(weak.upgrade().is_none());
+        assert_eq!(allocator_release(allocator), 0);
     }
 
     /// An offset near `u64::MAX` must not overflow and write outside the
