@@ -831,6 +831,46 @@ fn declared_compare_spans_cover_each_touched_piece_once() {
     assert_eq!(edge[0].to as usize, size);
 }
 
+/// The source compares with mode 1 on the synchronous path, leaving the
+/// old hash intact, and mode 2 for in-flight writes. This branch's CPU
+/// staging mirror must remain coherent even for undeclared writes, so
+/// explicitly rehash only the pieces whose readback has been recorded.
+/// Opt-in until the production path is tested on a D3D12 adapter.
+fn deferred_hashes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_LOOK_ONLY").is_some_and(|v| v == "1"))
+}
+
+/// Each fetched piece is complete (including the short first/last piece).
+/// Group by exact copy for the following piece-span coalescing pass.
+fn fetched_hash_runs(batch: &[FetchPiece]) -> std::collections::BTreeMap<usize, Vec<(usize, usize)>> {
+    let mut out: std::collections::BTreeMap<usize, Vec<(usize, usize)>> = Default::default();
+    for piece in batch {
+        out.entry(piece.copy).or_default().push((piece.lo, piece.hi));
+    }
+    out
+}
+
+#[test]
+fn deferred_hashes_commit_only_fetched_pieces() {
+    let start = 4096;
+    let size = 4 * PIECE;
+    let (a, b) = piece_at(start, size, 0);
+    let (c, d) = piece_at(start, size, 2);
+    let (e, f) = piece_at(start, size, 3);
+    let batch = [
+        FetchPiece { copy: 1, lo: a, hi: b, at: 0 },
+        FetchPiece { copy: 1, lo: c, hi: d, at: (b - a) as u64 },
+        FetchPiece { copy: 1, lo: e, hi: f, at: (b - a + d - c) as u64 },
+        FetchPiece { copy: 2, lo: 0, hi: PIECE, at: (b - a + d - c + f - e) as u64 },
+    ];
+    let runs = fetched_hash_runs(&batch);
+    let spans = compare_spans(start, size, Some(&runs[&1]));
+    assert_eq!(spans.iter().map(|s| (s.first, s.pieces)).collect::<Vec<_>>(), [(0, 1), (2, 2)]);
+    assert_eq!(compare_spans(0, size, Some(&runs[&2])), [card_span_of(0, 0, PIECE)]);
+    assert!(fetched_hash_runs(&[]).is_empty());
+}
+
 impl Host {
     /// Adapt the source card_before: copy CPU-dirty ranges, then hash the
     /// joined pieces on the device before the title's lists execute.
@@ -877,6 +917,7 @@ impl Host {
         if copies.is_empty() {
             return;
         }
+        let deferred = deferred_hashes();
         let scope = declared_scope(runs);
         let mut picked = picked_observation(runs);
         let plans: Vec<_> = copies.iter().enumerate().filter_map(|(copy, shadow)| {
@@ -899,7 +940,9 @@ impl Host {
             unsafe {
                 card.work.bind(&list.list, &shadow.buffer);
                 for span in spans {
-                    card_pass(&list.list, span, card.size as u32, span.first, 2);
+                    // Source's synchronous compare-only mode: no hash
+                    // is overwritten until the changed bytes are fetched.
+                    card_pass(&list.list, span, card.size as u32, span.first, if deferred { 1 } else { 2 });
                 }
                 compare_barrier(&list.list);
                 list.list.ResourceBarrier(&[transition(&card.work.differs,
@@ -964,6 +1007,29 @@ impl Host {
                         &copies[piece.copy].buffer, piece.lo as u64, (piece.hi - piece.lo) as u64);
                 }
             }
+            if deferred {
+                for (copy, ranges) in fetched_hash_runs(&batch) {
+                    let shadow = &copies[copy];
+                    let card = shadow.card().expect("fetched card copy");
+                    let (start, _) = shadow.range();
+                    let spans = compare_spans(start as usize, card.size as usize, Some(&ranges));
+                    // SAFETY: all copies for this source have been
+                    // recorded first; transition its promoted COPY_SOURCE
+                    // state to SRV for mode 0. All owners survive the
+                    // checked fence. No further title GPU work can run
+                    // between fetching and updating the hash.
+                    unsafe {
+                        list.list.ResourceBarrier(&[transition(&shadow.buffer,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                        card.work.bind(&list.list, &shadow.buffer);
+                        for span in &spans {
+                            card_pass(&list.list, span, card.size as u32, 0, 0);
+                        }
+                    }
+                    compare_barrier(&list.list);
+                }
+            }
             self.run_card_list(CardPhase::Fetch, list, submitted);
             for piece in batch {
                 // SAFETY: the checked readback fence completed; this
@@ -977,6 +1043,44 @@ impl Host {
     }
 }
 
+
+/// An actual submission changes an undeclared card buffer. Mode 1
+/// must fetch it and commit the new hash exactly once; an empty subsequent
+/// submission has no refresh/upload to hide a stale baseline.
+#[test]
+#[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_LOOK_ONLY=1 and D3D12; run alone"]
+fn deferred_card_hash_does_not_repeat_a_fetched_change() {
+    let host = host().expect("D3D12 device");
+    assert!(deferred_hashes());
+    let p = crate::watch::tests::pool(2);
+    let len = 2 * PIECE;
+    crate::shadow::register(p, p as u64, len as u64);
+    let shadow = crate::shadow::find(p as u64, len as u64).expect("registered copy");
+    let card = shadow.card().expect("device-local copy");
+    let value = 0x13572468u32;
+    // SAFETY: this test owns the two mapped title pages.
+    unsafe { (p as *mut u32).write_unaligned(0) };
+    let (upload, data) = host.upload_buffer(4).unwrap();
+    // SAFETY: the upload mapping holds four bytes.
+    unsafe { data.cast::<u32>().write_unaligned(value) };
+    let list = host.new_list().unwrap();
+    shadow.refresh(&list, p as u64, len as u64);
+    list.keep(&upload);
+    // SAFETY: an open list, live distinct resources, valid four-byte range.
+    unsafe { list.list.CopyBufferRegion(&shadow.buffer, 0, &upload, 0, 4) };
+    list.close();
+    host.execute(&[&list]);
+    assert_eq!(shadow.read_host(p as u64, 1), [value]);
+    // SAFETY: the flag readback is mapped and the check fence has completed.
+    assert_eq!(unsafe { (card.work.flags_data as *const u32).read() } & 1, 1);
+    let empty = host.new_list().unwrap();
+    empty.close();
+    host.execute(&[&empty]);
+    // SAFETY: the second full comparison has also completed.
+    assert_eq!(unsafe { (card.work.flags_data as *const u32).read() } & 1, 0);
+    assert_eq!(shadow.read_host(p as u64, 1), [value]);
+    crate::shadow::unregister(p, p as u64);
+}
 
 /// Reuse the exact three command allocators across two fenced submissions.
 /// Requires an actual adapter; the normal shader/range tests remain in CI.

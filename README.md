@@ -310,8 +310,19 @@ candidate until its turn, so a one-time observation is not dropped
 between frames. It rotates discovery over completed comparison flags,
 not GPU hashing: the normal comparison, readback and merge still run
 at their existing coverage. A removed UAV cannot be used for a later
-automatic declaration. The source's reduced GPU compare workload,
-look-only hash mode and async relay remain unported.
+automatic declaration.
+Experimental `VICTORY_CARD_LOOK_ONLY=1` uses the source's synchronous
+mode 1 compare without overwriting its baseline. The changed pieces
+still enter the existing full-coverage or declared-range readback path;
+each packed fetch batch records mode 0 rehashes of only the fetched
+pieces after its copies. The existing checked fence covers both
+operations. Unlike the source's probe-only range, a discovered change
+is still fetched into this branch's CPU mirror, so later snapshots
+cannot mistake it for a new write. This adds hashing for changed
+pieces; it does not yet reduce GPU comparison coverage or implement
+probe-only no-readback or async relay. The default is mode 2.
+Run the ignored `deferred_card_hash_does_not_repeat_a_fetched_change`
+test with the card-buffer options and `VICTORY_CARD_LOOK_ONLY=1`.
 Run the ignored `picked_writes_land_only_after_discovery` test with
 the card-buffer options and `VICTORY_PICKED_WRITES=2` on an adapter.
 These optional paths need real-adapter verification.
