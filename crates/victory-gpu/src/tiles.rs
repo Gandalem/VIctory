@@ -182,6 +182,7 @@ pub(crate) fn maintain() {
     });
 }
 
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn usage() -> (u64, u64) {
     let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     (MAPPED_BYTES.load(Relaxed), pool.len() as u64 * MAX_BYTES)
