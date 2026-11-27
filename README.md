@@ -380,10 +380,21 @@ record the next fetch while the worker merges, but waits for its
 receipt before executing into the shared readback pool or publishing
 title completion. Worker startup failure falls back to inline landing;
 a failure during landing is fatal rather than repeating a partial merge.
-This is a bounded, fenced worker port, not the source's full asynchronous
-submission pipeline: title submissions still do not overlap, and
-generation retirement and mapped-buffer access rely on the submission
-lock. Run the ignored
+Experimental `VICTORY_CARD_RELAY_FETCH=1` with the worker option ports
+the source's direct-queue RelayFetch list, allocator, private fence and
+event. Each checked fetch increments only its own fence; the send
+generation remains the last main-queue fence, since every send is
+ordered ahead of this fetch under the submission lock. The worker
+receives the actual fetch fence and completed value. Reuse the private
+list only after completion; keep the existing packed shared readback
+pool and wait for its landing receipt before reuse. Creation failure
+falls back to the main-fence path. The event closes with its owner.
+Run the ignored `private_relay_fetch_has_own_fence_and_reuses_list`
+test on a real adapter. This is a bounded, fenced worker port, not the
+source's full asynchronous submission pipeline: title submissions
+still do not overlap, and generation retirement and mapped-buffer
+access rely on the submission lock. The separate copy queue, torn-read
+protection and detached title lists remain unported. Run the ignored
 `owned_card_send_keeps_original_bytes_after_staging_changes` test with
 the card-buffer options and `VICTORY_SEND_OWN=1` on a real adapter.
 Run the ignored `card_check_tail_shares_title_fence` test on an adapter
@@ -396,7 +407,8 @@ Run the ignored `picked_writes_land_only_after_discovery` test with
 the card-buffer options and `VICTORY_PICKED_WRITES=2` on an adapter,
 including a separate run with `VICTORY_CARD_SEND_ORDER=1` and
 `VICTORY_CARD_RELAY_MERGE=1`, and another with
-`VICTORY_CARD_RELAY_WORKER=1` as well.
+`VICTORY_CARD_RELAY_WORKER=1` as well, including a separate run with
+`VICTORY_CARD_RELAY_FETCH=1`.
 These optional paths need real-adapter verification.
 Loose windows and exact-view arenas stay on the existing path. Run the
 ignored `carded_shadow_refresh_compare_and_copy_back` test with
