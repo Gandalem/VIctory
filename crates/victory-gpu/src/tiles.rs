@@ -290,7 +290,8 @@ impl Mapping {
         self.mapped == self.every_level()
     }
 
-    /// Reference first_shown: first held or card-authored mapped level.
+    /// Reference first_shown, retained for isolated policy/readback tests.
+    #[cfg(test)]
     fn first_shown(&self) -> Option<u32> {
         let shown = self.visible_mask();
         (shown != 0).then(|| shown.trailing_zeros())
@@ -303,24 +304,23 @@ impl Mapping {
     /// Port the reference Tiled::uploaded_on admission policy: title-held
     /// MIPs may wait for memory room; GPU-authored MIPs never wait.
     /// Existing backing is kept even if a later title judgement shrinks.
-    /// Returns (first shown changed, named levels still missing).
+    /// Returns whether any named levels still lack physical backing.
+    /// This is allocation only; do not treat zero-filled packed siblings
+    /// as source content or publish them before the real upload fence.
     ///
     /// SAFETY: same queue/state exclusion as map_more. Newly admitted
     /// groups are zero-initialized, not yet filled from title memory.
-    /// Live partial publication needs the actual upload fence as well.
     unsafe fn admit_held(
         &mut self, host: &crate::host::Host, texture: &ID3D12Resource,
         desc: &D3D12_RESOURCE_DESC, held: u32, room: bool,
         before: D3D12_RESOURCE_STATES,
-    ) -> Option<(bool, bool)> {
-        let previous = self.first_shown();
+    ) -> Option<bool> {
         let held = held & self.every_level();
         let named = held | self.card;
         let wanted = if room { named } else { self.card };
         // SAFETY: inherited caller's queue and state exclusion.
         let mapped = unsafe { self.map_more(host, texture, desc, wanted, before) }?;
-        self.held = held;
-        Some((previous != self.first_shown(), named & !mapped != 0))
+        Some(named & !mapped != 0)
     }
 
     /// Add only the missing groups. Allocation is transactional until the
@@ -369,6 +369,8 @@ pub(crate) unsafe fn prepare_backing(
     // and completes its fence before returning.
     let desc = unsafe { copy.texture.GetDesc() };
     let before = D3D12_RESOURCE_STATES(copy.state.load(Relaxed) as i32);
+    // SAFETY: the submission lock excludes GPU access, and before is
+    // the resource's actual state from the last completed submission.
     let result = unsafe { state.map_more(host, &copy.texture, &desc, missing, before) };
     state.unclaim(missing);
     result.is_some_and(|mapped| mapped & requested == requested)
@@ -793,12 +795,16 @@ pub(crate) fn make(host: &crate::host::Host, desc: &D3D12_RESOURCE_DESC,
     let mut state = mapping.lock().unwrap_or_else(|e| e.into_inner());
     let all = state.every_level();
     // SAFETY: reserve returned an unpublished COMMON-state resource.
-    let (_, waiting) = unsafe {
+    let waiting = unsafe {
         state.admit_held(host, &texture, &desc, all, true, D3D12_RESOURCE_STATE_COMMON)
     }?;
     if waiting || state.mapped != all {
         return None;
     }
+    // Production deliberately treats the completely zero-initialized
+    // chain as visible, matching the committed-resource baseline. The
+    // partial admission path itself must never publish source bytes.
+    state.held = all;
     let bytes = state.given_bytes();
     drop(state);
     Some((texture, bytes, mapping))
@@ -1100,28 +1106,39 @@ mod tests {
             // SAFETY: this resource is unpublished, in COMMON, and no
             // other list accesses it. Each mapper pass waits for its fence.
             assert_eq!(unsafe { state.admit_held(host, &texture, &desc,
-                1 << 7, false, D3D12_RESOURCE_STATE_COMMON) }, Some((false, true)));
+                1 << 7, false, D3D12_RESOURCE_STATE_COMMON) }, Some(true));
             assert_eq!(state.mapped, 0);
             assert_eq!(usage().0, before);
+            // SAFETY: the resource remains unpublished, in COMMON.
             assert_eq!(unsafe { state.admit_held(host, &texture, &desc,
-                1 << 7, true, D3D12_RESOURCE_STATE_COMMON) }, Some((true, false)));
+                1 << 7, true, D3D12_RESOURCE_STATE_COMMON) }, Some(false));
             assert_eq!(state.mapped, tail);
+            assert_eq!(state.first_shown(), None);
+            // Simulate completion of a source upload of the coarse MIP.
+            assert!(state.source_wrote(1 << 7));
             assert_eq!(state.first_shown(), Some(7));
             let tail_bytes = state.given_bytes();
-            // A new held level waits without discarding the existing tail.
+            // SAFETY: as above; a new held level waits without discarding
+            // the tail or exposing its not-yet-uploaded siblings.
             assert_eq!(unsafe { state.admit_held(host, &texture, &desc,
-                all, false, D3D12_RESOURCE_STATE_COMMON) }, Some((false, true)));
+                all, false, D3D12_RESOURCE_STATE_COMMON) }, Some(true));
             assert_eq!(state.given_bytes(), tail_bytes);
+            assert_eq!(state.visible_mask(), 1 << 7);
+            // SAFETY: the resource remains unpublished, in COMMON.
             assert_eq!(unsafe { state.admit_held(host, &texture, &desc,
-                all, true, D3D12_RESOURCE_STATE_COMMON) }, Some((true, false)));
+                all, true, D3D12_RESOURCE_STATE_COMMON) }, Some(false));
             assert_eq!(state.mapped, all);
+            assert_eq!(state.first_shown(), Some(7));
+            assert!(state.source_wrote(all));
             assert_eq!(state.first_shown(), Some(0));
             let bytes = state.given_bytes();
             assert!(bytes > tail_bytes);
-            // The reference keeps backing until the resource is released.
+            // SAFETY: as above. The reference keeps backing and this
+            // allocation-only pass does not hide completed source levels.
             assert_eq!(unsafe { state.admit_held(host, &texture, &desc,
-                1 << 7, true, D3D12_RESOURCE_STATE_COMMON) }, Some((true, false)));
+                1 << 7, true, D3D12_RESOURCE_STATE_COMMON) }, Some(false));
             assert_eq!(state.mapped, all);
+            assert_eq!(state.visible_mask(), all);
             assert_eq!(state.given_bytes(), bytes);
         }
         assert_eq!(read_texels(host, &texture, &desc, [0, 7]), [0, 0]);

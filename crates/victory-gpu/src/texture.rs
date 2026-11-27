@@ -87,6 +87,14 @@ struct Last {
 }
 
 impl Last {
+    /// A remap can erase host bytes without changing title source hashes.
+    /// Discard untracked digests and preserve pending ranges. Tracked
+    /// refreshes also force a fresh read via the staging retry flag.
+    fn invalidate_source(&mut self) {
+        self.hash = None;
+        self.span_hashes.clear();
+    }
+
     fn requested(&self, mips: u32) -> u32 {
         if self.full_initialized { mips } else { u32::MAX }
     }
@@ -526,7 +534,10 @@ fn upload_mask(list: &HostList, resource: This, texture: &ID3D12Resource, mips: 
     // A later table may request another range, or an explicit copy may
     // require the whole chain. The list unions them instead of dropping
     // every request after the first one.
-    if copy.texture.as_raw() == texture.as_raw() {
+    if copy.texture.as_raw() == texture.as_raw()
+        && copy.staging.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &staging))
+    {
         list.defer_texture(staging, copy, mips);
     }
 }
@@ -1044,7 +1055,12 @@ impl Staging {
     /// A newly admitted group must be refreshed even when its source
     /// tracker/digest is unchanged. The ordinary refresh owns the bytes.
     pub(crate) fn retry_after_backing(&self) {
-        self.retry.store(true, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        last.invalidate_source();
+        self.retry.store(true, Relaxed);
+        // No earlier private upload may acknowledge the invalidated state.
+        self.revision.fetch_add(1, Relaxed);
     }
 
     /// Whether its memory may have changed since it was last detiled (an
@@ -1390,6 +1406,12 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// (one for all title textures of its memory).
 pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
+    // The resource could have acquired another host copy after the
+    // caller read its texture. Never cache footprints for one D3D
+    // resource in a different host copy's staging.
+    if copy.texture.as_raw() != texture.as_raw() {
+        return None;
+    }
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = held.as_ref() {
         return Some(s.clone());
@@ -1459,6 +1481,24 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remapped_source_invalidates_digest_without_losing_pending_levels() {
+        let mut last = Last {
+            hash: Some(blake3::hash(b"unchanged title bytes")),
+            pending_mips: 0b0100,
+            full_initialized: true,
+            ..Default::default()
+        };
+        last.invalidate_source();
+        assert!(last.hash.is_none());
+        assert!(last.span_hashes.is_empty());
+        assert_eq!(last.pending_mips, 0b0100);
+        assert!(last.full_initialized);
+        assert_eq!(last.select_uploads(4, 0b0101, &[0, 1, 2, 3]), [0, 2]);
+        last.acknowledge(&[0, 2], 4);
+        assert_eq!(last.pending_mips, 0b1010);
+    }
 
     #[test]
     fn held_judgement_uses_view_start_neighbour_and_committed_spans() {

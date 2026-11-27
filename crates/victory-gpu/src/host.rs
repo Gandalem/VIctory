@@ -1197,13 +1197,14 @@ enum Step {
     Memory(usize),
 }
 
-/// What a list does on the CPU when it is submitted: copies between host
-/// memory regions (title buffers, upload buffers and buffer copies), and
-/// the upload buffers its GPU commands read, kept until the list is reset.
+/// Merged tile-source writes keyed by exact host-copy identity.
 type TileSources = std::collections::BTreeMap<
     usize, (std::sync::Arc<crate::resource::HostTexture>, u32)
 >;
 
+/// What a list does on the CPU when it is submitted: copies between host
+/// memory regions (title buffers, upload buffers and buffer copies), and
+/// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
     /// Destination, source, bytes.

@@ -477,7 +477,12 @@ waiting-source retry is adapted for nonmandatory bindless refreshes:
 before detiling, missing backing is admitted only when there is room.
 A failed admission leaves the dirty tracker and hashes untouched and
 waits before retrying. Successful new backing forces a fresh source
-read; no upload buffer is retained during the wait. Explicit table/copy
+read, invalidates untracked digests and older speculative revisions
+while preserving pending levels; no upload buffer is retained during
+the wait. Allocation-only held-level admission never publishes a MIP:
+a packed sibling's zero initialization is not a completed source
+upload. The full-chain production fallback explicitly keeps its
+zero-initialized visibility. Explicit table/copy
 requests and recorded GPU writes retain mandatory admission. Ahead and
 baked uploads decline incomplete backing so they cannot consume the
 waiting source's dirty state.

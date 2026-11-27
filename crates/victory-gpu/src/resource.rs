@@ -1669,7 +1669,8 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void, title_fed: b
         };
         let made = if defer && (first.is_err() || texture.is_none()) {
             texture = None;
-            // Preserve the castable-format path if the flag is unsupported.
+            // SAFETY: same validated description, clear value and output;
+            // retry the castable-format path without the unsupported flag.
             unsafe {
                 device.CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc1,
                     D3D12_BARRIER_LAYOUT_COMMON, clear_value, None::<&ID3D12ProtectedResourceSession>,
