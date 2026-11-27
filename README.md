@@ -248,6 +248,17 @@ unmixed blocks copied in bulk, and mixed blocks merged byte by byte.
 Temporary CPU read buffers reuse the bounded pool and are allocated only
 when needed. The mapped-memory checks and write tracking are unchanged.
 
+Experimental `VICTORY_EXACT_BACK=1` ports the exact changed-run search
+from cool_fox's selective copy-back. Declared-write pieces are merged
+using the existing GPU-wins-on-collision rule, then only changed byte
+runs are written to title memory (at most 64 writes per piece; a more
+fragmented piece falls back to the original full-piece write). The
+temporary before-merge buffer uses the existing bounded scratch pool.
+Changed pieces stay dirty for the next refresh, rather than claiming
+that a concurrent title write outside the landed ranges was mirrored.
+The option is off by default, and does not change marked-page copy-back
+or introduce a GPU comparison shader or asynchronous readback.
+
 Diagnostics report the logical refresh gap and already-covered bytes
 avoided since the last report. These counters are not physical PCIe
 transfer measurements. No new GPU-local mirror, shared-heap mapping,

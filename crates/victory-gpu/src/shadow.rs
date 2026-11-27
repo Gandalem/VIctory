@@ -320,6 +320,57 @@ fn merge_waited_piece(host: &mut [u8], old: &[u8], title: &mut [u8]) -> bool {
     changed
 }
 
+// Ported from cool_fox (f4b48ad): use the exact changed byte runs rather
+// than putting an entire piece back after a shader changed a few bytes.
+/// The runs of bytes where `now` differs from `was` (of one length), as
+/// (offset, bytes) in order: every differing byte is in a run and no equal
+/// byte is.
+fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    let n = now.len().min(was.len());
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < n {
+        // Equal bytes, many at a time while they last (a page looked at
+        // under a flight's writes hardly ever differs at all).
+        while i + 512 <= n && now[i..i + 512] == was[i..i + 512] {
+            i += 512;
+        }
+        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+            i += 8;
+        }
+        while i < n && now[i] == was[i] {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let first = i;
+        while i < n && now[i] != was[i] {
+            i += 1;
+        }
+        runs.push((first, i - first));
+    }
+    runs
+}
+
+/// Opt in to the reference's selective copy-back; the existing full-piece
+/// path remains the default until game/hardware regression tests pass.
+fn exact_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_BACK").is_some_and(|v| v == "1"))
+}
+
+/// Plan a bounded number of kernel writes. Highly fragmented changes use
+/// the existing full-piece path rather than issuing thousands of syscalls.
+fn waited_write_ranges(merged: &[u8], before: &[u8]) -> Vec<(usize, usize)> {
+    let runs = changed_runs(merged, before);
+    if runs.len() > 64 {
+        vec![(0, merged.len())]
+    } else {
+        runs
+    }
+}
+
 // SAFETY: D3D12 resources are free-threaded. The persistent mapping has
 // one writer per Shadow during a synchronous submission. Batch workers
 // operate on distinct Shadow allocations; the submitting thread joins
@@ -616,6 +667,8 @@ impl Shadow {
             const PIECE: usize = 64 << 10;
             // Unchanged shader ranges need no temporary CPU buffer at all.
             let mut title: Option<Vec<u8>> = None;
+            let mut original: Option<Vec<u8>> = None;
+            let exact = exact_back();
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -643,17 +696,43 @@ impl Shadow {
                     if crate::host::read_into((start + at) as *const u8, scratch) {
                         // Preserve CPU writes where the GPU did not write.
                         // The common unchanged blocks can be merged in bulk.
-                        if merge_waited_piece(host, old, scratch) {
-                            let _writing = crate::watch::writing(start + at, n);
-                            crate::host::write_mapped((start + at) as *mut u8, scratch.as_ptr(), n);
-                            written += n;
+                        if exact {
+                            let saved = original.get_or_insert_with(|| {
+                                let mut v = pooled(PIECE);
+                                v.resize(PIECE, 0);
+                                v
+                            });
+                            saved[..n].copy_from_slice(scratch);
                         }
-                        synced.push((start + at) / PAGE);
+                        let changed = merge_waited_piece(host, old, scratch);
+                        if changed {
+                            let _writing = crate::watch::writing(start + at, n);
+                            if exact {
+                                let saved = original.as_ref().expect("exact copy-back snapshot");
+                                for (offset, bytes) in waited_write_ranges(scratch, &saved[..n]) {
+                                    crate::host::write_mapped((start + at + offset) as *mut u8,
+                                        scratch[offset..].as_ptr(), bytes);
+                                    written += bytes;
+                                }
+                            } else {
+                                crate::host::write_mapped((start + at) as *mut u8, scratch.as_ptr(), n);
+                                written += n;
+                            }
+                        }
+                        // Selective writes can leave a concurrent title change
+                        // in an untouched byte. Keep that page dirty for its
+                        // next refresh instead of claiming a complete sync.
+                        if !exact || !changed {
+                            synced.push((start + at) / PAGE);
+                        }
                     }
                 }
                 at += n;
             }
             if let Some(v) = title {
+                give_back(v);
+            }
+            if let Some(v) = original {
                 give_back(v);
             }
             // Pages made equal to title memory are current in the copy, so
@@ -1593,6 +1672,56 @@ pub(crate) mod tests {
         assert_eq!(pool.bytes, MAX_POOL_ENTRIES);
     }
 
+
+    #[test]
+    fn changed_runs_are_exactly_the_bytes_that_differ() {
+        let was: Vec<u8> = (0..300u32).map(|i| (i * 13 + 5) as u8).collect();
+        for changes in [vec![], vec![0], vec![299], vec![7, 8, 9], vec![7, 9], vec![15, 16, 17, 23, 24, 64, 65, 66, 67, 68, 69, 70, 71, 72, 298, 299]] {
+            let mut now = was.clone();
+            for &at in &changes {
+                now[at] ^= 0x41;
+            }
+            let runs = changed_runs(&now, &was);
+            let mut put = was.clone();
+            let mut held = Vec::new();
+            for &(at, n) in &runs {
+                assert!(n > 0);
+                put[at..at + n].copy_from_slice(&now[at..at + n]);
+                held.extend(at..at + n);
+            }
+            assert_eq!(put, now, "{changes:?}");
+            assert_eq!(held, changes, "{changes:?}");
+            // Runs do not touch: two that did would be one.
+            assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
+        }
+        assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn waited_write_ranges_keep_sparse_writes_and_bound_dense_calls() {
+        let old = vec![0u8; PAGE];
+        let mut host = old.clone();
+        let mut title = old.clone();
+        host[5] = 7;
+        host[9] = 8;
+        title[7] = 9;
+        title[40_000] = 11;
+        let original = title.clone();
+        assert!(merge_waited_piece(&mut host, &old, &mut title));
+        let plan = waited_write_ranges(&title, &original);
+        assert_eq!(plan, [(5, 1), (9, 1)]);
+        let mut landed = original;
+        // A title write between the merge and the write-back is outside
+        // the planned writes and must survive.
+        landed[7] = 12;
+        for (at, len) in plan {
+            landed[at..at + len].copy_from_slice(&title[at..at + len]);
+        }
+        assert_eq!((landed[5], landed[7], landed[9], landed[40_000]), (7, 12, 8, 11));
+        let dense: Vec<u8> = (0..PAGE).map(|i| (i % 2) as u8).collect();
+        assert_eq!(waited_write_ranges(&dense, &old), [(0, PAGE)]);
+        assert!(waited_write_ranges(&old, &old).is_empty());
+    }
 
     #[test]
     fn waited_copyback_merge_matches_the_original_bytewise_rule() {
