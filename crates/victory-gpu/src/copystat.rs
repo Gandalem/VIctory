@@ -312,6 +312,8 @@ pub(crate) fn log(frames: f64) {
     );
     let (snapshots, cached, limit, loose, loose_bytes) = crate::shadow::cache_stats();
     let memory = crate::shadow::memory_status();
+    let video = crate::host::video_memory_bytes();
+    let (sampled, targets) = crate::resource::texture_budget_usage();
     let [gaps, covered] = crate::host::take_refresh_savings();
     tracing::info!(refresh_gap_scope_bytes = gaps, refresh_already_covered_bytes = covered,
         "buffer refresh scope avoided (logical bytes since last report)");
@@ -319,6 +321,13 @@ pub(crate) fn log(frames: f64) {
         working_set_mib = ?process.map(|m| m[0] >> 20),
         private_commit_mib = ?process.map(|m| m[1] >> 20),
         memory_pressure = crate::shadow::memory_pressured(),
+        dxgi_pressure = crate::host::video_memory_pressured(),
+        local_budget_mib = ?video.map(|m| m[0] >> 20),
+        local_usage_mib = ?video.map(|m| m[1] >> 20),
+        nonlocal_budget_mib = ?video.map(|m| m[2] >> 20),
+        nonlocal_usage_mib = ?video.map(|m| m[3] >> 20),
+        sampled_texture_logical_mib = sampled >> 20,
+        target_texture_logical_mib = targets >> 20,
         physical_free_mib = ?memory.map(|m| m.1 >> 20),
         available_commit_mib = ?memory.map(|m| m.2 >> 20),
         idle_cpu_buffer_count = snapshots,

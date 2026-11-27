@@ -118,10 +118,14 @@ const KEPT_BYTES: u64 = 64 << 20;
 /// Called before a submission's uploads: the buffers of the last one are
 /// free again (the oldest dropped past `KEPT_BYTES`).
 pub(crate) fn recycle() {
+    // The previous submission has completed; only idle allocations are reclaimed.
+    // Follow the former upload_pool idle-limit policy on RAM or DXGI pressure.
+    let pressure = crate::shadow::memory_pressured() || crate::host::video_memory_pressured();
+    let (kept_bytes, chunks_kept) = if pressure { (0, 0) } else { (KEPT_BYTES, CHUNKS_KEPT) };
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
         (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
+        c.all.truncate(chunks_kept);
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
@@ -129,7 +133,7 @@ pub(crate) fn recycle() {
         b.free_bytes += e.0;
         b.free.push_back(e);
     }
-    while b.free_bytes > KEPT_BYTES
+    while b.free_bytes > kept_bytes
         && let Some((n, ..)) = b.free.pop_front()
     {
         b.free_bytes -= n;

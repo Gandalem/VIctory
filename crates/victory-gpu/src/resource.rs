@@ -812,8 +812,9 @@ pub(crate) struct HostTexture {
     /// A depth texture's writable twin (`crate::twin`), made with its first
     /// unordered access view; `None` inside if it has none.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
-    /// Bytes it takes on the host GPU.
+    /// Logical allocation size, not resident bytes.
     bytes: u64,
+    sampled: bool,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
     /// A shader-visible heap slot viewed it (diagnostics: [`texture_census`]).
@@ -836,10 +837,15 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
-        let bytes = crate::host::host().map_or(0, |h| {
-            // SAFETY: plain queries on a live resource.
-            unsafe { h.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes
-        });
+        // SAFETY: plain query on a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        let sampled = desc.Flags.0 & USES as i32 == 0;
+        let bytes = tile_bytes.unwrap_or_else(|| crate::host::host().map_or(0, |h| {
+            // SAFETY: valid descriptor.
+            let size = unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
+            if size == u64::MAX { 0 } else { size }
+        }));
+        texture_kind_bytes(sampled).fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
@@ -850,6 +856,7 @@ impl HostTexture {
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
+            sampled,
             used: false.into(),
             viewed: false.into(),
             key: None,
@@ -911,6 +918,23 @@ static USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 static TEXTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(windows)]
 static TEXTURE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Logical allocation accounting, separate from DXGI segment usage.
+#[cfg(windows)]
+static SAMPLED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static TARGET_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+fn texture_kind_bytes(sampled: bool) -> &'static std::sync::atomic::AtomicU64 {
+    if sampled { &SAMPLED_BYTES } else { &TARGET_BYTES }
+}
+
+#[cfg(windows)]
+pub(crate) fn texture_budget_usage() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (SAMPLED_BYTES.load(Relaxed), TARGET_BYTES.load(Relaxed))
+}
+
 /// Title textures that found their memory's host texture made already.
 #[cfg(windows)]
 static SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -958,6 +982,7 @@ impl Drop for HostTexture {
         }
         TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        texture_kind_bytes(self.sampled).fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         if *self.used.get_mut() {
             USED.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1539,13 +1564,80 @@ pub(crate) const IDLE_FRAMES: u64 = 300;
 /// A use stamp's frame for "never" (tests).
 #[cfg(windows)]
 const NEVER: u64 = u64::MAX;
-/// Past this share of the card's memory budget, host textures fed from
-/// title memory are given up least recently used first, until the card's
-/// use is back under [`BUDGET_LOW`].
 #[cfg(windows)]
-const BUDGET_HIGH: f64 = 0.90;
+fn configured_texture_budget() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0).map(|v| v.min(65536) << 20))
+}
+
 #[cfg(windows)]
-const BUDGET_LOW: f64 = 0.85;
+fn configured_target_reserve() -> u64 {
+    static RESERVE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESERVE.get_or_init(|| std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(3072).min(8192) << 20)
+}
+
+#[cfg(windows)]
+fn recovery_margin(budget: u64) -> u64 {
+    (budget / 20).min(256 << 20)
+}
+
+#[cfg(windows)]
+fn local_used(budget: u64, usage: u64, sampled: u64, nonresident: u64, targets: u64, reserve: u64) -> u64 {
+    // DXGI usage is authoritative. Do not subtract nonresident bytes from
+    // it: the driver can report stale residency or count allocation costs
+    // differently. Only subtract them from our logical lower-bound estimate.
+    usage.max(sampled.saturating_sub(nonresident).saturating_add(targets))
+        .saturating_add(reserve.min(budget / 3).saturating_sub(targets))
+}
+
+#[cfg(windows)]
+fn local_ceiling(budget: u64, percent: u64) -> u64 {
+    (u128::from(budget) * u128::from(percent.min(100)) / 100) as u64
+}
+
+#[cfg(windows)]
+fn reclaim_goal(limit: Option<u64>, video: Option<[u64; 4]>, sampled: u64,
+    targets: u64, reserve: u64, percent: u64) -> u64
+{
+    let resident = sampled;
+    let own = limit.filter(|&limit| resident >= limit).map_or(0, |limit| resident.saturating_sub(limit.saturating_sub(recovery_margin(limit))));
+    let local = video.filter(|v| v[0] != 0).map_or(0, |[budget, usage, ..]| {
+        let used = local_used(budget, usage, sampled, 0, targets, reserve);
+        let ceiling = local_ceiling(budget, percent);
+        if used > ceiling {
+            used.saturating_sub(ceiling.saturating_sub(recovery_margin(budget)))
+        } else { 0 }
+    });
+    own.max(local).min(resident)
+}
+
+/// Upstream's normal texture eviction thresholds retain their five-point
+/// recovery margin. Explicit sampled budget or target reserve opts into
+/// the fork's logical allocation policy, without changing resource shape.
+#[cfg(windows)]
+fn budget_reclaim(video: Option<[u64; 4]>, free: u64) -> u64 {
+    let percent = crate::host::video_room_percent();
+    let limit = configured_texture_budget();
+    let reserve_enabled = limit.is_some() || std::env::var_os("VICTORY_CARD_ROOM_FOR_TARGETS_MB").is_some();
+    // Free space in placed texture heaps is available for new textures.
+    let video = video.map(|[b, u, nb, nu]| [b, u.saturating_sub(free), nb, nu]);
+    if limit.is_some() || reserve_enabled {
+        let (sampled, targets) = texture_budget_usage();
+        let reserve = if reserve_enabled { configured_target_reserve() } else { 0 };
+        return reclaim_goal(limit, video, sampled, targets, reserve, percent);
+    }
+    video.map_or(0, |[budget, used, ..]| {
+        let high = local_ceiling(budget, percent);
+        if budget != 0 && used > high {
+            used.saturating_sub(local_ceiling(budget, percent.saturating_sub(5)))
+        } else { 0 }
+    })
+}
+
 /// A texture made again within this many frames of being given up counts
 /// as remade soon ([`EVICTIONS`]): too eager an [`IDLE_MS`].
 #[cfg(windows)]
@@ -1583,8 +1675,8 @@ fn evictable(t: &HostTexture) -> bool {
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
-/// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
-/// the card's budget the least recently used ones until [`BUDGET_LOW`].
+/// that the title has not used for [`IDLE_MS`], and least recently used
+/// textures to recover configured local or sampled texture headroom.
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1593,12 +1685,7 @@ pub(crate) fn evict_unused() {
     if LAST.swap(frame, Relaxed) == frame {
         return;
     }
-    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
-        // Free space in the heaps of textures takes the card's memory but
-        // is not in use: new textures go there first.
-        let used = used - crate::placement::free_bytes() as f64 / 1e6;
-        if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
-    });
+    let over = budget_reclaim(crate::host::video_memory_for_eviction(), crate::placement::free_bytes());
     evict(frame, now_ms(), over);
 }
 
@@ -2755,6 +2842,19 @@ mod tests {
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
+    #[cfg(windows)]
+    #[test]
+    fn texture_budget_reclaims_sampled_bytes_and_reserves_target_headroom() {
+        let mb = 1u64 << 20;
+        let video = Some([8000 * mb, 6000 * mb, 0, 0]);
+        assert_eq!(reclaim_goal(None, video, 5000 * mb, 1500 * mb, 2000 * mb, 90), 0);
+        assert_eq!(reclaim_goal(None, video, 5000 * mb, 500 * mb, 2000 * mb, 90), 556 * mb);
+        assert_eq!(reclaim_goal(Some(1000 * mb), None, 1100 * mb, 0, 0, 90), 150 * mb);
+        assert_eq!(reclaim_goal(Some(1000 * mb), None, 950 * mb, 0, 0, 90), 0);
+        assert_eq!(reclaim_goal(None, Some([8000 * mb, 1000 * mb, 8000 * mb, 7999 * mb]),
+            500 * mb, 0, 0, 90), 0);
+    }
+
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {

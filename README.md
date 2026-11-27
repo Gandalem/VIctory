@@ -253,6 +253,26 @@ avoided since the last report. These counters are not physical PCIe
 transfer measurements. No new GPU-local mirror, shared-heap mapping,
 or asynchronous submission lifetime is introduced here.
 
+## GPU memory budget (experimental)
+
+DXGI local/nonlocal process usage and budget are observed separately.
+Pressure queries reuse the last valid segment samples for up to 100 ms;
+the eviction pass still requires a fresh local observation.
+`VICTORY_TEXTURE_ROOM_PERCENT` (50–97, default 90) selects the local
+pressure threshold. The normal upstream texture eviction policy keeps
+its five-percentage-point recovery margin. Scratch and idle texture upload
+allocations are trimmed under CPU or DXGI pressure, never during active GPU
+work.
+
+A positive `VICTORY_TEXTURE_BUDGET_MB` opts into a soft logical sampled
+texture budget. `VICTORY_CARD_ROOM_FOR_TARGETS_MB` selects outstanding
+render-target headroom (default 3072 MiB when the sampled budget is set,
+limited to one third of the reported local budget). Only upstream
+evictable textures are reclaimed; required resources are not rejected.
+Logical allocation counters are not measurements of resident VRAM.
+Full-resolution texture shapes are unchanged; the previous branch's
+optional MIP reduction is not enabled by these settings.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

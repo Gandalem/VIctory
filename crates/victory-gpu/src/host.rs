@@ -353,11 +353,52 @@ fn log_gpu_times(frames: f64) {
     }
 }
 
-/// Diagnostics: the host device's video memory use and budget, in MB, local
-/// (on the card) and non-local (system memory the GPU reads), as the
-/// system's memory manager sees them: use over budget makes it page
-/// allocations at submissions.
-pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
+/// DXGI process-local accounting: local budget/usage and nonlocal
+/// budget/usage. Sample at most once per 100 ms, preserving the last good
+/// sample if the driver cannot answer.
+#[derive(Default)]
+struct VideoBudget {
+    checked: Option<Instant>,
+    memory: Option<[u64; 4]>,
+    pressure: bool,
+}
+
+static VIDEO_PRESSURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn video_room_percent() -> u64 {
+    static PERCENT: OnceLock<u64> = OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(90).clamp(50, 97)
+    })
+}
+
+fn next_video_pressure(was: bool, budget: u64, usage: u64, percent: u64) -> bool {
+    if budget == 0 {
+        return false;
+    }
+    let threshold = if was { percent.saturating_sub(10) } else { percent };
+    u128::from(usage) * 100 >= u128::from(budget) * u128::from(threshold)
+}
+
+// Local and non-local queries fail independently. Keep the last good
+// segment rather than losing a current local budget because the other
+// segment failed. A zero local budget is not a usable local observation.
+fn merge_video_memory(previous: Option<[u64; 4]>, local: Option<(u64, u64)>,
+    nonlocal: Option<(u64, u64)>) -> Option<[u64; 4]>
+{
+    let (budget, usage) = local.filter(|&(budget, _)| budget != 0)
+        .or_else(|| previous.map(|[b, u, ..]| (b, u)))?;
+    let (shared_budget, shared_usage) = nonlocal
+        .or_else(|| previous.map(|[_, _, b, u]| (b, u))).unwrap_or((0, 0));
+    Some([budget, usage, shared_budget, shared_usage])
+}
+
+/// Byte-valued DXGI observations. Force a new local measurement for each
+/// upstream eviction pass; do not reclaim repeatedly from a stale sample.
+/// Diagnostic and pressure-only callers may reuse the 100 ms cache.
+fn sample_video_memory(fresh: bool) -> Option<[u64; 4]> {
     static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
     let adapter = ADAPTER
         .get_or_init(|| {
@@ -370,13 +411,61 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
             }
         })
         .as_ref()?;
-    let info = |group| {
-        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        // SAFETY: a valid out pointer.
-        unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
-        Some((info.CurrentUsage as f64 / 1e6, info.Budget as f64 / 1e6))
+    static STATE: OnceLock<Mutex<VideoBudget>> = OnceLock::new();
+    let mut state = STATE.get_or_init(|| Mutex::new(VideoBudget::default()))
+        .lock().unwrap_or_else(|e| e.into_inner());
+    // Adapt the reference renderer's 100 ms room-query cache. A
+    // large streaming sweep may outlast a whole one-second interval.
+    if !fresh && state.checked.is_some_and(|at| at.elapsed() < Duration::from_millis(100)) {
+        return state.memory;
+    }
+    state.checked = Some(Instant::now());
+    let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    let mut nonlocal = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: the structures are valid writable DXGI outputs.
+    let local_ok = unsafe {
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).is_ok()
     };
-    Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
+    let nonlocal_ok = unsafe {
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal).is_ok()
+    };
+    let memory = merge_video_memory(state.memory,
+        local_ok.then_some((local.Budget, local.CurrentUsage)),
+        nonlocal_ok.then_some((nonlocal.Budget, nonlocal.CurrentUsage)));
+    let Some([local_budget, local_usage, nonlocal_budget, nonlocal_usage]) = memory else {
+        return state.memory;
+    };
+    let pressure = next_video_pressure(state.pressure, local_budget, local_usage, video_room_percent())
+        || next_video_pressure(state.pressure, nonlocal_budget, nonlocal_usage, video_room_percent());
+    if pressure != state.pressure {
+        tracing::info!(pressure, local_budget_mib = local_budget >> 20,
+            local_usage_mib = local_usage >> 20, nonlocal_budget_mib = nonlocal_budget >> 20,
+            nonlocal_usage_mib = nonlocal_usage >> 20, "DXGI memory pressure changed");
+    }
+    state.pressure = pressure;
+    state.memory = memory;
+    VIDEO_PRESSURE.store(pressure, Ordering::Relaxed);
+    if fresh && (!local_ok || local.Budget == 0) { None } else { state.memory }
+}
+
+pub(crate) fn video_memory_bytes() -> Option<[u64; 4]> {
+    sample_video_memory(false)
+}
+
+pub(crate) fn video_memory_for_eviction() -> Option<[u64; 4]> {
+    sample_video_memory(true)
+}
+
+/// Preserve the upstream diagnostic API: usage and budget in decimal MB.
+pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
+    video_memory_bytes().map(|[b, u, nb, nu]| [
+        (u as f64 / 1e6, b as f64 / 1e6),
+        (nu as f64 / 1e6, nb as f64 / 1e6),
+    ])
+}
+
+pub(crate) fn video_memory_pressured() -> bool {
+    VIDEO_PRESSURE.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -614,6 +703,27 @@ pub(crate) mod tests {
         for &object in &objects {
             assert_eq!(crate::texture::uploads(object), 1, "unchanged: not again");
         }
+    }
+
+    #[test]
+    fn dxgi_pressure_tracks_the_actual_budget_and_recovers_with_hysteresis() {
+        assert!(!next_video_pressure(false, 0, 100, 90));
+        assert!(!next_video_pressure(false, 100, 89, 90));
+        assert!(next_video_pressure(false, 100, 90, 90));
+        assert!(next_video_pressure(true, 100, 80, 90));
+        assert!(!next_video_pressure(true, 100, 79, 90));
+        assert!(next_video_pressure(false, 80, 75, 90));
+    }
+
+    #[test]
+    fn dxgi_keeps_each_last_good_segment_independently() {
+        assert_eq!(merge_video_memory(None, None, Some((100, 50))), None);
+        assert_eq!(merge_video_memory(None, Some((100, 20)), None), Some([100, 20, 0, 0]));
+        let old = Some([100, 20, 200, 30]);
+        assert_eq!(merge_video_memory(old, Some((80, 75)), None), Some([80, 75, 200, 30]));
+        assert_eq!(merge_video_memory(old, None, Some((150, 60))), Some([100, 20, 150, 60]));
+        assert_eq!(merge_video_memory(old, Some((0, 0)), Some((0, 0))), Some([100, 20, 0, 0]));
+        assert_eq!(merge_video_memory(old, None, None), old);
     }
 
     #[test]
@@ -985,7 +1095,7 @@ fn scratch_keep_bytes() -> u64 {
             .unwrap_or(4)
             .min(64) << 20
     });
-    idle_scratch_budget(configured, crate::shadow::memory_pressured())
+    idle_scratch_budget(configured, crate::shadow::memory_pressured() || video_memory_pressured())
 }
 
 fn idle_scratch_budget(configured: u64, pressure: bool) -> u64 {
@@ -1213,6 +1323,8 @@ impl Host {
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
+        // Refresh pressure even on submissions without a new presented frame.
+        video_memory_bytes();
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
