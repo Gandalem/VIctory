@@ -1241,12 +1241,64 @@ type TileSources = std::collections::BTreeMap<
     usize, (std::sync::Arc<crate::resource::HostTexture>, u32)
 >;
 
+/// Verify the real send/settle boundary: a queue Signal alone does not
+/// publish callbacks or bottom-of-pipe values. The same guarded sent
+/// state must survive until the checked title fence and copy-back.
+#[test]
+#[ignore = "requires D3D12 adapter; run alone"]
+fn sent_title_publishes_pipe_writes_only_after_settlement() {
+    let host = host().expect("D3D12 device");
+    let list = host.new_list().expect("title list");
+    let mut value = 0u64;
+    let after = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = after.clone();
+    list.defer_after(move || done.store(true, Ordering::Release));
+    list.defer_write((&raw mut value).cast(), crate::queue::Written::Value(0x1234), 8);
+    list.close();
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let sent = host.submit_title(&[&list], &mut submitted);
+    assert_eq!(sent.fence, *submitted);
+    assert!(!sent.waited, "single group");
+    assert_eq!(value, 0);
+    assert!(!after.load(Ordering::Acquire));
+    host.settle_title(&[&list], sent, submitted);
+    assert!(after.load(Ordering::Acquire));
+    assert_eq!(value, 0x1234);
+}
+
 /// A reference-style deferred flip tied to the exact submitted fence.
 struct PendingBake {
     fence: u64,
     list: HostList,
     sources: TileSources,
     jobs: crate::descriptor::BakedSlots,
+}
+
+/// Adapt the source's Sent/Flight boundary: the queue has accepted the
+/// title work, but its writes, flags and texture levels are not published
+/// until settlement. Keep every preparation owner through that boundary.
+///
+/// This is intentionally still a same-thread state: Uploads owns the
+/// bindless upload-pool MutexGuard and the current mark/compare buffers
+/// are shared. Moving SentTitle to a worker or admitting another title
+/// flight would be unsound until those ownership paths are split.
+struct SentTitle {
+    fence: u64,
+    waited: bool,
+    _commands: Vec<Option<ID3D12CommandList>>,
+    batch: Batch,
+    uploads: Option<crate::bindless::Uploads>,
+    heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
+    tile_sources: TileSources,
+    tile_writes: TileSources,
+    picked: Vec<crate::picked::Range>,
+    carded: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    tail: Option<card_compare::CardCheck>,
+    started: std::time::Instant,
+    prepared: std::time::Instant,
+    removed_in: Option<usize>,
+    #[cfg(feature = "diagnostics")]
+    traced: bool,
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1543,9 +1595,19 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        // One submission at a time from preparation to copy-back: snapshots
-        // and the ranges shaders write are per host copy, not per submission.
+        // Keep the old serialization contract. The source splits sending
+        // and settlement; here the guard remains held across both.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = self.submit_title(runs, &mut submitted);
+        self.settle_title(runs, sent, submitted);
+    }
+
+    /// Prepare and signal the title's lists. In the ordinary single-group
+    /// path, return the sent state without waiting for its title fence.
+    /// Per-list timing retains the original individually checked waits.
+    /// Caller owns every original HostList through settlement, and
+    /// continues to hold the submission guard without interruption.
+    fn submit_title(&self, runs: &[&HostList], submitted: &mut u64) -> SentTitle {
         self.settle_baked_uploads();
         // Source PREPARED's logical flight number, passed explicitly to
         // every declaration in this submission instead of a global.
@@ -1674,7 +1736,7 @@ impl Host {
         // their GPU baseline before title work reaches the direct queue.
         let picked = card_compare::prepare_picked(runs, flight);
         let carded = crate::shadow::carded();
-        self.card_before(&carded, &mut submitted);
+        self.card_before(&carded, submitted);
         // As in source CardPlan::check, pre-record the check for the
         // same title fence. Keep the original per-list timing path.
         #[cfg(feature = "diagnostics")]
@@ -1698,6 +1760,7 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         let mut removed_in = None;
+        let waited = groups.len() != 1;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1711,23 +1774,17 @@ impl Host {
                 if i + 1 == groups.len() && let Some(tail) = &tail {
                     self.enqueue_card_tail(tail);
                 }
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        if WaitForSingleObject(self.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0
-                            || self.fence.GetCompletedValue() < *submitted
-                        {
-                            fail(format_args!("host submission fence wait failed"));
-                        }
-                    }
-                    // Every upload buffer and recorded owner relies on
-                    // this fence. Do not recycle on an unconfirmed wait.
-                    Err(e) => fail(format_args!("host submission fence setup failed: {e}")),
+                if let Err(e) = self.queue.Signal(&self.fence, *submitted) {
+                    fail(format_args!("host submission fence signal failed: {e}"));
                 }
             }
+            if !waited {
+                // Source submit's late branch returns after Signal.
+                // The returned state owns the auxiliary work until the
+                // caller settles the exact signalled fence.
+                continue;
+            }
+            self.wait_title_fence(*submitted);
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
@@ -1753,6 +1810,57 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        SentTitle {
+            fence: *submitted, waited, _commands: lists,
+            batch, uploads, heaps, tile_sources, tile_writes,
+            picked, carded, tail, started, prepared, removed_in,
+            #[cfg(feature = "diagnostics")]
+            traced,
+        }
+    }
+
+    /// Wait for exactly the title fence the send signalled. The original
+    /// owners and the submission guard remain live. Treat device removal
+    /// (MAX completion value) or an unconfirmed wait as fatal.
+    fn wait_title_fence(&self, fence: u64) {
+        // SAFETY: the event belongs to this serial submission and the
+        // fence value has already been signalled on the direct queue.
+        unsafe {
+            if let Err(e) = self.fence.SetEventOnCompletion(fence, self.event) {
+                fail(format_args!("host submission fence setup failed: {e}"));
+            }
+            let result = WaitForSingleObject(self.event, INFINITE);
+            let completed = self.fence.GetCompletedValue();
+            if result != windows::Win32::Foundation::WAIT_OBJECT_0
+                || completed < fence || completed == u64::MAX
+            {
+                fail(format_args!("host submission fence wait failed"));
+            }
+        }
+    }
+
+    /// Source settle boundary. Restore the combined upload/title runs
+    /// from their owners; wait, then preserve the existing order of
+    /// tile publication, marks, GPU copy-back, callbacks and pipe writes.
+    /// No other title send may be prepared while this state is pending.
+    fn settle_title(&self, runs: &[&HostList], sent: SentTitle,
+        mut submitted: std::sync::MutexGuard<'_, u64>)
+    {
+        let SentTitle {
+            fence, waited, _commands, batch, uploads, heaps, tile_sources,
+            tile_writes, picked, carded, tail, started, prepared, removed_in,
+            #[cfg(feature = "diagnostics")]
+            traced,
+        } = sent;
+        assert_eq!(*submitted, fence, "one outstanding title submission");
+        let runs: Vec<&HostList> = uploads.as_ref().into_iter().flat_map(|u| u.lists())
+            .chain(runs.iter().copied()).collect();
+        let runs = &runs[..];
+        if !waited {
+            self.wait_title_fence(fence);
+            #[cfg(feature = "diagnostics")]
+            crate::resource::life::note(0, crate::resource::life::RAN, fence, 0);
+        }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);

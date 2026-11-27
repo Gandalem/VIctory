@@ -428,6 +428,18 @@ every required replacement before changing the recording; allocation
 failure returns E_OUTOFMEMORY without consuming its resources.
 The queue remains synchronous. Run the ignored
 `detached_segments_survive_title_reset_and_release` test on an adapter.
+The source's `submit`/ `Sent`/ `settle` boundary is also reflected in
+`Host::submit_title` and `Host::settle_title`: the ordinary single
+group signals its fence and returns a `SentTitle` containing the
+command lists, upload lease, texture work, refresh batch, picked
+ranges and card compare tail. Settlement waits that exact fence,
+checks removal, then publishes the existing copy-backs, callbacks
+and bottom-of-pipe writes. Per-list timing still waits each group.
+Both phases run on the same thread under the existing submission
+guard; the texture upload lease contains a non-Send MutexGuard,
+and write marks and compare flags are still shared. No second
+in-flight title submission is enabled. Run the ignored
+`sent_title_publishes_pipe_writes_only_after_settlement` adapter test.
 The default keeps the existing Arc/leave path. The ignored
 `carded_shadow_refresh_compare_and_copy_back` and
 `picked_writes_land_only_after_discovery` adapter tests can also
