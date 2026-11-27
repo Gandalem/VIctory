@@ -382,6 +382,12 @@ fn section_window_enabled() -> bool {
     *ON
 }
 
+/// Source xmem::lean's commit-elision stage. Other map calls remain unchanged.
+fn lean() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_MAP_LEAN").is_some_and(|v| v == "1"));
+    *ON
+}
+
 impl Section {
     fn new(handle: HANDLE, pages: usize) -> Self {
         Self {
@@ -390,6 +396,40 @@ impl Section {
             committed: (0..pages.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             leased: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Source commit_shown: a section commit is shared across its views.
+    /// Publish commit bits only after a successful kernel call.
+    fn commit_shown(&self, index: usize, base: usize, len: usize) -> bool {
+        self.commit_shown_with(index, base, len, lean(), commit)
+    }
+
+    fn commit_shown_with(&self, index: usize, base: usize, len: usize,
+        skip_known: bool, commit_pages: impl FnOnce(usize, usize) -> bool) -> bool
+    {
+        if len == 0 || !len.is_multiple_of(PAGE) {
+            return false;
+        }
+        let Some(end) = index.checked_add(len / PAGE).filter(|&end| end <= self.pages) else {
+            return false;
+        };
+        use std::sync::atomic::Ordering;
+        let pages = index..end;
+        let bit = |p: usize| (&self.committed[p / 64], 1u64 << (p % 64));
+        if skip_known && pages.clone().all(|p| {
+            let (word, mask) = bit(p);
+            word.load(Ordering::Acquire) & mask != 0
+        }) {
+            return true;
+        }
+        if !commit_pages(base, len) {
+            return false;
+        }
+        for p in pages {
+            let (word, mask) = bit(p);
+            word.fetch_or(mask, Ordering::AcqRel);
+        }
+        true
     }
 
     /// Original fork's persistent section view and per-page commit
@@ -539,33 +579,61 @@ pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
     }
 }
 
-/// The addresses of title views showing `pages` (page numbers): writes into
-/// them through our own views must be reported there.
-fn shown_at(pages: &[usize]) -> Vec<usize> {
-    let physical = physical();
-    pages
-        .iter()
-        .filter_map(|p| physical.pages.get(p))
-        .filter_map(|slice| physical.shown.get(&slice.key(0)))
-        .flatten()
-        .copied()
-        .collect()
+/// Source shown_at: exact title byte spans of the completed physical
+/// write, resolved against current views. Retain the original Slice
+/// owners: page numbers can be freed while their sections stay mapped.
+/// `within` is the initial offset, `len` is the completed byte count.
+fn shown_at(runs: &[(Slice, usize)], within: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut pieces = Vec::new();
+    {
+        let physical = physical();
+        let mut remaining = len;
+        let mut lo = within;
+        'runs: for (slice, n) in runs {
+            for k in 0..*n {
+                let bytes = (PAGE - lo).min(remaining);
+                if let Some(shown) = physical.shown.get(&slice.key(k)) {
+                    pieces.extend(shown.iter().map(|&at| (at + lo, bytes)));
+                }
+                remaining -= bytes;
+                if remaining == 0 {
+                    break 'runs;
+                }
+                lo = 0;
+            }
+        }
+    }
+    // Source joins adjacent spans; repeated physical pages can also
+    // produce overlapping intervals, which can be reported together.
+    pieces.sort_unstable();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (at, bytes) in pieces {
+        match spans.last_mut() {
+            Some((start, n)) if at <= *start + *n => {
+                *n = (*start + *n).max(at + bytes) - *start;
+            }
+            _ => spans.push((at, bytes)),
+        }
+    }
+    spans
 }
 
-/// Reports writes into physical pages through our own views at every title
-/// view showing them (DirectStorage's page destinations).
-fn report_written(shown: &[usize]) {
-    for &page in shown {
+/// Report completed bytes, keeping this branch's 64 KiB guard API.
+fn report_written(runs: &[(Slice, usize)], within: usize, len: usize) {
+    for (at, bytes) in shown_at(runs, within, len) {
         #[cfg(test)]
-        REPORTED.with(|r| r.borrow_mut().push(page));
-        drop(victory_gpu::kernel_will_write(page, PAGE));
+        REPORTED.with(|r| r.borrow_mut().push((at, bytes)));
+        drop(victory_gpu::kernel_will_write(at, bytes));
     }
 }
 
 #[cfg(test)]
 thread_local! {
-    /// The title addresses this thread's writes into physical pages reported.
-    static REPORTED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The exact title ranges this thread's physical writes reported.
+    static REPORTED: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -695,7 +763,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        slice.section.commit_shown(slice.index, at.Value as usize, len).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -768,6 +836,9 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
@@ -777,7 +848,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
             // Bytes in earlier runs may already have landed. Retain the
             // current notification contract even on a later map failure.
             if done != 0 {
-                report_written(&shown_at(pages.get(offset / PAGE..(offset + done).div_ceil(PAGE)).unwrap_or(&[])));
+                report_written(&runs, offset % PAGE, done);
             }
             return false;
         };
@@ -786,7 +857,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         (within, done) = (0, done + k);
     }
     // Where the pages show once written (see `PageWindow`).
-    report_written(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
+    report_written(&runs, offset % PAGE, done);
     true
 }
 
@@ -797,18 +868,15 @@ pub(crate) struct PageWindow {
     view: Window,
     within: usize,
     len: usize,
-    /// The pages (page numbers) the bytes reach: the title views showing
-    /// them when the window is done are told. Looked up then, not when the
-    /// window opens: a decode takes milliseconds, and the title may map a
-    /// page at another address meanwhile (its GPU heap); a copy that took
-    /// the page there before the bytes landed would never hear of them. An
-    /// address that stops showing a page meanwhile was told by the unmap.
-    pages: Vec<usize>,
+    /// Pin the physical destination even if its page number is freed.
+    /// Current alias addresses are looked up only on completion.
+    slice: Slice,
+    n: usize,
 }
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        report_written(&shown_at(&self.pages));
+        report_written(&[(self.slice.clone(), self.n)], self.within, self.len);
     }
 }
 
@@ -837,7 +905,8 @@ fn page_window_with(pages: &[usize], offset: usize, len: usize, kept: bool) -> O
         view: Window::make(slice, *n, kept)?,
         within: offset % PAGE,
         len,
-        pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
+        slice: slice.clone(),
+        n: *n,
     })
 }
 
@@ -978,7 +1047,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !slice.section.commit_shown(slice.index, base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -1583,13 +1652,13 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         window.bytes().fill(3);
         drop(window);
-        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [(b as usize, 16)]);
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { b.cast::<u8>().read() }, 3);
         // `write_physical` the same way.
         REPORTED.with(|r| r.borrow_mut().clear());
         assert!(write_physical(&pages, 0, &[4]));
-        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [(b as usize, 1)]);
         assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
@@ -1647,11 +1716,60 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         window.bytes().fill(0x67);
         drop(window);
-        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [(b as usize + 17, 16)]);
         // SAFETY: b is the live mapping of the physical page.
         assert_eq!(unsafe { b.cast::<u8>().add(17).read() }, 0x67);
         assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn section_commit_bits_are_shared_by_all_views() {
+        let pages = allocate(3);
+        let slices = runs(&pages, 0, 3 * PAGE).unwrap();
+        let slice = &slices[0].0;
+        let section = &slice.section;
+        let mut view = View::map(slice, 1).expect("committed transient view");
+        view.bytes()[7] = 0x54;
+        assert_eq!(section.committed[0].load(std::sync::atomic::Ordering::Acquire) & 7, 1);
+        assert!(section.commit_shown_with(0, view.at.Value as usize, PAGE, true,
+            |_, _| panic!("known page must not commit twice")));
+        assert!(!section.commit_shown_with(1, view.at.Value as usize, PAGE, true, |_, _| false));
+        assert_eq!(section.committed[0].load(std::sync::atomic::Ordering::Acquire) & 7, 1);
+        let mut kept = section.window(0, 2).expect("kept view after transient commit");
+        assert_eq!(kept.bytes()[7], 0x54);
+        assert_eq!(section.committed[0].load(std::sync::atomic::Ordering::Acquire) & 7, 3);
+        drop(kept);
+        drop(view);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    /// Physical aliases remain mapped after the opaque page IDs are freed.
+    #[test]
+    fn physical_notices_join_exact_alias_ranges_after_page_free() {
+        let pages = allocate(2);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 2, pages.as_ptr()), b);
+        let mut window = page_window_with(&pages, PAGE - 7, 19, true).expect("cross-page window");
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        REPORTED.with(|r| r.borrow_mut().clear());
+        window.bytes().fill(0x91);
+        drop(window);
+        let mut expected = [(a as usize + PAGE - 7, 19), (b as usize + PAGE - 7, 19)];
+        expected.sort_unstable();
+        assert_eq!(REPORTED.with(|r| r.borrow().clone()), expected);
+        // SAFETY: a and b still show their mapped sections.
+        unsafe {
+            assert_eq!(a.cast::<u8>().add(PAGE - 8).read(), 0);
+            assert_eq!(a.cast::<u8>().add(PAGE - 7).read(), 0x91);
+            assert_eq!(b.cast::<u8>().add(PAGE + 11).read(), 0x91);
+            assert_eq!(b.cast::<u8>().add(PAGE + 12).read(), 0);
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 2, std::ptr::null()), b);
     }
 
     #[test]

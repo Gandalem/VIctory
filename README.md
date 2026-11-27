@@ -481,6 +481,18 @@ Release the final cached view before closing the section handle.
 No GPU alternate-view write or journal-based clean skip is enabled;
 this is a distinct, directly ported HLE optimization. The default
 continues to use the old temporary view.
+The reference's xmem::Section::commit_shown shares successful
+commit bits across transient, kept and title mappings.
+Experimental `VICTORY_MAP_LEAN=1` skips redundant commits only
+when every requested page is known committed; failures do not
+publish bits. The source shown_at/pages_written byte-range notices
+also apply to completed physical writes/decodes: resolve current
+title aliases, join exact adjacent/overlapping ranges, and pin
+the original Slice even after its opaque page number is freed.
+On a failed later mapping report the successfully written prefix.
+The existing GPU guards still round notices to 64 KiB blocks.
+No placeholder-split elision, parallel remapping or GPU journal
+is enabled.
 Run the ignored `parallel_staging_landing_preserves_pending_cpu_bytes`
 test with the send-order and landing options. No GPU compare
 coverage or submission waits are removed.
