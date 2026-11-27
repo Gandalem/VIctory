@@ -63,6 +63,8 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod texture_workers;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;

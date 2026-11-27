@@ -270,8 +270,8 @@ render-target headroom (default 3072 MiB when the sampled budget is set,
 limited to one third of the reported local budget). Only upstream
 evictable textures are reclaimed; required resources are not rejected.
 Logical allocation counters are not measurements of resident VRAM.
-Full-resolution texture shapes are unchanged by these budget settings
-alone. MIP reduction requires the separate opt-in profile below.
+A positive sampled texture budget also opts into the allocation-time MIP
+profile below. Without that budget or a MIP profile, sizes are unchanged.
 
 ## Low-VRAM texture profile (experimental)
 
@@ -279,8 +279,10 @@ alone. MIP reduction requires the separate opt-in profile below.
 `1` omits the largest mip of eligible sampled 2D textures, and `2`–`4`
 omit additional levels. `auto` selects one omitted level on a detected
 adapter with up to 8 GiB dedicated video memory, or zero when the adapter
-is unknown or has more memory. This is a process-wide choice; no live
-texture changes shape. Eligible textures have at least five mips and
+is unknown or has more memory. In `auto` mode, or with a positive
+`VICTORY_TEXTURE_BUDGET_MB`, a new eligible texture may omit more levels
+(up to four) if its estimated allocation exceeds current sampled headroom.
+The baseline is process-wide; no live texture changes shape. Eligible textures have at least five mips and
 512 texels on the shorter side. Render targets, depth, UAV, MSAA and
 incompatible formats are excluded. Eligible texture chains typically
 use about a quarter of their original host bytes when one mip is omitted,
@@ -297,6 +299,17 @@ The mip mapping follows
 [fxceless/victory-fork PR 610](https://github.com/fxceless/victory-fork/pull/610)
 and [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/tree/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90).
 Validate both modes, including retained array uploads, before deployment.
+
+## Bounded texture preparation
+
+The existing submission-owned upload path uses the fork's persistent CPU
+workers for changed textures. `VICTORY_TEXTURE_WORKERS` overrides the
+automatic worker count (1–8, limited to logical CPUs). Temporary reads
+are batched in groups of up to 32 textures and 128 MiB of source spans;
+a larger individual texture is processed alone. Under RAM pressure work
+is serial. Tracked reads use the existing checked copy; untracked reads
+are serial unless `VICTORY_PARALLEL_UNTRACKED=1` opts into owned kernel
+snapshots. GPU recording, upload lifetimes and fence ordering are unchanged.
 
 ## Debugging
 

@@ -1174,6 +1174,62 @@ fn drop_levels(desc: &ResourceDesc) -> u32 {
     mip_drop_for(desc, configured_mip_drop())
 }
 
+/// Allocation-time adaptation is opt-in. Numeric MIP profiles retain
+/// their original behavior unless a positive texture budget is set.
+#[cfg(windows)]
+fn adaptive_texture_budget() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        configured_texture_budget().is_some()
+            || std::env::var("VICTORY_TEXTURE_DROP_MIPS").is_ok_and(|v| v.trim().eq_ignore_ascii_case("auto"))
+    })
+}
+
+/// Soft headroom: avoid double-counting logical texture allocations
+/// already included in DXGI usage. Reserve the outstanding target room.
+#[cfg(windows)]
+fn sampled_room(limit: Option<u64>, video: Option<[u64; 4]>, sampled: u64,
+    targets: u64, reserve: u64, percent: u64) -> u64
+{
+    let own = limit.unwrap_or(u64::MAX).saturating_sub(sampled);
+    let Some([budget, usage, ..]) = video.filter(|v| v[0] != 0) else { return own };
+    let reserved = reserve.min(budget / 3).saturating_sub(targets);
+    let used = usage.max(sampled.saturating_add(targets));
+    let ceiling = (u128::from(budget) * u128::from(percent.min(100)) / 100) as u64;
+    own.min(ceiling.saturating_sub(used).saturating_sub(reserved))
+}
+
+#[cfg(windows)]
+fn budgeted_drop(desc: &ResourceDesc, baseline: u32) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC;
+    if !adaptive_texture_budget() || mip_drop_for(desc, 1) == 0 {
+        return baseline;
+    }
+    let Some(host) = crate::host::host() else { return baseline };
+    let (sampled, targets) = texture_budget_usage();
+    let room = sampled_room(configured_texture_budget(), crate::host::video_memory_bytes(), sampled,
+        targets, configured_target_reserve(), crate::host::video_room_percent());
+    let mut smallest = baseline;
+    for drop in baseline..=4 {
+        if drop != 0 && mip_drop_for(desc, drop) != drop {
+            continue;
+        }
+        let Some(d) = host_desc(desc, drop) else { continue };
+        // SAFETY: converted ResourceDesc has the D3D12 descriptor layout.
+        let bytes = unsafe { host.device.GetResourceAllocationInfo(0,
+            &[std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read_unaligned()]) }.SizeInBytes;
+        if bytes == u64::MAX {
+            continue;
+        }
+        smallest = drop;
+        if bytes <= room {
+            return drop;
+        }
+    }
+    // Required resources are not omitted to enforce a soft limit.
+    smallest
+}
+
 /// Determine the shape of the actual retained host texture, not a newly
 /// looked-up copy (eviction may have replaced it).
 #[cfg(windows)]
@@ -1249,7 +1305,7 @@ pub(crate) fn shift_levels(drop: u32, first: &mut u32, levels: &mut u32, clamp: 
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
 #[cfg(windows)]
-fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
+fn host_desc(desc: &ResourceDesc, drop: u32) -> Option<ResourceDesc> {
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
@@ -1258,6 +1314,11 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    if drop > 0 {
+        d.width >>= drop;
+        d.height >>= drop;
+        d.mip_levels -= drop as u16;
+    }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; Grand Theft Auto VI's shadow maps and material depth ask
     // for it): unordered views of such a texture write its twin
@@ -1359,30 +1420,39 @@ fn shared_texture(
     state: u32,
     clear: *const c_void,
 ) -> Option<std::sync::Arc<HostTexture>> {
-    let mut d = host_desc(desc)?;
+    let full = host_desc(desc, 0)?;
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
-    // Reuse full-resolution copies if they already exist. Never shorten a
-    // texture whose memory is also described by a writable title texture.
-    // Keep the same MEMORY -> TEXTURES_AT lock order as the original code.
-    let mut drop = drop_levels(desc);
-    if drop != 0 {
-        let full_live = live.as_ref().is_some_and(|t| takes(t, &d));
-        let writable_alias = {
-            let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-            at.get(&address).into_iter().flatten()
-                .any(|&r| resource(r as This).desc.flags & USES != 0)
-        };
-        if full_live || writable_alias {
-            drop = 0;
-        }
+    let mut baseline = drop_levels(desc);
+    let adaptive = adaptive_texture_budget();
+    // The fork's adaptive profile may reduce only a new sampled allocation.
+    // Keep known writable aliases and an existing compatible full-size copy
+    // at full resolution, as in the preceding integration.
+    let writable_alias = if baseline != 0 || adaptive {
+        let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+        at.get(&address).into_iter().flatten()
+            .any(|&r| resource(r as This).desc.flags & USES != 0)
+    } else {
+        false
+    };
+    let full_live = live.as_ref().is_some_and(|t| takes(t, &full));
+    if writable_alias || full_live {
+        baseline = 0;
     }
-    if drop > 0 {
-        d.width >>= drop;
-        d.height >>= drop;
-        d.mip_levels -= drop as u16;
+    let mut d = host_desc(desc, baseline)?;
+    // Reuse a compatible live texture at its existing shape.
+    if adaptive && !writable_alias && !full_live && let Some(t) = &live {
+        // SAFETY: the Arc owns the live resource.
+        let host_mips = unsafe { t.texture.GetDesc() }.MipLevels;
+        let drop = u32::from(desc.mip_levels.saturating_sub(host_mips));
+        if drop >= baseline && mip_drop_for(desc, drop) == drop
+            && let Some(candidate) = host_desc(desc, drop)
+            && takes(t, &candidate)
+        {
+            d = candidate;
+        }
     }
     if let Some(t) = &live
         && takes(t, &d)
@@ -1398,15 +1468,27 @@ fn shared_texture(
         }
         return live;
     }
+    let mut selected = if writable_alias { 0 } else { budgeted_drop(desc, baseline) };
+    d = host_desc(desc, selected)?;
     // Host textures are made on first use, in any order: the new one takes
     // the uses of every title texture of the memory, so none replaces it.
     if let Some(k) = key {
         let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
             if memory_key(address, &r.desc) == Some(k) {
-                d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
+                d.flags |= host_desc(&r.desc, 0).map_or(0, |h| h.flags & USES);
             }
         }
+    }
+    if selected != 0 && d.flags & USES != 0 {
+        let flags = d.flags;
+        selected = 0;
+        d = host_desc(desc, selected)?;
+        d.flags = flags;
+    }
+    if selected > baseline {
+        tracing::debug!(baseline, selected, width = desc.width, height = desc.height,
+            "texture allocation reduced by soft VRAM budget");
     }
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
@@ -1766,7 +1848,7 @@ fn reclaim_goal(limit: Option<u64>, video: Option<[u64; 4]>, sampled: u64,
 fn budget_reclaim(video: Option<[u64; 4]>, free: u64) -> u64 {
     let percent = crate::host::video_room_percent();
     let limit = configured_texture_budget();
-    let reserve_enabled = limit.is_some() || std::env::var_os("VICTORY_CARD_ROOM_FOR_TARGETS_MB").is_some();
+    let reserve_enabled = adaptive_texture_budget() || std::env::var_os("VICTORY_CARD_ROOM_FOR_TARGETS_MB").is_some();
     // Free space in placed texture heaps is available for new textures.
     let video = video.map(|[b, u, nb, nu]| [b, u.saturating_sub(free), nb, nu]);
     if limit.is_some() || reserve_enabled {
@@ -1994,7 +2076,7 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if host_desc(&desc).is_some() {
+    } else if host_desc(&desc, 0).is_some() {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
@@ -3028,6 +3110,17 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn texture_budget_accounts_for_target_headroom() {
+        let mb = 1u64 << 20;
+        let video = Some([8000 * mb, 2000 * mb, 0, 0]);
+        assert_eq!(sampled_room(None, video, 1000 * mb, 500 * mb, 2000 * mb, 90), 3700 * mb);
+        assert_eq!(sampled_room(Some(1500 * mb), video, 1000 * mb, 500 * mb, 2000 * mb, 90), 500 * mb);
+        assert_eq!(sampled_room(None, video, 6000 * mb, 2000 * mb, 2000 * mb, 90), 0);
+        assert_eq!(sampled_room(Some(1024 * mb), None, 512 * mb, 0, 3072 * mb, 90), 512 * mb);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn retained_mip_indices_and_view_ranges_preserve_array_slices() {
         assert_eq!(map_mip_subresource(8, 2, 1, 0), None);
         assert_eq!(map_mip_subresource(8, 2, 1, 1), Some(0));
@@ -3057,8 +3150,14 @@ mod tests {
         let d = ResourceDesc { depth_or_array_size: 2, ..texture(512, 512, 28, 8) };
         let mut image = null;
         assert_eq!(create_committed(null, &PROPERTIES, 0, &d, 0, null.cast(), &RESOURCE_IIDS[0], &mut image), S_OK);
-        let drop = drop_levels(&d);
+        let baseline = drop_levels(&d);
         let gpu = host_resource(image).unwrap();
+        let drop = dropped(image, &gpu);
+        if adaptive_texture_budget() {
+            assert!(drop >= baseline && mip_drop_for(&d, drop) == drop);
+        } else {
+            assert_eq!(drop, baseline);
+        }
         // SAFETY: the title resource owns the live host texture.
         let actual = unsafe { gpu.GetDesc() };
         assert_eq!((actual.Width, actual.Height, actual.MipLevels, actual.DepthOrArraySize),

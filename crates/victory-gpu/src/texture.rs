@@ -531,21 +531,78 @@ pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
     });
 }
 
-/// [`Staging::refresh`] of each of `work`, those whose memory may have
-/// changed on several threads at once (reading title memory and detiling
-/// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
-pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
-    // Most find nothing changed (their trackers' clean bits say so): those
-    // are not handed to threads.
-    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
-    let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
-    in_parallel(changed.len(), |k| {
-        *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[changed[k]].0.refresh();
-    });
-    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
-    for (k, r) in results.into_iter().enumerate() {
-        out[changed[k]] = r.into_inner().unwrap_or_else(|e| e.into_inner());
+/// Bound the simultaneous tiled reads rather than multiplying the size of
+/// every live texture by the number of workers. A texture larger than the
+/// limit is processed on its own, never silently omitted.
+const REFRESH_CHUNK_BYTES: u64 = 128 << 20;
+const REFRESH_CHUNK_COUNT: usize = 32;
+
+fn chunk_len(sizes: impl Iterator<Item = u64>, limit: u64, count: usize) -> usize {
+    let (mut bytes, mut n) = (0u64, 0usize);
+    for size in sizes.take(count) {
+        if n != 0 && bytes.saturating_add(size) > limit {
+            break;
+        }
+        bytes = bytes.saturating_add(size);
+        n += 1;
     }
+    n
+}
+
+fn parallel_untracked() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_PARALLEL_UNTRACKED").as_deref() == Ok("1"))
+}
+
+/// Prepare only changed textures; results remain in the original order.
+/// Apply the old fork's bounded worker and chunk policy to the upstream
+/// submission-owned upload buffers. No worker outlives this call.
+pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
+    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
+    if let [i] = changed.as_slice() {
+        out[*i] = work[*i].0.refresh();
+        return out;
+    }
+    let started = std::time::Instant::now();
+    let mut read = 0usize;
+    let mut at = 0;
+    let allow_untracked = parallel_untracked();
+    while at < changed.len() {
+        let threads = if crate::shadow::memory_pressured() {
+            1
+        } else {
+            crate::texture_workers::configured_threads()
+        };
+        let first = &work[changed[at]].0;
+        if threads < 2 || (!allow_untracked && first.tracked.is_none()) {
+            let (bytes, upload) = first.refresh_now();
+            read = read.saturating_add(bytes);
+            out[changed[at]] = upload;
+            at += 1;
+            continue;
+        }
+        let n = chunk_len(changed[at..].iter()
+            .map(|&i| &work[i].0)
+            .take_while(|s| allow_untracked || s.tracked.is_some())
+            .map(|s| s.layout.size as u64), REFRESH_CHUNK_BYTES, REFRESH_CHUNK_COUNT);
+        debug_assert!(n > 0);
+        let results = if n == 1 {
+            vec![first.refresh_now()]
+        } else {
+            let jobs = changed[at..at + n].iter().map(|&i| work[i].0.clone()).collect();
+            crate::texture_workers::ordered_map(jobs, threads, |staging: Arc<Staging>| staging.refresh_now_with(true))
+        };
+        for (k, (bytes, upload)) in results.into_iter().enumerate() {
+            read = read.saturating_add(bytes);
+            out[changed[at + k]] = upload;
+        }
+        at += n;
+    }
+    let preparing = &crate::host::PREPARING;
+    preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    preparing[3].fetch_add(read as u64, Relaxed);
     out
 }
 
@@ -572,6 +629,10 @@ impl Staging {
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
     fn refresh_now(&self) -> (usize, Option<Upload>) {
+        self.refresh_now_with(false)
+    }
+
+    fn refresh_now_with(&self, checked_untracked: bool) -> (usize, Option<Upload>) {
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -666,8 +727,23 @@ impl Staging {
             last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
+        if checked_untracked {
+            // The old fork's checked kernel snapshot for untracked worker
+            // reads, using this integration's bounded RAII scratch pool.
+            let mut snapshot = Scratch::take(size);
+            if crate::host::read_into(self.memory, &mut snapshot.0) {
+                return self.refresh_untracked(last, &snapshot.0);
+            }
+            return (0, None);
+        }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        self.refresh_untracked(last, tiled)
+    }
+
+    fn refresh_untracked(&self, last: &mut Last, tiled: &[u8]) -> (usize, Option<Upload>) {
+        let size = tiled.len();
+        let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -852,6 +928,15 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_chunks_bound_temporary_reads_without_dropping_large_textures() {
+        let mb = 1u64 << 20;
+        assert_eq!(chunk_len([64 * mb, 64 * mb, mb].into_iter(), 128 * mb, 32), 2);
+        assert_eq!(chunk_len([256 * mb, mb].into_iter(), 128 * mb, 32), 1);
+        assert_eq!(chunk_len(std::iter::repeat_n(mb, 100), 128 * mb, 32), 32);
+        assert_eq!(chunk_len(std::iter::empty(), 128 * mb, 32), 0);
+    }
 
     #[test]
     fn retained_texture_staging_reads_original_mip_and_slice() {
