@@ -437,6 +437,7 @@ fn sample_video_memory(fresh: bool) -> Option<[u64; 4]> {
     let local_ok = unsafe {
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).is_ok()
     };
+    // SAFETY: nonlocal is a valid writable DXGI output.
     let nonlocal_ok = unsafe {
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal).is_ok()
     };
@@ -468,6 +469,7 @@ pub(crate) fn video_memory_for_eviction() -> Option<[u64; 4]> {
 }
 
 /// Preserve the upstream diagnostic API: usage and budget in decimal MB.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     video_memory_bytes().map(|[b, u, nb, nu]| [
         (u as f64 / 1e6, b as f64 / 1e6),
@@ -1737,7 +1739,7 @@ impl Host {
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
             if crate::descriptor::bake_enabled() {
-                crate::descriptor::make_read_baked(&read, self, &mut *submitted);
+                crate::descriptor::make_read_baked(&read, self, &mut submitted);
             } else {
                 crate::descriptor::make_read(&read);
             }

@@ -931,7 +931,7 @@ pub(crate) fn refresh_all(work: &[RefreshWork]) -> Vec<Option<Upload>> {
         let n = chunk_len(changed[at..].iter()
             .map(|&i| &work[i].0)
             .take_while(|s| allow_untracked || s.tracked.is_some())
-            .map(|s| s.layout.size as u64), REFRESH_CHUNK_BYTES, REFRESH_CHUNK_COUNT);
+            .map(|s| s.layout.size), REFRESH_CHUNK_BYTES, REFRESH_CHUNK_COUNT);
         debug_assert!(n > 0);
         let results = if n == 1 {
             vec![first.refresh_now(work[changed[at]].2)]

@@ -368,15 +368,14 @@ pub(crate) fn prepare_ahead(viewed: &Arc<Viewed>) {
         return;
     }
     let list = if ready_enabled() && entries.iter().all(crate::texture::AheadUpload::can_record) {
-        crate::host::host().and_then(|host| host.new_list().ok()).map(|list| {
+        crate::host::host().and_then(|host| host.new_list().ok()).inspect(|list| {
             list.set_ours();
-            let readable: Vec<_> = entries.iter().filter_map(|e| e.record(&list, false)).collect();
+            let readable: Vec<_> = entries.iter().filter_map(|e| e.record(list, false)).collect();
             if !readable.is_empty() {
                 // SAFETY: an open list naming live, owned textures.
                 unsafe { list.list.ResourceBarrier(&readable) };
             }
             list.close();
-            list
         })
     } else {
         None

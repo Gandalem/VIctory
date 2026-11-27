@@ -1693,9 +1693,9 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void, title_fed: b
     }
     if texture.is_none() {
         castable_formats.clear();
+        initially_nonresident = false;
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
-        initially_nonresident = false;
         let first = unsafe {
             host.device.CreateCommittedResource(
                 &heap,

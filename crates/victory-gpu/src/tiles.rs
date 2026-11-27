@@ -122,6 +122,7 @@ struct Heap {
 
 // SAFETY: D3D12 heaps are free-threaded and the allocator state is locked.
 unsafe impl Send for Heap {}
+// SAFETY: shared access uses a free-threaded D3D12 heap and mutex-protected runs.
 unsafe impl Sync for Heap {}
 
 static POOL: Mutex<Vec<Arc<Heap>>> = Mutex::new(Vec::new());
@@ -435,7 +436,12 @@ unsafe extern "system" fn query(this: *mut c_void, iid: *const GUID, out: *mut *
     }
     // SAFETY: COM provides a writable interface output.
     unsafe { out.write(std::ptr::null_mut()) };
-    if iid.is_null() || unsafe { *iid } != IUnknown::IID {
+    if iid.is_null() {
+        return HRESULT(0x80004002u32 as i32);
+    }
+    // SAFETY: COM QueryInterface supplies a readable IID when non-null.
+    let requested = unsafe { *iid };
+    if requested != IUnknown::IID {
         return HRESULT(0x80004002u32 as i32);
     }
     // SAFETY: this is a live Owner's canonical IUnknown.
