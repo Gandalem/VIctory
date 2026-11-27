@@ -260,13 +260,28 @@ The option is off by default, and does not change marked-page copy-back
 or introduce a GPU comparison shader or asynchronous readback.
 
 The reference `CARD_COMPARE` shader, its 64 KiB piece range arithmetic
-and CPU hash oracle are ported in the isolated Windows test module
+and CPU hash oracle are ported in the Windows module
 `host/card_compare.rs`. The compiler and range tests run in normal CI;
 the ignored `card_compare_detects_and_fetches_changed_pieces` test
 executes hash initialization, comparison, compare-and-update and
-selective readback on a D3D12 adapter. It is not yet part of title
-submission or production Shadow buffer ownership. Run the ignored test
-alone on hardware before using the GPU results to drive copy-back.
+selective readback on a D3D12 adapter.
+
+Experimental `VICTORY_CARD_BUFFERS=1` connects the reference's two-sided
+registered Shadow buffers to synchronous title submission: dirty CPU
+ranges are uploaded and hashed before execution, and changed GPU pieces
+are fetched after the checked fence before the existing CPU copy-back.
+The original shared-buffer path remains the default and allocation or
+pipeline failures fall back before publication. Limits follow the source
+(16 MiB minimum and 512 MiB total for local budgets up to 12 GiB), with
+`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MIN_KB` and
+`VICTORY_CARD_BUFFERS_MB` overrides. Admission leaves 20% of the reported
+local budget free. This conservative port compares all live card copies
+and owns a full-size persistent CPU readback per copy; it does not yet
+import the source's picked-range planner, shared fetch pool or async relay.
+Loose windows and exact-view arenas stay on the existing path. Run the
+ignored `carded_shadow_refresh_compare_and_copy_back` test with
+`VICTORY_CARD_BUFFERS=1` and `VICTORY_CARD_BUFFERS_MIN_KB=64` on a real
+adapter before using the experimental path in a game.
 
 Diagnostics report the logical refresh gap and already-covered bytes
 avoided since the last report. These counters are not physical PCIe

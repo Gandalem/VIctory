@@ -1,8 +1,8 @@
-//! Isolated validation of the reference renderer's GPU changed-piece compare.
+//! Synchronous GPU changed-piece compare, adapted from the reference renderer.
 //! Source: DoubleGhosty/cool_fox@f4b48ad766ddbec1a1867022cd42f7645b0dd55e, host.rs (CARD_COMPARE, card_pass,
 //! make_card_work), shadow.rs (CardSpan, range helpers and tests), host/torn.rs
-//! (CPU hash). The title's synchronous Shadow storage is unchanged.
-//! This is test-only until GPU-local shadow ownership and fencing are ported.
+//! (CPU hash). The optional two-sided Shadow path keeps existing CPU
+//! copy-back and fences; relay/async landing are deliberately not imported.
 
 use super::*;
 const PIECE: usize = 64 << 10;
@@ -139,6 +139,7 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 /// The offsets hashed for a card's buffer of `size`
 /// bytes for title memory from `start` on.
+#[cfg(test)]
 fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
     let (lo, hi) = piece_at(start, size, piece);
     (lo & !15, hi.next_multiple_of(16))
@@ -181,15 +182,19 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &CardSpan, size: u32
     }
 }
 
+#[cfg(test)]
 const MUL: [u32; 4] = [0x0100_0193, 0x9E37_79B1, 0x85EB_CA77, 0xC2B2_AE3D];
+#[cfg(test)]
 const SEED: [u32; 4] = [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
 
+#[cfg(test)]
 fn step(h: &mut [u32; 4], with: [u32; 4]) {
     let x: [u32; 4] = std::array::from_fn(|i| (h[i] ^ with[i]).wrapping_mul(MUL[i]));
     *h = std::array::from_fn(|i| x[(i + 1) % 4] ^ (x[i] >> 15));
 }
 
 /// The 64 threads' hashes as one, folded to 31 bits.
+#[cfg(test)]
 fn finish(parts: &[[u32; 4]; 64]) -> u32 {
     let mut h = parts[0];
     for part in &parts[1..] {
@@ -199,10 +204,12 @@ fn finish(parts: &[[u32; 4]; 64]) -> u32 {
     f & 0x7FFF_FFFF
 }
 
+#[cfg(test)]
 fn seeds() -> [[u32; 4]; 64] {
     std::array::from_fn(|thread| SEED.map(|s| s.wrapping_add(thread as u32)))
 }
 
+#[cfg(test)]
 fn tail(parts: &mut [[u32; 4]; 64], bytes: &[u8]) {
     for (thread, chunk) in bytes.as_chunks::<16>().0.iter().enumerate() {
         let with = std::array::from_fn(|i| u32::from_le_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]));
@@ -210,6 +217,7 @@ fn tail(parts: &mut [[u32; 4]; 64], bytes: &[u8]) {
     }
 }
 
+#[cfg(test)]
 fn hash_plain(bytes: &[u8]) -> u32 {
     let mut parts = seeds();
     for row in bytes.chunks(1024) {
@@ -262,6 +270,7 @@ fn piece_runs_join_without_losing_or_adding_pieces() {
 
 /// The offsets the compare's shader takes for a piece (`CARD_COMPARE`
 /// in host.rs), before it widens them to 16 bytes.
+#[cfg(test)]
 fn shader_piece(span: &CardSpan, i: u32) -> (u32, u32) {
     let piece = span.first + i;
     let lo = piece * 65536;
@@ -311,6 +320,7 @@ fn a_piece_is_hashed_here_as_on_the_card() {
     }
 }
 
+#[cfg(test)]
 fn uav_buffer(device: &ID3D12Device, size: u64) -> ID3D12Resource {
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -334,13 +344,13 @@ fn uav_buffer(device: &ID3D12Device, size: u64) -> ID3D12Resource {
 }
 
 /// The source's make_card_work PSO setup, without the production flight queue.
-fn compare_pipeline(device: &ID3D12Device) -> (ID3D12RootSignature, ID3D12PipelineState) {
-    let code = compile_compare().unwrap();
+fn compare_pipeline(device: &ID3D12Device) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+    let code = compile_compare()?;
     // SAFETY: the shader blob remains live and includes the root signature;
     // the borrowed root pointer is not released by the PSO description.
     unsafe {
         let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -348,8 +358,8 @@ fn compare_pipeline(device: &ID3D12Device) -> (ID3D12RootSignature, ID3D12Pipeli
                 BytecodeLength: bytes.len(),
             },
             ..Default::default()
-        }).unwrap();
-        (root, pso)
+        })?;
+        Ok((root, pso))
     }
 }
 
@@ -367,13 +377,183 @@ fn compare_barrier(list: &ID3D12GraphicsCommandList) {
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
+
+fn card_hash_bytes(size: u64) -> u64 {
+    (size / PIECE as u64 + 2) * 16
+}
+
+/// Per-copy ownership of the source CardWork's comparison resources. The
+/// existing submission lock replaces the reference's in-flight relay pool.
+/// Persistent readbacks allow allocation failures to fall back at creation,
+/// before a descriptor can refer to the device-local buffer.
+pub(crate) struct CardWork {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    hashes: ID3D12Resource,
+    differs: ID3D12Resource,
+    flags: ID3D12Resource,
+    flags_data: usize,
+    fetched: ID3D12Resource,
+    fetched_data: usize,
+}
+
+impl CardWork {
+    pub(crate) fn new(host: &Host, size: u64) -> Option<Self> {
+        let (root, pso) = host.card_pipeline.get_or_init(|| {
+            match compare_pipeline(&host.device) {
+                Ok(pipeline) => Some(pipeline),
+                Err(e) => {
+                    tracing::warn!(error = %e, "card compare pipeline unavailable; use shared buffers");
+                    None
+                }
+            }
+        }).as_ref()?;
+        let hashes = host.uav_buffer(card_hash_bytes(size))?;
+        let flag_bytes = card_hash_bytes(size) / 4;
+        let differs = host.uav_buffer(flag_bytes)?;
+        let (flags, flags_data) = host.mapped_buffer(flag_bytes, true)?;
+        let (fetched, fetched_data) = host.mapped_buffer(size, true)?;
+        Some(Self {
+            root: root.clone(), pso: pso.clone(), hashes, differs, flags,
+            flags_data: flags_data as usize, fetched, fetched_data: fetched_data as usize,
+        })
+    }
+
+    /// # Safety
+    /// An open list, live card buffer and resources kept through its fence.
+    unsafe fn bind(&self, list: &ID3D12GraphicsCommandList, buffer: &ID3D12Resource) {
+        // SAFETY: the caller keeps the root signature, PSO, buffers and list live.
+        unsafe {
+            list.SetPipelineState(&self.pso);
+            list.SetComputeRootSignature(&self.root);
+            list.SetComputeRootShaderResourceView(1, buffer.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, self.hashes.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(3, self.differs.GetGPUVirtualAddress());
+        }
+    }
+}
+
+impl Host {
+    /// Adapt the source card_before: copy CPU-dirty ranges, then hash the
+    /// joined pieces on the device before the title's lists execute.
+    pub(super) fn card_before(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>], submitted: &mut u64) {
+        let dirty: Vec<_> = copies.iter().filter_map(|shadow| {
+            let card = shadow.card()?;
+            let ranges = card.take_dirty();
+            (!ranges.is_empty()).then_some((shadow, card, ranges))
+        }).collect();
+        if dirty.is_empty() {
+            return;
+        }
+        let list = self.new_list().unwrap_or_else(|e| fail(format_args!("card sync list: {e}")));
+        for (shadow, card, ranges) in dirty {
+            let (start, _) = shadow.range();
+            let spans = joined_piece_runs(ranges.iter().map(|&(from, to)|
+                card_span_of(start as usize, from, to)).collect());
+            // SAFETY: ranges are in both live buffers. Buffers have decayed
+            // to COMMON after the last separately submitted list; copies
+            // promote the destination to COPY_DEST, then transition to SRV.
+            unsafe {
+                for (from, to) in ranges {
+                    list.list.CopyBufferRegion(&shadow.buffer, from as u64,
+                        &card.staging, from as u64, (to - from) as u64);
+                }
+                list.list.ResourceBarrier(&[transition(&shadow.buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                card.work.bind(&list.list, &shadow.buffer);
+                for span in &spans {
+                    card_pass(&list.list, span, card.size as u32, 0, 0);
+                }
+            }
+            compare_barrier(&list.list);
+        }
+        // This helper uses the existing checked direct-queue fence. There
+        // are no title commands or tiled resources in this internal list.
+        self.submit_baked_uploads(&list, submitted);
+    }
+
+    /// Adapt source card_back: compare on the device, read flags after the
+    /// fence, fetch flagged pieces, then make their bytes available to the
+    /// existing CPU snapshot/marked-page merge. Compare all live card
+    /// copies conservatively, including unbounded descriptor writes.
+    pub(super) fn card_back(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>], submitted: &mut u64) {
+        if copies.is_empty() {
+            return;
+        }
+        let list = self.new_list().unwrap_or_else(|e| fail(format_args!("card compare list: {e}")));
+        for shadow in copies {
+            let Some(card) = shadow.card() else { continue };
+            let (start, _) = shadow.range();
+            let span = card_span_of(start as usize, 0, card.size as usize);
+            // SAFETY: the title submission has finished. The buffers and
+            // UAVs are live, in COMMON, and promoted by their respective use.
+            unsafe {
+                card.work.bind(&list.list, &shadow.buffer);
+                card_pass(&list.list, &span, card.size as u32, 0, 2);
+                compare_barrier(&list.list);
+                list.list.ResourceBarrier(&[transition(&card.work.differs,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.list.CopyBufferRegion(&card.work.flags, 0, &card.work.differs, 0,
+                    u64::from(span.pieces) * 4);
+            }
+        }
+        self.submit_baked_uploads(&list, submitted);
+        let mut fetches = Vec::new();
+        for shadow in copies {
+            let Some(card) = shadow.card() else { continue };
+            let (start, _) = shadow.range();
+            let span = card_span_of(start as usize, 0, card.size as usize);
+            // SAFETY: the persistent flag readback is large enough for
+            // this span, and the checked compare fence has completed.
+            let flags = unsafe { std::slice::from_raw_parts(card.work.flags_data as *const u32, span.pieces as usize) };
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            for (i, flag) in flags.iter().enumerate() {
+                if flag & 1 != 0 {
+                    let (from, to) = card_piece_of(start as usize, card.size as usize, &span, i as u32);
+                    match ranges.last_mut() {
+                        Some(last) if last.1 == from => last.1 = to,
+                        _ => ranges.push((from, to)),
+                    }
+                }
+            }
+            if !ranges.is_empty() {
+                fetches.push((shadow, card, ranges));
+            }
+        }
+        if fetches.is_empty() {
+            return;
+        }
+        let list = self.new_list().unwrap_or_else(|e| fail(format_args!("card fetch list: {e}")));
+        for (shadow, card, ranges) in &fetches {
+            for &(from, to) in ranges {
+                // SAFETY: valid ranges in live buffers, source buffer has
+                // decayed to COMMON and readback stays COPY_DEST.
+                unsafe {
+                    list.list.CopyBufferRegion(&card.work.fetched, from as u64,
+                        &shadow.buffer, from as u64, (to - from) as u64);
+                }
+            }
+        }
+        self.submit_baked_uploads(&list, submitted);
+        for (shadow, card, ranges) in fetches {
+            for (from, to) in ranges {
+                // SAFETY: completed readback, valid mapped range, and the
+                // submission lock excludes CPU refresh and GPU work.
+                let bytes = unsafe { std::slice::from_raw_parts(
+                    (card.work.fetched_data as *const u8).add(from), to - from) };
+                shadow.land_card(from, bytes);
+            }
+        }
+    }
+}
+
 /// Tests the real reference shader in three modes and fetches only the
 /// pieces it marked as changed. Run on a D3D12 adapter, with debug validation.
 #[test]
 #[ignore = "requires a D3D12 adapter and GPU compute/readback; run alone"]
 fn card_compare_detects_and_fetches_changed_pieces() {
     let host = host().expect("D3D12 device");
-    let (root, pso) = compare_pipeline(&host.device);
+    let (root, pso) = compare_pipeline(&host.device).unwrap();
     let size = 3 * PIECE;
     let start = 0x1000usize;
     let span = card_span_of(start, 0, size);

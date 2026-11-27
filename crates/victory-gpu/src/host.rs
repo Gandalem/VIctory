@@ -21,8 +21,7 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
-#[cfg(test)]
-mod card_compare;
+pub(crate) mod card_compare;
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -53,6 +52,7 @@ pub(crate) struct Host {
     /// Access only while holding submitted; keep the list and its owners
     /// until the copy fence, before recycling staging or executing titles.
     pending_bake: Mutex<Option<PendingBake>>,
+    card_pipeline: OnceLock<Option<(ID3D12RootSignature, ID3D12PipelineState)>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -261,6 +261,7 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             pending_bake: Mutex::new(None),
+            card_pipeline: OnceLock::new(),
             event,
             rtvs,
             rtv_size,
@@ -1652,6 +1653,10 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Reference two-sided buffers: upload changed CPU ranges and hash
+        // their GPU baseline before title work reaches the direct queue.
+        let carded = crate::shadow::carded();
+        self.card_before(&carded, &mut submitted);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1813,6 +1818,9 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        // The title fence has completed. Restore changed GPU pieces to
+        // the CPU side before the existing marked/declared merge paths.
+        self.card_back(&carded, &mut submitted);
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
@@ -1853,7 +1861,7 @@ impl Host {
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
-        release_later(Box::new((batch, back, withheld, heaps)));
+        release_later(Box::new((batch, back, withheld, heaps, carded)));
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
@@ -3415,6 +3423,36 @@ mod title_copies {
 
 impl Host {
     /// A buffer in the upload heap, mapped for writing.
+    /// Device-local UAV buffer starting in COMMON, as in cool_fox's
+    /// uav_buffer. Keep this branch's committed/resident allocation policy.
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1), Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: valid committed resource description and output pointer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+                &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no device-local unordered-access buffer");
+                None
+            }
+        }
+    }
+
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {

@@ -90,6 +90,172 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    card: Option<Card>,
+}
+
+
+// Reference two-sided GPU-local copies, with the current synchronous
+// submission and snapshot/mark semantics. Source: cool_fox f4b48ad,
+// Card, card_limits, card_room_for, card_changed_runs, card_dirty, lookup.
+fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
+    let Some(budget_bytes) = local_vram_budget else {
+        return (16, 512);
+    };
+    let budget_mb = budget_bytes >> 20;
+    const TWELVE_GIB_MB: u64 = 12 * 1024;
+    const TWENTY_GIB_MB: u64 = 20 * 1024;
+    if budget_mb <= TWELVE_GIB_MB {
+        (16, 512)
+    } else if budget_mb < TWENTY_GIB_MB {
+        (4, 2048)
+    } else {
+        (1, (budget_mb / 4).min(8192))
+    }
+}
+
+/// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
+/// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
+/// `VICTORY_CARD_BUFFERS_MB`.
+fn resolve_card_limits(
+    local_vram_budget: Option<u64>,
+    min_mb_override: Option<u64>,
+    max_mb_override: Option<u64>,
+) -> (u64, u64) {
+    const MIB: u64 = 1 << 20;
+    let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
+    let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
+    let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
+    (min_bytes, max_bytes)
+}
+
+fn cards() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_some_and(|v| v == "1"))
+}
+
+fn card_limits() -> (u64, u64) {
+    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let vram_budget = crate::host::video_memory_bytes().map(|[budget, ..]| budget);
+        let (mut min_bytes, max_bytes) = resolve_card_limits(
+            vram_budget, env_mb("VICTORY_CARD_BUFFERS_MIN_MB"), env_mb("VICTORY_CARD_BUFFERS_MB"));
+        if let Some(kib) = env_mb("VICTORY_CARD_BUFFERS_MIN_KB") && kib > 0 {
+            min_bytes = kib.saturating_mul(1024);
+        }
+        (min_bytes, max_bytes)
+    })
+}
+
+static CARD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reserve the local buffer budget before allocating, returning it on all
+/// failures and only releasing a live lease when the owning Shadow dies.
+struct CardLease(u64);
+
+impl CardLease {
+    fn reserve(size: u64, limit: u64) -> Option<Self> {
+        use std::sync::atomic::Ordering::Relaxed;
+        CARD_BYTES.fetch_update(Relaxed, Relaxed, |used|
+            used.checked_add(size).filter(|&total| total <= limit)).ok()?;
+        Some(Self(size))
+    }
+}
+
+impl Drop for CardLease {
+    fn drop(&mut self) {
+        CARD_BYTES.fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) struct Card {
+    pub(crate) staging: ID3D12Resource,
+    pub(crate) work: crate::host::card_compare::CardWork,
+    pub(crate) size: u64,
+    dirty: Mutex<Vec<(usize, usize)>>,
+    _lease: CardLease,
+}
+
+fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    // (The sort that finds what is in order already: they come as a few
+    // stretches of tens of thousands in order, put behind one another.)
+    ranges.sort();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        match out.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+impl Card {
+    fn changed(&self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let mut dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        // Reference card_changed_runs: combine a touching last range.
+        match dirty.last_mut() {
+            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+            _ => dirty.push((from, to)),
+        }
+    }
+
+    pub(crate) fn take_dirty(&self) -> Vec<(usize, usize)> {
+        joined(std::mem::take(&mut *self.dirty.lock().unwrap_or_else(|e| e.into_inner())))
+    }
+}
+
+/// New registered copies use the reference VRAM thresholds. The new path
+/// remains opt-in; all resources must be ready before changing GPU addresses.
+fn card_for(staging: &ID3D12Resource, data: *mut u8, size: u64) -> Option<(ID3D12Resource, Card)> {
+    if !cards() || memory_pressured() {
+        return None;
+    }
+    let (least, most) = card_limits();
+    if size < least || size >= 1 << 30 || size == 0 {
+        return None;
+    }
+    if let Some([budget, used, ..]) = crate::host::video_memory_bytes()
+        && used.saturating_add(size) > budget / 100 * 80
+    {
+        return None;
+    }
+    let lease = CardLease::reserve(size, most)?;
+    let host = host()?;
+    let work = crate::host::card_compare::CardWork::new(host, size)?;
+    let buffer = host.uav_buffer(size)?;
+    // SAFETY: the freshly allocated mapped staging resource has size bytes
+    // and is not yet visible to any other owner. Initialize padded bytes too.
+    unsafe { data.write_bytes(0, size as usize) };
+    Some((buffer, Card {
+        staging: staging.clone(), work, size,
+        dirty: Mutex::new(vec![(0, size as usize)]), _lease: lease,
+    }))
+}
+
+/// Same weak ownership as the source CARDED registry: no copy is kept alive
+/// merely by being registered. The submitting thread takes a strong snapshot
+/// through the comparison and readback fences.
+static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+pub(crate) fn carded() -> Vec<Arc<Shadow>> {
+    if !cards() {
+        return Vec::new();
+    }
+    let mut live = Vec::new();
+    let mut cards = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    cards.retain(|weak| {
+        if let Some(shadow) = weak.upgrade() {
+            live.push(shadow);
+            true
+        } else {
+            false
+        }
+    });
+    live
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -494,6 +660,11 @@ impl Shadow {
     /// [`Shadow::new`] of a copy in a run of a shared buffer (`data` and
     /// `gpu` are the run's).
     fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
+        Self::new_with_card(buffer, data, gpu, start, len, slice, None)
+    }
+
+    fn new_with_card(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64,
+        len: u64, slice: Option<Slice>, card: Option<Card>) -> Arc<Shadow> {
         let tracked = crate::watch::track_copy(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -508,11 +679,35 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            card,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
+        if shadow.card.is_some() {
+            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        }
         shadow
+    }
+
+    pub(crate) fn card(&self) -> Option<&Card> {
+        self.card.as_ref()
+    }
+
+    fn card_changed(&self, from: usize, to: usize) {
+        if let Some(card) = &self.card {
+            card.changed(from, to);
+        }
+    }
+
+    /// Land the reference's flagged GPU pieces before existing CPU merge.
+    /// Called only under the submission lock, after the readback fence.
+    pub(crate) fn land_card(&self, from: usize, bytes: &[u8]) {
+        let card = self.card.as_ref().expect("a device-local copy");
+        assert!(from <= card.size as usize && bytes.len() <= card.size as usize - from);
+        // SAFETY: bounds checked; source is a disjoint completed readback
+        // and the staging mapping is writable under the submission lock.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -705,6 +900,8 @@ impl Shadow {
                             saved[..n].copy_from_slice(scratch);
                         }
                         let changed = merge_waited_piece(host, old, scratch);
+                        // The merged CPU side may now differ from the card.
+                        self.card_changed(at, at + n);
                         if changed {
                             let _writing = crate::watch::writing(start + at, n);
                             if exact {
@@ -801,7 +998,9 @@ impl Shadow {
             None => (*host != title[..]).then_some(host.as_ptr()),
             Some(before) => {
                 let before = &before[from - page..to - page];
-                merge_writeback(&mut title, host, before).then_some(title.as_ptr())
+                let changed = merge_writeback(&mut title, host, before);
+                self.card_changed(from - start, to - start);
+                changed.then_some(title.as_ptr())
             }
         };
         if let Some(bytes) = written {
@@ -918,6 +1117,7 @@ impl Shadow {
         for (a, b) in unmapped {
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
             unsafe { self.data.add(a - start).write_bytes(0, b - a) };
+            self.card_changed(a - start, b - start);
             sync_before(a, b);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
@@ -966,6 +1166,7 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        self.card_changed(from - start, to - start);
         if let Some(t) = &self.tracked {
             // SAFETY: `to - from` bytes inside the mapping, just copied.
             t.refreshed(from, unsafe { std::slice::from_raw_parts(at, to - from) });
@@ -1310,8 +1511,16 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        let size = len.next_multiple_of(1 << 16);
+        let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        let (buffer, card) = match card_for(&buffer, data, size) {
+            Some((local, card)) => {
+                crate::host::name(&local, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+                (local, Some(card))
+            }
+            None => (buffer, None),
+        };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {
@@ -1327,7 +1536,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        entry.shadow = Some(Shadow::new_with_card(buffer, data, gpu, key.0, len, None, card));
         changed();
     }
     entry.shadow.clone()
@@ -1597,6 +1806,69 @@ pub(crate) mod tests {
         // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
         // holds the submission lock).
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    #[test]
+    fn card_limits_scale_with_local_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+
+        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        assert_eq!(default_card_limits_mb(None), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+
+        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
+        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
+
+        // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
+        assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
+        assert_eq!(default_card_limits_mb(Some(24 * GIB)), (1, 6144));
+        assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));
+        assert_eq!(default_card_limits_mb(Some(48 * GIB)), (1, 8192));
+
+        // Explicit env overrides always win, clamp min to >= 1 MiB, and saturate on overflow.
+        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
+        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
+        assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+    }
+
+    /// Requires the opt-in and a real D3D12 adapter. Test the production
+    /// submission path rather than just the isolated compare shader.
+    #[test]
+    #[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 and D3D12; run alone"]
+    fn carded_shadow_refresh_compare_and_copy_back() {
+        let host = host().expect("D3D12 device");
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let shadow = find(p as u64, len as u64).expect("registered copy");
+        assert!(shadow.card().is_some(), "device-local allocation refused");
+        // SAFETY: the test owns the two mapped title pages.
+        unsafe { (p as *mut u8).add(7).write_volatile(0x11) };
+        let (upload, data) = host.upload_buffer(4).unwrap();
+        // SAFETY: the upload has four mapped bytes.
+        unsafe { data.cast::<u32>().write_unaligned(0x78563412) };
+        let list = host.new_list().unwrap();
+        shadow.refresh(&list, p as u64, len as u64);
+        shadow.gpu_writes(&list, (p + PAGE) as u64, 4, false);
+        list.keep(&upload);
+        // SAFETY: live, non-overlapping buffers and valid four-byte range.
+        unsafe { list.list.CopyBufferRegion(&shadow.buffer, PAGE as u64, &upload, 0, 4) };
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(shadow.read_host((p + PAGE) as u64, 1), [0x78563412]);
+        // SAFETY: the owned title pages remain mapped after the checked fence.
+        unsafe {
+            assert_eq!(((p + PAGE) as *const u32).read_unaligned(), 0x78563412);
+            assert_eq!((p as *const u8).add(7).read_volatile(), 0x11);
+        }
+        unregister(p, p as u64);
     }
 
     #[test]
