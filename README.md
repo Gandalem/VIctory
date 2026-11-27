@@ -510,8 +510,14 @@ unmaps/maps on reusable workers, then publish alias/guard
 metadata after completion. Failed direct maps retry serially;
 failed unmaps restore the previous owner metadata. Duplicate
 destinations and read-after-map dependencies break groups.
-Larger mapped-view edits, multi-page alias ranges and self-alias
-ranges retain the serial path. `VICTORY_MAP_THREADS=auto` ports
+The source map_aliases flat_map expands disjoint aligned
+multi-page alias/unmap ranges into the same independent page
+groups, preserving source order and resolving dependencies after
+the previous group is published. Retain at most 64 expanded
+pages at once. Larger existing mapped-view edits still use the
+serial change path; overlapping/self-alias or non-page-aligned
+ranges keep the legacy whole-range behavior.
+`VICTORY_MAP_THREADS=auto` ports
 the source Busy/asked_threads/side_by_side controller: sample
 mapping-call elapsed time over 250 ms windows; switch from 1
 to 16 threads above 25% mapping time and return to 1 at or

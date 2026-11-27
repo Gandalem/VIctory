@@ -1175,46 +1175,77 @@ fn scatter_with(wanted: &[(usize, usize)], threads: usize) -> bool {
     true
 }
 
+/// The original map_aliases expands each byte range to pages. Reuse
+/// its iterator verbatim; only feed whole aligned, independent ranges.
+fn alias_pages(ranges: &[(u64, u64, u64)]) -> impl Iterator<Item = (usize, Option<usize>)> + '_ {
+    ranges
+        .iter()
+        .flat_map(|&(to, from, len)| {
+            (0..len as usize).step_by(PAGE).map(move |k| (to as usize + k, (from != 0).then_some(from as usize + k)))
+        })
+}
+
+/// The old map_alias unmaps the entire destination before finding
+/// sources. Overlapping/self-alias ranges must retain that behavior,
+/// rather than reading a different old source page during preparation.
+fn batch_alias_range(&(to, from, len): &(u64, u64, u64)) -> bool {
+    let (to, from, len) = (to as usize, from as usize, len as usize);
+    if len == 0 || !len.is_multiple_of(PAGE) || !page_address(to) {
+        return false;
+    }
+    let Some(end) = to.checked_add(len) else { return false };
+    from == 0 || page_address(from)
+        && from.checked_add(len).is_some_and(|source_end| end <= from || source_end <= to)
+}
+
 /// Source map_aliases, connected to the GPU's many-page callback.
-/// Multi-page ranges keep the legacy whole-range unmap semantics,
-/// as do misaligned or self-aliasing requests.
+/// Expand disjoint aligned ranges to the original page work stream.
+/// Misaligned, overlapping and self-alias requests retain the old path.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     map_aliases_with(ranges, map_threads())
 }
 
 fn map_aliases_with(ranges: &[(u64, u64, u64)], threads: usize) -> bool {
-    let eligible = |&(to, from, len): &(u64, u64, u64)| {
-        len == PAGE as u64 && page_address(to as usize)
-            && (from == 0 || page_address(from as usize) && from != to)
-    };
     if threads <= 1 {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
     let mut at = 0;
     let mut ok = true;
     while at < ranges.len() {
-        if !eligible(&ranges[at]) {
+        if !batch_alias_range(&ranges[at]) {
             let (to, from, len) = ranges[at];
             ok &= map_alias(to, from, len);
             at += 1;
             continue;
         }
-        let wanted: Vec<_> = ranges[at..].iter().take(GROUP).take_while(|r| eligible(r))
-            .map(|&(to, from, _)| (to as usize, (from != 0).then_some(from as usize))).collect();
-        let n = independent_prefix(&wanted);
-        let _busy = Busy::begin();
-        let mut p = physical();
-        let _changing = victory_gpu::title_memory_remapping();
-        let mut ops = Vec::with_capacity(n);
-        for &(to, from) in &wanted[..n] {
-            let slice = from.and_then(|a| p.views.range(..=a).next_back()
-                .filter(|(base, (size, _))| a < *base + size)
-                .map(|(base, (_, s))| Slice { section: s.section.clone(), index: s.index + (a - base) / PAGE }));
-            ok &= from.is_none() || slice.is_some();
-            ops.push(Op::new(to, slice));
+        // The source expands ranges using flat_map, then groups pages
+        // by dependency. Keep that order but retain at most GROUP
+        // pages at a time instead of allocating the whole expansion.
+        let end = at + ranges[at..].iter().take_while(|r| batch_alias_range(r)).count();
+        let mut pages = alias_pages(&ranges[at..end]);
+        let mut wanted: Vec<_> = pages.by_ref().take(GROUP).collect();
+        while !wanted.is_empty() {
+            let n = independent_prefix(&wanted);
+            {
+                let _busy = Busy::begin();
+                let mut p = physical();
+                let _changing = victory_gpu::title_memory_remapping();
+                let mut ops = Vec::with_capacity(n);
+                for &(to, from) in &wanted[..n] {
+                    let slice = from.and_then(|a| p.views.range(..=a).next_back()
+                        .filter(|(base, (size, _))| a < *base + size)
+                        .map(|(base, (_, s))| Slice { section: s.section.clone(), index: s.index + (a - base) / PAGE }));
+                    ok &= from.is_none() || slice.is_some();
+                    ops.push(Op::new(to, slice));
+                }
+                ok &= change(&mut p, ops, threads);
+            }
+            // A dependent page belongs to the next group; do not
+            // advance past it. Read its source only after publication.
+            drop(wanted.drain(..n));
+            wanted.extend(pages.by_ref().take(GROUP - wanted.len()));
         }
-        ok &= change(&mut p, ops, threads);
-        at += n;
+        at = end;
     }
     ok
 }
@@ -2108,6 +2139,64 @@ mod tests {
         }
         let clear: Vec<_> = (0..6).map(|k| (at(k), 0)).collect();
         assert!(scatter_with(&clear, 3));
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn alias_range_expansion_keeps_source_page_order_and_legacy_overlaps() {
+        let p = PAGE as u64;
+        let ranges = [(8 * p, p, 3 * p), (12 * p, 0, 2 * p)];
+        assert!(ranges.iter().all(batch_alias_range));
+        assert_eq!(alias_pages(&ranges).collect::<Vec<_>>(), [
+            (8 * PAGE, Some(PAGE)),
+            (9 * PAGE, Some(2 * PAGE)),
+            (10 * PAGE, Some(3 * PAGE)),
+            (12 * PAGE, None),
+            (13 * PAGE, None),
+        ]);
+        assert!(!batch_alias_range(&(p, p, p)));
+        assert!(!batch_alias_range(&(2 * p, p, 2 * p)));
+        assert!(!batch_alias_range(&(p, 2 * p, 2 * p)));
+        assert!(!batch_alias_range(&(p, 0, p - 1)));
+        assert!(!batch_alias_range(&(p + 1, 0, p)));
+        assert!(!batch_alias_range(&(p, 0, 0)));
+        assert!(!batch_alias_range(&(u64::MAX - p + 1, 0, p)));
+    }
+
+    /// Multi-page requests use the same page worker groups as the
+    /// reference. The second range reads the first range's NEW aliases.
+    #[test]
+    fn parallel_alias_ranges_preserve_cross_range_dependencies() {
+        let pages = allocate(4);
+        for (i, &page) in pages.iter().enumerate() {
+            assert!(write_physical(&[page], 0, &[0x30 + i as u8]));
+        }
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 12 * PAGE,
+            MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let at = |i: usize| a as usize + i * PAGE;
+        assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
+        let len = (4 * PAGE) as u64;
+        assert!(map_aliases_with(&[(at(4) as u64, at(0) as u64, len),
+            (at(8) as u64, at(4) as u64, len)], 3));
+        // SAFETY: the source and both destination ranges are live views.
+        unsafe {
+            for i in 0..4 {
+                assert_eq!((at(i + 4) as *const u8).read(), 0x30 + i as u8);
+                assert_eq!((at(i + 8) as *const u8).read(), 0x30 + i as u8);
+            }
+            (at(6) as *mut u8).write(0x75);
+            assert_eq!((at(2) as *const u8).read(), 0x75);
+            assert_eq!((at(10) as *const u8).read(), 0x75);
+        }
+        assert!(map_aliases_with(&[(at(4) as u64, 0, 2 * len)], 3));
+        // The two destination ranges are gone; the source remains.
+        {
+            let p = physical();
+            assert_eq!(p.views.get(&at(0)).map(|v| v.0), Some(4 * PAGE));
+            assert!(p.views.range(at(4)..at(12)).next().is_none());
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
