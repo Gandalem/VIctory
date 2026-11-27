@@ -407,11 +407,20 @@ a partial map, writes a coarse texel, expands to another MIP, then checks
 readback, accounting and lifetime. This test must be run on a tier-2
 adapter before considering live activation.
 
-Live descriptor remapping, held-level detection, and GPU-write
-`claim`/`unclaim` tracking are not yet ported. Enabling partial maps in
-the title path before those are available could lose writes or expose
-unbacked levels. Like the reference, mapped tiles are not returned while
-the resource lives. This option is disabled by
+The reference's backed GPU-write mask is connected to the existing
+fence-complete callbacks for whole and per-MIP copies, resolves and alias
+copies, retaining the same whole-resource host-written guard. The
+COM-owned mapping state carries the held, written and claimed masks.
+The reference's packed-group claim/unclaim policy has isolated tests,
+and its 2D/2D-array `show_from` clamp is connected to explicit SRV
+creation after retained-MIP shifting. For the production full-chain path
+the first shown level is zero, so the clamp does not change sampling.
+
+Live partial admission, title-held level discovery, command-list claims
+for unmapped writes and re-publishing existing descriptors on changes
+remain unported. Do not activate sparse title maps until those paths and
+GPU readback are verified. Like the reference, mapped tiles are not
+returned while the resource lives. This option is disabled by
 default: the dedicated initialization fence and zero fill may outweigh
 pooling savings; validate both correctness and performance on Windows.
 The upstream first-use texture creation and whole-texture descriptor

@@ -333,7 +333,26 @@ unsafe impl Sync for Staging {}
 /// order their lists were recorded in), and one run before it must still
 /// get its upload.
 pub(crate) fn host_writes(list: &HostList, resource: This) {
+    host_writes_mask(list, resource, u32::MAX);
+}
+
+/// Single-slice tiled textures use host subresource indices as MIP bits.
+/// Other formats preserve the existing whole-resource host-written flag.
+pub(crate) fn host_mip_bit(level: u32) -> u32 {
+    1u32.checked_shl(level).unwrap_or(0)
+}
+
+pub(crate) fn host_writes_mask(list: &HostList, resource: This, levels: u32) {
     if let Some(copy) = crate::resource::host_copy(resource) {
+        if let Some(mapping) = &copy.tiled {
+            let mapping = mapping.clone();
+            // The reference tracked writes at submission. Here the existing
+            // synchronous completion callback can record actual completion
+            // and never publishes claims from reset, unsubmitted lists.
+            list.defer_after(move || {
+                mapping.lock().unwrap_or_else(|e| e.into_inner()).card_wrote(levels);
+            });
+        }
         list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
     }
 }
@@ -422,7 +441,8 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
-    crate::texture::host_writes(list, to);
+    let written = pairs.iter().fold(0, |mask, &(_, j)| mask | host_mip_bit(j as u32));
+    host_writes_mask(list, to, written);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {

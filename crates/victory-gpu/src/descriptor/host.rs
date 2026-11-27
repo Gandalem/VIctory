@@ -1659,6 +1659,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 if let Some(d) = desc.as_mut() {
                     shift_view_levels(crate::resource::dropped(resource, texture), d);
+                    if let Some(mapping) = &copy.tiled
+                        && let Some(first) = mapping.lock().unwrap_or_else(|e| e.into_inner()).first_shown()
+                    {
+                        // SAFETY: the live reserved texture supplies the retained level count.
+                        let levels = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                        crate::tiles::show_from(d, first, levels);
+                    }
                 }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;

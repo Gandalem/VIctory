@@ -206,19 +206,56 @@ pub(crate) fn usage() -> (u64, u64) {
 /// Per-resource group residency, adapted from cool_fox's Tiled/Given.
 /// The mask is published only after a successful initialization fence.
 /// Each group owns its leases; existing groups are never remapped.
-struct Mapping {
+pub(crate) struct Mapping {
     groups: Vec<Group>,
     mapped: u32,
     leases: Vec<Lease>,
+    /// Levels held by title data and levels actually written by the card.
+    /// The production full-chain path treats every initialized level as held.
+    held: u32,
+    card: u32,
+    /// Packed-group claims are used by the isolated partial-map path;
+    /// production initializes all groups before any list records a write.
+    claimed: u32,
 }
 
 impl Mapping {
     fn new(groups: Vec<Group>) -> Self {
-        Self { groups, mapped: 0, leases: Vec::new() }
+        Self { groups, mapped: 0, leases: Vec::new(), held: 0, card: 0, claimed: 0 }
     }
 
     fn every_level(&self) -> u32 {
         group_mask(&self.groups, u32::MAX)
+    }
+
+    /// Reference Tiled::without/claim/unclaim semantics, synchronized by
+    /// this mapping's mutex. Claim whole packed groups, not just one MIP.
+    #[cfg(test)]
+    fn claim(&mut self, levels: u32) -> u32 {
+        let missing = group_mask(&self.groups, levels) & !self.mapped;
+        let fresh = missing & !self.claimed;
+        self.claimed |= fresh;
+        fresh
+    }
+
+    fn unclaim(&mut self, levels: u32) {
+        self.claimed &= !group_mask(&self.groups, levels);
+    }
+
+    /// Reference card_wrote's successful-backed-level mask. Called only
+    /// after the real list's completion fence. It never maps tiles or
+    /// acknowledges unbacked writes. Preserve exact authored subresources,
+    /// rather than marking the entire packed tail as GPU-written.
+    pub(crate) fn card_wrote(&mut self, levels: u32) {
+        self.card |= levels & self.mapped;
+        self.unclaim(levels);
+    }
+
+    /// Reference first_shown: first held or card-authored mapped level.
+    /// The title path still publishes only fully mapped initialized chains.
+    pub(crate) fn first_shown(&self) -> Option<u32> {
+        let shown = (self.held | self.card) & self.mapped;
+        (shown != 0).then(|| shown.trailing_zeros())
     }
 
     fn given_bytes(&self) -> u64 {
@@ -523,22 +560,57 @@ fn reserve(host: &crate::host::Host, desc: &D3D12_RESOURCE_DESC,
     Some((texture, desc, mapping))
 }
 
+/// Reference cool_fox show_from, keeping the original 2D/2D-array
+/// range and LOD adjustment semantics.
+pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
+    if first >= levels {
+        return;
+    }
+    let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
+        if first <= *most {
+            return;
+        }
+        let fewer = first - *most;
+        *most = first;
+        if *mips != u32::MAX {
+            *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
+        }
+        if *min_lod > 0.0 {
+            *min_lod = (*min_lod - fewer as f32).max(0.0);
+        }
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: `ViewDimension` selects `Texture2D`.
+            let view = unsafe { &mut desc.Anonymous.Texture2D };
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: `ViewDimension` selects `Texture2DArray`.
+            let view = unsafe { &mut desc.Anonymous.Texture2DArray };
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+        }
+        _ => {}
+    }
+}
+
 /// Production remains fully mapped before first publication. The
 /// incremental allocator is shared with the isolated sparse GPU test;
 /// live partial mapping is NOT enabled until descriptor/write tracking
 /// and readback verification are complete.
 pub(crate) fn make(host: &crate::host::Host, desc: &D3D12_RESOURCE_DESC,
-    formats: &[DXGI_FORMAT]) -> Option<(ID3D12Resource, u64)> {
-    let (texture, desc, state) = reserve(host, desc, formats)?;
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    formats: &[DXGI_FORMAT]) -> Option<(ID3D12Resource, u64, Arc<Mutex<Mapping>>)> {
+    let (texture, desc, mapping) = reserve(host, desc, formats)?;
+    let mut state = mapping.lock().unwrap_or_else(|e| e.into_inner());
     let all = state.every_level();
     // SAFETY: reserve returned an unpublished COMMON-state resource.
     if unsafe { state.map_more(host, &texture, &desc, all) }? != all {
         return None;
     }
+    state.held = all;
     let bytes = state.given_bytes();
     drop(state);
-    Some((texture, bytes))
+    Some((texture, bytes, mapping))
 }
 
 #[cfg(test)]
@@ -568,6 +640,65 @@ mod tests {
         assert_eq!(missing_groups(&groups, tail, tail | 1).collect::<Vec<_>>(),
             [Group { first: 0, levels: 1, tiles: 16 }]);
         assert_eq!(missing_groups(&groups, 0, 0).count(), 0);
+    }
+
+    #[test]
+    fn claims_recover_and_only_backed_gpu_levels_are_published() {
+        let mut state = Mapping::new(groups(&[16, 4, 1], 4, 2, 23).unwrap());
+        let tail = 0b1111000;
+        assert_eq!(state.claim(1 << 5), tail);
+        assert_eq!(state.claim(1 << 6), 0);
+        // Recording was discarded or allocation failed.
+        state.unclaim(1 << 5);
+        assert_eq!(state.claim(1 << 6), tail);
+        state.card_wrote(1 << 6);
+        assert_eq!(state.card, 0);
+        assert_eq!(state.first_shown(), None);
+        assert_eq!(state.claim(1 << 6), tail);
+        state.mapped = tail;
+        state.card_wrote(1 << 6);
+        assert_eq!(state.card, 1 << 6);
+        assert_eq!(state.claimed, 0);
+        assert_eq!(state.first_shown(), Some(6));
+        assert_eq!(state.claim(1 << 4), 0);
+        state.held = 1 << 3;
+        assert_eq!(state.first_shown(), Some(3));
+    }
+
+    #[test]
+    fn shown_srv_preserves_reference_range_and_lod_clamp() {
+        let mut view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 1, MipLevels: 7,
+                    ResourceMinLODClamp: 4.5, PlaneSlice: 0,
+                },
+            },
+            ..Default::default()
+        };
+        show_from(&mut view, 3, 8);
+        // SAFETY: Texture2D is the selected union member.
+        let v = unsafe { view.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels), (3, 5));
+        assert_eq!(v.ResourceMinLODClamp, 2.5);
+        let mut array = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0, MipLevels: u32::MAX,
+                    FirstArraySlice: 2, ArraySize: 3, PlaneSlice: 0,
+                    ResourceMinLODClamp: 1.0,
+                },
+            },
+            ..Default::default()
+        };
+        show_from(&mut array, 4, 8);
+        // SAFETY: Texture2DArray is the selected union member.
+        let v = unsafe { array.Anonymous.Texture2DArray };
+        assert_eq!((v.MostDetailedMip, v.MipLevels), (4, u32::MAX));
+        assert_eq!((v.FirstArraySlice, v.ArraySize), (2, 3));
+        assert_eq!(v.ResourceMinLODClamp, 0.0);
     }
 
     #[test]
@@ -605,7 +736,9 @@ mod tests {
             ..Default::default()
         };
         let before = usage().0;
-        let (texture, bytes) = make(host, &desc, &[]).expect("reserved texture");
+        let (texture, bytes, mapping) = make(host, &desc, &[]).expect("reserved texture");
+        assert_eq!(mapping.lock().unwrap().first_shown(), Some(0));
+        drop(mapping);
         assert_eq!(usage().0, before + bytes);
         let retained = texture.clone();
         drop(texture);
@@ -646,6 +779,8 @@ mod tests {
         write_texel(host, &texture, &desc, 7, marker);
         {
             let mut map = mapping.lock().unwrap();
+            map.card_wrote(1 << 7);
+            assert_eq!(map.first_shown(), Some(7));
             let bytes = map.given_bytes();
             // SAFETY: write_texel returned after a fence and restored COMMON.
             assert_eq!(unsafe { map.map_more(host, &texture, &desc, 1 << 7) }, Some(tail));

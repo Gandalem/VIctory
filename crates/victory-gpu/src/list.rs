@@ -662,12 +662,12 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_writes(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             if levelwise {
                 copy_retained_levels(list, dst, &to, src, &from);
             } else {
+                crate::texture::host_writes(list, dst);
                 // SAFETY: an open list and live textures.
                 unsafe { list.list.CopyResource(&to, &from) };
             }
@@ -700,12 +700,15 @@ fn copy_retained_levels(
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
     };
     let n = crate::resource::title_subresources(dst).min(crate::resource::title_subresources(src));
+    let mut written = 0;
     for index in 0..n {
         let (Some(d), Some(s)) = (crate::resource::host_subresource(dst, to, index),
                                   crate::resource::host_subresource(src, from, index)) else { continue };
         // SAFETY: both retained subresources have matching title dimensions.
         unsafe { list.list.CopyTextureRegion(&location(to, d), 0, 0, 0, &location(from, s), None) };
+        written |= crate::texture::host_mip_bit(d);
     }
+    crate::texture::host_writes_mask(list, dst, written);
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -802,7 +805,9 @@ extern "system" fn copy_texture_region(
             from.resource = texture.as_raw().cast_const().cast();
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_writes(list, dst.resource);
+        let written = if dst.kind == FOOTPRINT { u32::MAX }
+            else { crate::texture::host_mip_bit(dst.footprint.offset as u32) };
+        crate::texture::host_writes_mask(list, dst.resource, written);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -1006,7 +1011,7 @@ extern "system" fn resolve(
         }
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_writes(list, dst);
+        crate::texture::host_writes_mask(list, dst, crate::texture::host_mip_bit(dst_sub));
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

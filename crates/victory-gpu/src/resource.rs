@@ -817,7 +817,7 @@ pub(crate) struct HostTexture {
     sampled: bool,
     /// Explicit residency applies only to independent committed sampled copies.
     residency: Residency,
-    tiled: bool,
+    pub(crate) tiled: Option<std::sync::Arc<std::sync::Mutex<crate::tiles::Mapping>>>,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
     /// A shader-visible heap slot viewed it (diagnostics: [`texture_census`]).
@@ -847,12 +847,12 @@ impl HostTexture {
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         state: u32,
         castable: Vec<u32>,
-        tile_bytes: Option<u64>,
+        tile: Option<(u64, std::sync::Arc<std::sync::Mutex<crate::tiles::Mapping>>)>,
     ) -> Self {
         // SAFETY: plain query on a live resource.
         let desc = unsafe { texture.GetDesc() };
         let sampled = desc.Flags.0 & USES as i32 == 0;
-        let bytes = tile_bytes.unwrap_or_else(|| crate::host::host().map_or(0, |h| {
+        let bytes = tile.as_ref().map(|(bytes, _)| *bytes).unwrap_or_else(|| crate::host::host().map_or(0, |h| {
             // SAFETY: valid descriptor.
             let size = unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
             if size == u64::MAX { 0 } else { size }
@@ -870,7 +870,7 @@ impl HostTexture {
             bytes,
             sampled,
             residency: Residency::default(),
-            tiled: tile_bytes.is_some(),
+            tiled: tile.map(|(_, mapping)| mapping),
             used: false.into(),
             viewed: false.into(),
             key: None,
@@ -1588,12 +1588,12 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void, title_fed: b
     // and committed allocation. It publishes only fully initialized MIPs.
     if clear_value.is_none() && crate::tiles::enabled() {
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
-        if let Some((texture, bytes)) = crate::tiles::make(host, &plain, &formats) {
+        if let Some((texture, bytes, mapping)) = crate::tiles::make(host, &plain, &formats) {
             tracing::debug!(bytes, "sampled texture backed by pooled D3D12 tiles");
             crate::host::name(&texture, || {
                 format!("tiled texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
             });
-            return Some((HostTexture::new_with_size(texture, 0, castable_formats, Some(bytes)), false));
+            return Some((HostTexture::new_with_size(texture, 0, castable_formats, Some((bytes, mapping))), false));
         }
     }
     let mut placement = None;
@@ -2052,13 +2052,13 @@ static PRIORITY_COPIES: std::sync::Mutex<
 fn register_residency(copy: &std::sync::Arc<HostTexture>, initially_nonresident: bool) {
     use std::sync::atomic::Ordering::{Relaxed, Release};
     if !initially_nonresident && (!residency_priority_enabled()
-        || !priority_candidate(copy.sampled, copy.bytes, copy.tiled)
+        || !priority_candidate(copy.sampled, copy.bytes, copy.tiled.is_some())
         || copy.placement.is_some()
         || !evictable(copy))
     {
         return;
     }
-    debug_assert!(!copy.tiled && copy.placement.is_none() && copy.sampled);
+    debug_assert!(copy.tiled.is_none() && copy.placement.is_none() && copy.sampled);
     if initially_nonresident {
         NONRESIDENT_BYTES.fetch_add(copy.bytes, Relaxed);
         copy.residency.phase.store(RES_EVICTED, Release);
