@@ -648,10 +648,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
-        if let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
+        if let (Some(destination), Some(from)) = (
+            crate::resource::host_copy(dst),
             crate::resource::host_resource(src),
         ) {
+            let to = destination.texture.clone();
             let levelwise = crate::resource::dropped(dst, &to) != crate::resource::dropped(src, &from);
             if levelwise && !crate::resource::matching_copy_shape(dst, src) {
                 tracing::warn!("incompatible whole-texture copy with omitted mip levels");
@@ -665,9 +666,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             if levelwise {
-                copy_retained_levels(list, dst, &to, src, &from);
+                copy_retained_levels(list, dst, &destination, src, &from);
             } else {
-                crate::texture::host_writes(list, dst);
+                crate::texture::host_writes_mask(list, &destination, u32::MAX);
                 // SAFETY: an open list and live textures.
                 unsafe { list.list.CopyResource(&to, &from) };
             }
@@ -688,11 +689,12 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 fn copy_retained_levels(
     list: &crate::host::HostList,
     dst: This,
-    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    destination: &std::sync::Arc<crate::resource::HostTexture>,
     src: This,
     from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
 ) {
     use windows::Win32::Graphics::Direct3D12::*;
+    let to = &destination.texture;
     let location = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: the borrowed resource is kept alive by the list.
         pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -708,7 +710,7 @@ fn copy_retained_levels(
         unsafe { list.list.CopyTextureRegion(&location(to, d), 0, 0, 0, &location(from, s), None) };
         written |= crate::texture::host_mip_bit(d);
     }
-    crate::texture::host_writes_mask(list, dst, written);
+    crate::texture::host_writes_mask(list, destination, written);
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -750,12 +752,13 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        let Some(destination) = crate::resource::host_copy(dst.resource) else {
             if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
                 read_back(list, &dst, [x, y, z], &src, source_box);
             }
             return;
         };
+        let to = destination.texture.clone();
         let mut dst = dst;
         if dst.kind != FOOTPRINT && crate::resource::dropped(dst.resource, &to) > 0 {
             let Some(index) = crate::resource::host_subresource(dst.resource, &to, dst.footprint.offset as u32) else {
@@ -807,7 +810,7 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         let written = if dst.kind == FOOTPRINT { u32::MAX }
             else { crate::texture::host_mip_bit(dst.footprint.offset as u32) };
-        crate::texture::host_writes_mask(list, dst.resource, written);
+        crate::texture::host_writes_mask(list, &destination, written);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -992,11 +995,12 @@ extern "system" fn resolve(
 ) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
-        && let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
+        && let (Some(destination), Some(from)) = (
+            crate::resource::host_copy(dst),
             crate::resource::host_resource(src),
         )
     {
+        let to = destination.texture.clone();
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -1011,7 +1015,7 @@ extern "system" fn resolve(
         }
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_writes_mask(list, dst, crate::texture::host_mip_bit(dst_sub));
+        crate::texture::host_writes_mask(list, &destination, crate::texture::host_mip_bit(dst_sub));
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

@@ -843,7 +843,7 @@ impl HostTexture {
         Self::new_with_size(texture, state, castable, None)
     }
 
-    fn new_with_size(
+    pub(crate) fn new_with_size(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         state: u32,
         castable: Vec<u32>,

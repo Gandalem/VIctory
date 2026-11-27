@@ -332,8 +332,11 @@ unsafe impl Sync for Staging {}
 /// (submissions run in the order they are made, which need not be the
 /// order their lists were recorded in), and one run before it must still
 /// get its upload.
+#[cfg(test)]
 pub(crate) fn host_writes(list: &HostList, resource: This) {
-    host_writes_mask(list, resource, u32::MAX);
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        host_writes_mask(list, &copy, u32::MAX);
+    }
 }
 
 /// Single-slice tiled textures use host subresource indices as MIP bits.
@@ -342,19 +345,10 @@ pub(crate) fn host_mip_bit(level: u32) -> u32 {
     1u32.checked_shl(level).unwrap_or(0)
 }
 
-pub(crate) fn host_writes_mask(list: &HostList, resource: This, levels: u32) {
-    if let Some(copy) = crate::resource::host_copy(resource) {
-        if let Some(mapping) = &copy.tiled {
-            let mapping = mapping.clone();
-            // The reference tracked writes at submission. Here the existing
-            // synchronous completion callback can record actual completion
-            // and never publishes claims from reset, unsubmitted lists.
-            list.defer_after(move || {
-                mapping.lock().unwrap_or_else(|e| e.into_inner()).card_wrote(levels);
-            });
-        }
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
-    }
+pub(crate) fn host_writes_mask(list: &HostList, copy: &Arc<crate::resource::HostTexture>, levels: u32) {
+    list.defer_tile_write(copy, levels);
+    let copy = copy.clone();
+    list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
 }
 
 fn is_host_written(resource: This) -> bool {
@@ -384,13 +378,14 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    let (Some(a), Some(b), Some(host)) = (
+    let (Some(a), Some(destination), Some(host)) = (
         crate::resource::host_resource(from),
-        crate::resource::host_resource(to),
+        crate::resource::host_copy(to),
         host(),
     ) else {
         return;
     };
+    let b = destination.texture.clone();
     // An odd key: textures' own first uses are keyed by the host texture.
     if !list.first_use(to as usize | 1) {
         return;
@@ -442,7 +437,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
     let written = pairs.iter().fold(0, |mask, &(_, j)| mask | host_mip_bit(j as u32));
-    host_writes_mask(list, to, written);
+    host_writes_mask(list, &destination, written);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {

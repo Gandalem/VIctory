@@ -214,8 +214,8 @@ pub(crate) struct Mapping {
     /// The production full-chain path treats every initialized level as held.
     held: u32,
     card: u32,
-    /// Packed-group claims are used by the isolated partial-map path;
-    /// production initializes all groups before any list records a write.
+    /// Packed-group claims are acquired at submission, never recording.
+    /// Production initializes every group before a list records a write.
     claimed: u32,
 }
 
@@ -230,7 +230,6 @@ impl Mapping {
 
     /// Reference Tiled::without/claim/unclaim semantics, synchronized by
     /// this mapping's mutex. Claim whole packed groups, not just one MIP.
-    #[cfg(test)]
     fn claim(&mut self, levels: u32) -> u32 {
         let missing = group_mask(&self.groups, levels) & !self.mapped;
         let fresh = missing & !self.claimed;
@@ -268,24 +267,49 @@ impl Mapping {
     /// or terminates the run, so no in-flight leases can be reused.
     ///
     /// SAFETY: the caller must own a live resource matching these groups
-    /// and desc, in COMMON state, with no concurrent recording/submission
-    /// that accesses its mappings. For the title path this is guaranteed
-    /// only before first publication. The isolated test also waits for
-    /// all preceding work before extending the map.
+    /// and desc, with `before` the actual state, and exclude concurrent
+    /// GPU access until the mapper fence. The caller either has an
+    /// unpublished resource or holds the submission lock before preludes.
     unsafe fn map_more(&mut self, host: &crate::host::Host, texture: &ID3D12Resource,
-        desc: &D3D12_RESOURCE_DESC, wanted: u32) -> Option<u32> {
+        desc: &D3D12_RESOURCE_DESC, wanted: u32, before: D3D12_RESOURCE_STATES) -> Option<u32> {
         let additions = missing_groups(&self.groups, self.mapped, wanted)
             .map(|group| Some((group, take(&host.device, group.tiles)?)))
             .collect::<Option<Vec<_>>>()?;
         if additions.is_empty() {
             return Some(self.mapped);
         }
-        initialize(host, texture, desc, &additions)?;
+        initialize(host, texture, desc, &additions, before)?;
         let mapped = additions.iter().fold(self.mapped, |bits, (group, _)| bits | group.mask());
         self.leases.extend(additions.into_iter().map(|(_, lease)| lease));
         self.mapped = mapped;
         Some(mapped)
     }
+}
+
+/// Adapt cool_fox card_wrote_on admission to the synchronous renderer:
+/// initialize missing groups in a fenced mapper pass, not in each title
+/// list. Recording or resetting a list cannot clear another list's write.
+///
+/// SAFETY: the submission lock is held before any upload or state
+/// prelude; all earlier GPU work has completed.
+pub(crate) unsafe fn prepare_card_write(
+    host: &crate::host::Host,
+    copy: &crate::resource::HostTexture,
+    levels: u32,
+) -> bool {
+    let Some(mapping) = &copy.tiled else { return true };
+    let mut state = mapping.lock().unwrap_or_else(|e| e.into_inner());
+    let requested = group_mask(&state.groups, levels);
+    let missing = requested & !state.mapped;
+    if missing == 0 { return true; }
+    state.claim(missing);
+    // SAFETY: the copy is live; the mapper restores its actual state
+    // and completes its fence before returning.
+    let desc = unsafe { copy.texture.GetDesc() };
+    let before = D3D12_RESOURCE_STATES(copy.state.load(Relaxed) as i32);
+    let result = unsafe { state.map_more(host, &copy.texture, &desc, missing, before) };
+    state.unclaim(missing);
+    result.is_some_and(|mapped| mapped & requested == requested)
 }
 
 /// The resource itself retains the shared mapping state through
@@ -425,7 +449,7 @@ fn mapper(device: &ID3D12Device) -> Option<&'static Mutex<Mapper>> {
 }
 
 fn initialize(host: &crate::host::Host, texture: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC,
-    mappings: &[(Group, Lease)]) -> Option<()> {
+    mappings: &[(Group, Lease)], before: D3D12_RESOURCE_STATES) -> Option<()> {
     let mut footprints = Vec::with_capacity(desc.MipLevels as usize);
     let mut largest = 0u64;
     // Whole standard MIPs or every subresource in an added packed tail.
@@ -469,8 +493,11 @@ fn initialize(host: &crate::host::Host, texture: &ID3D12Resource, desc: &D3D12_R
     // SAFETY: the resources and command allocator are live. The mapping
     // commands will be placed on this queue before the closed copy list.
     unsafe {
-        list.ResourceBarrier(&[alias, crate::host::transition(texture,
-            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        list.ResourceBarrier(&[alias]);
+        if before != D3D12_RESOURCE_STATE_COPY_DEST {
+            list.ResourceBarrier(&[crate::host::transition(texture,
+                before, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        }
         for &(level, footprint) in &footprints {
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&zero),
@@ -484,8 +511,10 @@ fn initialize(host: &crate::host::Host, texture: &ID3D12Resource, desc: &D3D12_R
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
         }
-        list.ResourceBarrier(&[crate::host::transition(texture,
-            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+        if before != D3D12_RESOURCE_STATE_COPY_DEST {
+            list.ResourceBarrier(&[crate::host::transition(texture,
+                D3D12_RESOURCE_STATE_COPY_DEST, before)]);
+        }
         list.Close().ok()?;
     }
     let command: ID3D12CommandList = list.cast().ok()?;
@@ -604,7 +633,7 @@ pub(crate) fn make(host: &crate::host::Host, desc: &D3D12_RESOURCE_DESC,
     let mut state = mapping.lock().unwrap_or_else(|e| e.into_inner());
     let all = state.every_level();
     // SAFETY: reserve returned an unpublished COMMON-state resource.
-    if unsafe { state.map_more(host, &texture, &desc, all) }? != all {
+    if unsafe { state.map_more(host, &texture, &desc, all, D3D12_RESOURCE_STATE_COMMON) }? != all {
         return None;
     }
     state.held = all;
@@ -764,33 +793,56 @@ mod tests {
         };
         let before = usage().0;
         let (texture, desc, mapping) = reserve(host, &desc, &[]).expect("reserved texture");
-        let tail = {
-            let mut map = mapping.lock().unwrap();
+        let (tail, full_bytes) = {
+            let map = mapping.lock().unwrap();
             let tail = group_mask(&map.groups, 1 << 7);
             assert_ne!(tail, map.every_level());
-            // SAFETY: unpublished COMMON-state texture.
-            assert_eq!(unsafe { map.map_more(host, &texture, &desc, 1 << 7) }, Some(tail));
-            assert_eq!(usage().0, before + map.given_bytes());
-            tail
+            (tail, map.groups.iter().map(|g| u64::from(g.tiles) * TILE).sum())
         };
-        // Write a recognizable value into a mapped coarse MIP, then wait.
-        // The new mapping must not clear this already initialized group.
+        let copy = Arc::new(crate::resource::HostTexture::new_with_size(
+            texture.clone(), 0, Vec::new(), Some((full_bytes, mapping.clone())),
+        ));
+        let abandoned = record_texel(host, &copy, &desc, 0, 0xdeadbeef);
+        abandoned.reset();
+        drop(abandoned);
+        assert_eq!(mapping.lock().unwrap().mapped, 0);
+        assert_eq!(usage().0, before);
+        // Same new group, reverse recording order: initialize exactly once.
         let marker = 0x11223344;
-        write_texel(host, &texture, &desc, 7, marker);
-        {
-            let mut map = mapping.lock().unwrap();
-            map.card_wrote(1 << 7);
+        let first = record_texel(host, &copy, &desc, 7, marker);
+        let second = record_texel(host, &copy, &desc, 7, 0xaabbccdd);
+        host.execute(&[&second, &first]);
+        drop(first);
+        drop(second);
+        let tail_bytes = {
+            let map = mapping.lock().unwrap();
+            assert_eq!(map.mapped, tail);
+            assert_eq!(map.card, 1 << 7);
+            assert_eq!(map.claimed, 0);
             assert_eq!(map.first_shown(), Some(7));
-            let bytes = map.given_bytes();
-            // SAFETY: write_texel returned after a fence and restored COMMON.
-            assert_eq!(unsafe { map.map_more(host, &texture, &desc, 1 << 7) }, Some(tail));
-            assert_eq!(map.given_bytes(), bytes);
-            assert_eq!(unsafe { map.map_more(host, &texture, &desc, 1) }, Some(tail | 1));
-            assert!(map.given_bytes() > bytes);
+            assert_eq!(usage().0, before + map.given_bytes());
+            map.given_bytes()
+        };
+        let fine = 0x55667788;
+        let list = record_texel(host, &copy, &desc, 0, fine);
+        host.execute(&[&list]);
+        drop(list);
+        {
+            let map = mapping.lock().unwrap();
+            assert_eq!(map.mapped, tail | 1);
+            assert_eq!(map.card, (1 << 7) | 1);
+            assert_eq!(map.claimed, 0);
+            assert_eq!(map.first_shown(), Some(0));
+            assert!(map.given_bytes() > tail_bytes);
             assert_eq!(usage().0, before + map.given_bytes());
         }
-        assert_eq!(read_texels(host, &texture, &desc, [0, 7]), [0, marker]);
+        assert_eq!(read_texels(host, &texture, &desc, [0, 7]), [fine, marker]);
+        let untouched = tail & !(1 << 7);
+        if untouched != 0 {
+            assert_eq!(read_texels(host, &texture, &desc, [untouched.trailing_zeros(), 7]), [0, marker]);
+        }
         let retained = texture.clone();
+        drop(copy);
         drop(mapping);
         drop(texture);
         assert!(usage().0 > before);
@@ -798,14 +850,17 @@ mod tests {
         assert_eq!(usage().0, before);
     }
 
-    fn write_texel(host: &crate::host::Host, texture: &ID3D12Resource,
-        desc: &D3D12_RESOURCE_DESC, level: u32, value: u32) {
+    fn record_texel(host: &crate::host::Host, copy: &Arc<crate::resource::HostTexture>,
+        desc: &D3D12_RESOURCE_DESC, level: u32, value: u32) -> crate::host::HostList {
+        let texture = &copy.texture;
         let (upload, data) = host.upload_buffer(512).unwrap();
-        // SAFETY: the upload is mapped and holds one RGBA8 texel.
+        // SAFETY: mapped upload contains at least one RGBA8 texel.
         unsafe { data.cast::<u32>().write_unaligned(value) };
         let list = host.new_list().unwrap();
-        // SAFETY: the mapped test level and upload remain live; state is
-        // restored to COMMON and execute waits before returning.
+        list.keep(&upload);
+        list.defer_tile_write(copy, 1 << level);
+        // SAFETY: the list retains its destination and upload; submission
+        // admits missing backing before either command runs.
         unsafe {
             list.list.ResourceBarrier(&[crate::host::transition(texture,
                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
@@ -831,7 +886,7 @@ mod tests {
                 D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
         }
         list.close();
-        host.execute(&[&list]);
+        list
     }
 
     fn read_texels(host: &crate::host::Host, texture: &ID3D12Resource,

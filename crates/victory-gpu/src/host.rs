@@ -1173,6 +1173,8 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Actual destinations of tiled copies, retained until list reset.
+    tile_writes: Vec<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1380,6 +1382,24 @@ impl Host {
         if crate::tiles::enabled() {
             crate::tiles::maintain();
         }
+        // Merge destinations before any uploads or state preludes.
+        // The previous submission's actual resource states are still valid.
+        let mut tile_writes = std::collections::BTreeMap::<usize,
+            (std::sync::Arc<crate::resource::HostTexture>, u32)>::new();
+        for list in runs {
+            for (copy, levels) in &list.deferred().tile_writes {
+                let entry = tile_writes.entry(std::sync::Arc::as_ptr(copy) as usize)
+                    .or_insert_with(|| (copy.clone(), 0));
+                entry.1 |= *levels;
+            }
+        }
+        for (copy, levels) in tile_writes.values() {
+            // SAFETY: submission lock held, all prior work completed,
+            // no current state prelude has run.
+            if !unsafe { crate::tiles::prepare_card_write(self, copy, *levels) } {
+                fail(format_args!("could not back tiled texture write levels {levels:#x}"));
+            }
+        }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -1495,7 +1515,9 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        if WaitForSingleObject(self.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                        if WaitForSingleObject(self.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0
+                            || self.fence.GetCompletedValue() < *submitted
+                        {
                             fail(format_args!("host submission fence wait failed"));
                         }
                     }
@@ -1549,6 +1571,13 @@ impl Host {
                 last_notes(runs),
                 removed_during(runs, removed_in)
             ));
+        }
+        // Publish GPU-authored levels only after successful completion,
+        // before read-driven descriptor creation.
+        for (copy, levels) in tile_writes.values() {
+            if let Some(mapping) = &copy.tiled {
+                mapping.lock().unwrap_or_else(|e| e.into_inner()).card_wrote(*levels);
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -2357,6 +2386,14 @@ impl HostList {
         self.deferred().missed.push(Box::new(check));
     }
 
+    /// Record a tiled write against the exact host copy. A reset of an
+    /// unsubmitted list drops this request without claiming any tiles.
+    pub(crate) fn defer_tile_write(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, levels: u32) {
+        if copy.tiled.is_some() && levels != 0 {
+            self.deferred().tile_writes.push((copy.clone(), levels));
+        }
+    }
+
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
@@ -2384,7 +2421,8 @@ impl HostList {
     /// over).
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
-        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
+        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.tile_writes.is_empty()
+            && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
         drop(d);
         deferred_empty
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
