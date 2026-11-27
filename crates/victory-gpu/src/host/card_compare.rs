@@ -593,6 +593,105 @@ impl Host {
     }
 }
 
+/// Source declared_writes / CardPlan: group ranges by copy identity.
+/// Adapt to the marked-page and withholding paths of this branch; use
+/// a full compare whenever the list does not have bounded declarations.
+type CardScope = std::collections::BTreeMap<usize, Vec<(usize, usize)>>;
+
+fn ranges_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COMPARE_RANGES").is_some_and(|v| v == "1"))
+}
+
+fn add_range(scope: &mut CardScope, shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    address: usize, len: usize, bounded: bool)
+{
+    let Some(card) = shadow.card() else { return };
+    let (start, _) = shadow.range();
+    let size = card.size as usize;
+    let start = start as usize;
+    let (from, to) = if bounded {
+        (address.saturating_sub(start).min(size),
+         address.saturating_add(len).saturating_sub(start).min(size))
+    } else {
+        // Root UAVs have no reliable length in the current branch.
+        (0, size)
+    };
+    if from < to {
+        scope.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default().push((from, to));
+    }
+}
+
+/// Returns None for the original full-coverage path. An empty declaration
+/// set is not evidence that arbitrary command lists cannot have written.
+fn declared_scope(runs: &[&HostList]) -> Option<CardScope> {
+    if !ranges_enabled() {
+        return None;
+    }
+    let mut scope = CardScope::new();
+    let mut declared = false;
+    for list in runs {
+        let d = list.deferred();
+        if d.card_unbounded || !d.after.is_empty() || !d.missed.is_empty()
+            || d.copies.iter().any(|s| matches!(s, Step::Heap(..) | Step::Memory(..)))
+        {
+            return None;
+        }
+        for step in &d.copies {
+            if let Step::GpuWrite(shadow, address, len, marked, _) = step {
+                declared = true;
+                add_range(&mut scope, shadow, *address, *len, *marked);
+            }
+        }
+    }
+    if !declared {
+        return None;
+    }
+    for (shadow, address, len) in crate::shadow::card_mark_ranges()? {
+        add_range(&mut scope, &shadow, address, len, true);
+    }
+    Some(scope)
+}
+
+/// Join the reference's 64 KiB piece runs. The comparison hashes a whole
+/// piece and updates its baseline, so fetch the whole piece too, not just
+/// a declared subrange. Distinct spans have disjoint result offsets.
+fn compare_spans(start: usize, size: usize, ranges: Option<&[(usize, usize)]>) -> Vec<CardSpan> {
+    let Some(ranges) = ranges else {
+        return (size != 0).then(|| card_span_of(start, 0, size)).into_iter().collect();
+    };
+    let runs = ranges.iter().filter_map(|&(from, to)| {
+        let to = to.min(size);
+        if from >= to {
+            return None;
+        }
+        let pieces = pieces_of(start, from, to);
+        let lo = piece_at(start, size, pieces.start).0;
+        let hi = piece_at(start, size, pieces.end - 1).1;
+        Some(card_span_of(start, lo, hi))
+    }).collect();
+    joined_piece_runs(runs)
+}
+
+#[test]
+fn declared_compare_spans_cover_each_touched_piece_once() {
+    let start = 4096;
+    let size = 6 * PIECE;
+    let ranges = [(3, 9), (7, 12), (PIECE - start - 1, PIECE - start + 1),
+        (4 * PIECE, 4 * PIECE + 4), (size, size + 1)];
+    let spans = compare_spans(start, size, Some(&ranges));
+    assert_eq!(spans.iter().map(|s| (s.first, s.pieces)).collect::<Vec<_>>(), [(0, 2), (4, 1)]);
+    assert_eq!(spans[0].from, 0);
+    assert_eq!(spans[0].to as usize, 2 * PIECE - start);
+    assert_eq!(spans[1].from as usize, 4 * PIECE - start);
+    assert_eq!(spans[1].to as usize, 5 * PIECE - start);
+    assert!(compare_spans(start, size, Some(&[])).is_empty());
+    assert_eq!(compare_spans(start, size, None), [card_span_of(start, 0, size)]);
+    // First and last partial pages must cover all padded GPU bytes.
+    let edge = compare_spans(start, size, Some(&[(size - 1, size)]));
+    assert_eq!(edge[0].to as usize, size);
+}
+
 impl Host {
     /// Adapt the source card_before: copy CPU-dirty ranges, then hash the
     /// joined pieces on the device before the title's lists execute.
@@ -630,48 +729,68 @@ impl Host {
         self.run_card_list(CardPhase::Sync, list, submitted);
     }
 
-    /// Adapt source card_back: compare on the device, read flags after the
-    /// fence, fetch flagged pieces, then make their bytes available to the
-    /// existing CPU snapshot/marked-page merge. Compare all live card
-    /// copies conservatively, including unbounded descriptor writes.
-    pub(super) fn card_back(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>], submitted: &mut u64) {
+    /// Adapt source card_back: compare on the device, read flags after
+    /// the fence and land flagged full pieces before the CPU merge.
+    /// Full coverage is the default and the conservative fallback.
+    pub(super) fn card_back(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>],
+        runs: &[&HostList], submitted: &mut u64)
+    {
         if copies.is_empty() {
             return;
         }
-        let list = self.card_list(CardPhase::Check);
-        for shadow in copies {
-            let Some(card) = shadow.card() else { continue };
+        let scope = declared_scope(runs);
+        let plans: Vec<_> = copies.iter().enumerate().filter_map(|(copy, shadow)| {
+            let card = shadow.card()?;
             let (start, _) = shadow.range();
-            let span = card_span_of(start as usize, 0, card.size as usize);
-            // SAFETY: the title submission has finished. The buffers and
-            // UAVs are live, in COMMON, and promoted by their respective use.
+            let ranges = scope.as_ref().map(|s| s.get(&(std::sync::Arc::as_ptr(shadow) as usize))
+                .map_or(&[][..], Vec::as_slice));
+            let spans = compare_spans(start as usize, card.size as usize, ranges);
+            (!spans.is_empty()).then_some((copy, spans))
+        }).collect();
+        if plans.is_empty() {
+            return;
+        }
+        let list = self.card_list(CardPhase::Check);
+        for (copy, spans) in &plans {
+            let shadow = &copies[*copy];
+            let card = shadow.card().expect("planned card copy");
+            // SAFETY: the title submission finished. All buffers live,
+            // and spans are disjoint complete pieces with valid flag offsets.
             unsafe {
                 card.work.bind(&list.list, &shadow.buffer);
-                card_pass(&list.list, &span, card.size as u32, 0, 2);
+                for span in spans {
+                    card_pass(&list.list, span, card.size as u32, span.first, 2);
+                }
                 compare_barrier(&list.list);
                 list.list.ResourceBarrier(&[transition(&card.work.differs,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                list.list.CopyBufferRegion(&card.work.flags, 0, &card.work.differs, 0,
-                    u64::from(span.pieces) * 4);
+                for span in spans {
+                    let at = u64::from(span.first) * 4;
+                    list.list.CopyBufferRegion(&card.work.flags, at, &card.work.differs, at,
+                        u64::from(span.pieces) * 4);
+                }
             }
         }
         self.run_card_list(CardPhase::Check, list, submitted);
         let mut fetches = Vec::new();
         let mut total = 0u64;
-        for (copy, shadow) in copies.iter().enumerate() {
-            let Some(card) = shadow.card() else { continue };
+        for (copy, spans) in plans {
+            let shadow = &copies[copy];
+            let card = shadow.card().expect("planned card copy");
             let (start, _) = shadow.range();
-            let span = card_span_of(start as usize, 0, card.size as usize);
-            // SAFETY: the persistent flag readback is large enough for
-            // this span, and the checked compare fence has completed.
-            let flags = unsafe { std::slice::from_raw_parts(card.work.flags_data as *const u32, span.pieces as usize) };
             let mut ranges: Vec<(usize, usize)> = Vec::new();
-            for (i, flag) in flags.iter().enumerate() {
-                if flag & 1 != 0 {
-                    let (from, to) = card_piece_of(start as usize, card.size as usize, &span, i as u32);
-                    match ranges.last_mut() {
-                        Some(last) if last.1 == from => last.1 = to,
-                        _ => ranges.push((from, to)),
+            for span in spans {
+                // SAFETY: only read the flags copied for this span, from
+                // the live persistent mapping after its checked fence.
+                let flags = unsafe { std::slice::from_raw_parts(
+                    (card.work.flags_data as *const u32).add(span.first as usize), span.pieces as usize) };
+                for (i, flag) in flags.iter().enumerate() {
+                    if flag & 1 != 0 {
+                        let (from, to) = card_piece_of(start as usize, card.size as usize, &span, i as u32);
+                        match ranges.last_mut() {
+                            Some(last) if last.1 == from => last.1 = to,
+                            _ => ranges.push((from, to)),
+                        }
                     }
                 }
             }

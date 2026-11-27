@@ -617,6 +617,9 @@ impl State {
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
+        if p.stages.iter().any(|s| s.memory.is_some() || s.translated().host.heap) {
+            list.note_card_unbounded();
+        }
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.

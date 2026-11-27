@@ -1278,6 +1278,8 @@ struct Deferred {
     waits: Vec<crate::hold::ValueWait>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// A shader may address buffers beyond its declared ranges.
+    card_unbounded: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -1824,7 +1826,7 @@ impl Host {
             .collect();
         // The title fence has completed. Restore changed GPU pieces to
         // the CPU side before the existing marked/declared merge paths.
-        self.card_back(&carded, &mut submitted);
+        self.card_back(&carded, runs, &mut submitted);
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
@@ -2546,6 +2548,12 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+    }
+
+    /// A shader uses heap indexing or title-memory addressing: the
+    /// reference's declared ranges alone are insufficient here.
+    pub(crate) fn note_card_unbounded(&self) {
+        self.deferred().card_unbounded = true;
     }
 
     /// Shaders of the list take views from the heap itself

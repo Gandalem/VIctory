@@ -1372,6 +1372,45 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
+/// Snapshot the current GPU write marks without clearing them. The
+/// reference's declared-range planner must also cover this branch's
+/// marked-page copy-back, including held-back memory writes. Called
+/// after the title fence and before copy_back_marks, under submitted.
+pub(crate) fn card_mark_ranges() -> Option<Vec<(Arc<Shadow>, usize, usize)>> {
+    let maps = [bitmap(false)?, bitmap(true)?];
+    let m = marks();
+    let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+    let used = (m.end as usize).div_ceil(32).min(words);
+    let mut out = Vec::new();
+    for b in maps {
+        // SAFETY: the GPU completed its writes and the submission lock
+        // excludes further GPU writes or clearing of the mapped bitmap.
+        let bits = unsafe { std::slice::from_raw_parts(b.data as *const u32, words) };
+        // The last bit represents an untrackable write. Do not narrow.
+        if bits[words - 1] & (1 << 31) != 0 {
+            return None;
+        }
+        for (w, &word) in bits[..used].iter().enumerate() {
+            let mut x = word;
+            while x != 0 {
+                let n = (w * 32) as u32 + x.trailing_zeros();
+                x &= x - 1;
+                let (&base, owner) = m.owners.range(..=n).next_back()?;
+                let copy = owner.upgrade()?;
+                let k = n - base;
+                if k >= pages(copy.start, copy.len) {
+                    return None;
+                }
+                if copy.card().is_some() {
+                    let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
+                    out.push((copy, page, PAGE));
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 /// After a submission: every page its shaders marked as written through
 /// views goes back ([`Shadow::copy_back_marked`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title

@@ -281,9 +281,15 @@ reusing it after each checked fence. Admission reserves space for the
 largest copy; if later growth fails, bounded batches reuse that space.
 The source's sync/check/fetch command allocator and list reuse is also
 connected: one pair per phase, returned only after a checked fence.
-The internal lists bypass the unrelated tile-upload path. This
-conservative port still compares all live card copies; the source's
-picked-range planner and async relay are not imported.
+The internal lists bypass the unrelated tile-upload path. Experimental
+`VICTORY_CARD_COMPARE_RANGES=1` adapts the source's declared-range
+planner to the current write marks. It compares only joined whole
+64 KiB pieces of bounded declarations plus both GPU write bitmaps;
+unbounded root ranges compare their whole copy. Heap-indexed and
+title-memory shaders, unknown marks, and undeclared-only submissions
+fall back to full comparison. The default remains full coverage.
+The source's picked-view discovery and async relay are not imported.
+This optional range path needs real-adapter verification.
 Loose windows and exact-view arenas stay on the existing path. Run the
 ignored `carded_shadow_refresh_compare_and_copy_back` test with
 `VICTORY_CARD_BUFFERS=1` and `VICTORY_CARD_BUFFERS_MIN_KB=64` on a real
