@@ -5,7 +5,7 @@
 //! registers previously found live UAV ranges before a future submission,
 //! never retroactively lands a discovery, and keeps full GPU coverage.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use crate::pipeline::Shader;
@@ -209,6 +209,233 @@ fn picked_declarations_exclude_same_copy_and_overlapping_title_pages() {
     assert!(conflicts((1, 2 * page - 1, 2), (2, 2 * page, 4)));
     assert!(!conflicts((1, page, page), (2, 2 * page, page)));
     assert!(!conflicts((1, page, 0), (1, page, 4)));
+}
+
+/// Opt-in scheduling of discovery from completed comparison flags.
+/// The reference reduces GPU work by delaying hashes and using mode 1
+/// look-only compares. This branch shares the hash baseline with CPU
+/// merge, so do not delay its GPU reads or modify its landing semantics.
+pub(crate) fn rotates() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PICKED_ROTATE").is_some_and(|v| v == "1"))
+}
+
+/// Reference picked::slice, with a checked/saturating byte conversion.
+fn slice() -> u64 {
+    static SLICE: OnceLock<u64> = OnceLock::new();
+    *SLICE.get_or_init(|| {
+        let mb = std::env::var("VICTORY_PICKED_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        mb.unwrap_or(32).max(1).saturating_mul(1 << 20)
+    })
+}
+
+/// A buffer the heap shows unordered views of: copy offsets, from the
+/// first to the last.
+struct Shown {
+    copy: Weak<Shadow>,
+    from: u64,
+    to: u64,
+}
+
+#[derive(Default)]
+struct State {
+    shown: BTreeMap<u64, Shown>,
+    /// The copies (by number) found written through picked views.
+    found: BTreeSet<u64>,
+    /// Where the next slice begins: copy, offset from its first address.
+    next: (u64, u64),
+    /// The frame of the last slice; frame zero is also eligible.
+    frame: Option<u64>,
+    /// One unexplained flagged piece per not-yet-found copy. The original
+    /// GPU comparison stays full, so evidence must survive skipped turns.
+    pending: BTreeMap<u64, (u64, u64)>,
+}
+
+static PROBES: Mutex<Option<State>> = Mutex::new(None);
+
+impl State {
+    /// The ranges of the next `most` bytes in turn, at most all once.
+    fn turn(&mut self, most: u64) -> Vec<(u64, u64, u64)> {
+        let mut out: Vec<(u64, u64, u64)> = Vec::new();
+        let mut left = most;
+        // (The one it begins in may come twice: its end first.)
+        for _ in 0..=self.shown.len() {
+            let (copy, offset) = self.next;
+            let Some((&id, s)) = self.shown.range(copy..).next().or_else(|| self.shown.iter().next()) else {
+                break;
+            };
+            let offset = if id == copy { offset } else { 0 };
+            let len = s.to - s.from;
+            let n = len.saturating_sub(offset).min(left);
+            if n > 0 && !self.found.contains(&id) {
+                if out.iter().any(|r| r.0 == id) {
+                    break;
+                }
+                out.push((id, s.from + offset, n));
+                left -= n;
+                if offset + n < len {
+                    self.next = (id, offset + n);
+                    break;
+                }
+            }
+            self.next = (id + 1, 0);
+            if left == 0 {
+                break;
+            }
+        }
+        out
+    }
+}
+
+impl State {
+    /// Consume evidence only when its bytes fall inside the current turn.
+    /// No re-hash or late write-back: the evidence was captured from the
+    /// completed submission where it occurred. A found copy needs no
+    /// further rotating discovery.
+    fn take_seen(&mut self, most: u64) -> Vec<(u64, u64)> {
+        let mut found = Vec::new();
+        for (id, at, len) in self.turn(most) {
+            let hit = self.pending.get(&id).is_some_and(|&(lo, hi)|
+                lo < at.saturating_add(len) && at < hi);
+            if hit {
+                if let Some((lo, _)) = self.pending.remove(&id) {
+                    self.found.insert(id);
+                    found.push((id, lo));
+                }
+            }
+        }
+        found
+    }
+
+    fn take_frame(&mut self, frame: u64, most: u64) -> Vec<(u64, u64)> {
+        if self.frame == Some(frame) {
+            return Vec::new();
+        }
+        self.frame = Some(frame);
+        self.take_seen(most)
+    }
+}
+
+/// Both vectors name exact live owners and copy-relative byte ranges.
+/// Keep pending evidence even if a view disappears before its turn,
+/// but never use an old view to declare writes: known_ranges still
+/// requires the UAV to be present in the current submission.
+pub(crate) fn rotate(shown: Vec<Range>, evidence: Vec<Range>) {
+    if !rotates() {
+        return;
+    }
+    let known = {
+        let mut found = FOUND.lock().unwrap_or_else(|e| e.into_inner());
+        found.retain(|_, owner| owner.strong_count() != 0);
+        found.keys().map(|&id| id as u64).collect::<BTreeSet<_>>()
+    };
+    let ready = {
+        let mut state = PROBES.lock().unwrap_or_else(|e| e.into_inner());
+        let state = state.get_or_insert_with(State::default);
+        state.found = known;
+        state.shown.retain(|id, view| view.copy.strong_count() != 0
+            && state.pending.contains_key(id) && !state.found.contains(id));
+        state.pending.retain(|id, _| state.shown.contains_key(id));
+        for (copy, from, len) in shown {
+            let id = Arc::as_ptr(&copy) as u64;
+            if len == 0 || state.found.contains(&id) {
+                continue;
+            }
+            let from = from as u64;
+            let to = from.saturating_add(len as u64);
+            let e = state.shown.entry(id).or_insert_with(|| Shown {
+                copy: Arc::downgrade(&copy), from, to,
+            });
+            (e.from, e.to) = (e.from.min(from), e.to.max(to));
+        }
+        for (copy, from, len) in evidence {
+            let id = Arc::as_ptr(&copy) as u64;
+            if let Some(view) = state.shown.get_mut(&id)
+                && !state.found.contains(&id) && len != 0
+            {
+                let lo = from as u64;
+                let hi = lo.saturating_add(len as u64);
+                // A hash covers a whole piece; preserve its intersection
+                // with the known UAV hull, even for an unaligned view.
+                let (lo, hi) = (lo.max(view.from), hi.min(view.to));
+                if lo < hi {
+                    state.pending.entry(id).or_insert((lo, hi));
+                }
+            }
+        }
+        state.take_frame(crate::frame::current(), slice()).into_iter()
+            .filter_map(|(id, at)| Some((state.shown.get(&id)?.copy.upgrade()?, at as usize)))
+            .collect::<Vec<_>>()
+    };
+    // Do not hold the probe lock while updating the found registry.
+    for (copy, at) in ready {
+        found(&copy, at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(sizes: &[u64]) -> State {
+        let mut state = State::default();
+        for (i, &n) in sizes.iter().enumerate() {
+            let from = (i as u64 + 1) << 32;
+            state.shown.insert(i as u64 * 3 + 2, Shown { copy: Weak::new(), from, to: from + n });
+        }
+        state
+    }
+
+    /// Every byte in turn, none left out, whatever the slice.
+    #[test]
+    fn all_buffers_are_looked_at_in_turn() {
+        let sizes = [100u64, 7, 1000, 1, 350];
+        let total: u64 = sizes.iter().sum();
+        for most in [1u64, 10, 99, 350, 1000, 5000] {
+            let mut s = state(&sizes);
+            let mut seen = std::collections::BTreeMap::<u64, u64>::new();
+            // (A turn ends with the list: it may take one more.)
+            let turns = total.div_ceil(most) + sizes.len() as u64 + 1;
+            for _ in 0..turns {
+                let turn = s.turn(most);
+                assert!(turn.iter().map(|r| r.2).sum::<u64>() <= most);
+                for (id, at, n) in turn {
+                    let from = s.shown[&id].from;
+                    for b in at - from..at - from + n.min(2000) {
+                        *seen.entry(id << 32 | b).or_default() += 1;
+                    }
+                }
+            }
+            assert_eq!(seen.len() as u64, total, "slices of {most}");
+        }
+    }
+
+    #[test]
+    fn what_was_found_has_no_turn() {
+        let mut s = state(&[64, 64, 64]);
+        s.found.insert(5);
+        let turn = s.turn(1000);
+        assert_eq!(turn.iter().map(|r| r.0).collect::<Vec<_>>(), [2, 8]);
+        assert!(state(&[]).turn(10).is_empty());
+        let mut all = state(&[64]);
+        all.found.insert(2);
+        assert!(all.turn(10).is_empty());
+    }
+}
+
+#[test]
+fn rotating_evidence_survives_a_skipped_frame_and_is_consumed_once() {
+    let mut s = State::default();
+    s.shown.insert(2, Shown { copy: Weak::new(), from: 0, to: 16 });
+    s.shown.insert(5, Shown { copy: Weak::new(), from: 0, to: 16 });
+    s.pending.insert(5, (4, 5));
+    assert!(s.take_frame(0, 16).is_empty());
+    assert_eq!(s.pending.get(&5), Some(&(4, 5)));
+    assert!(s.take_frame(0, 16).is_empty(), "only one turn per frame");
+    assert_eq!(s.take_frame(1, 16), [(5, 4)]);
+    assert!(s.pending.is_empty());
+    assert!(s.found.contains(&5));
+    assert!(s.take_frame(2, 32).is_empty());
 }
 
 /// A hash flags a whole piece, not individual bytes. Any declaration or

@@ -716,6 +716,9 @@ pub(super) fn finish_picked(ranges: &[crate::picked::Range], withholding: bool) 
 struct PickedObservation {
     shown: CardScope,
     declared: CardScope,
+    // At most one unexplained piece per candidate owner, since the
+    // reference's found registry promotes the whole copy.
+    evidence: std::collections::BTreeMap<usize, (usize, usize)>,
 }
 
 fn picked_observation(runs: &[&HostList]) -> Option<PickedObservation> {
@@ -751,17 +754,41 @@ fn picked_observation(runs: &[&HostList]) -> Option<PickedObservation> {
     for (shadow, address, len) in crate::shadow::card_mark_ranges()? {
         add_range(&mut declared, &shadow, address, len, true);
     }
-    Some(PickedObservation { shown, declared })
+    Some(PickedObservation { shown, declared, evidence: Default::default() })
 }
 
 impl PickedObservation {
-    fn flagged(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, hi: usize) {
+    fn flagged(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, hi: usize) {
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         let Some(shown) = self.shown.get(&key) else { return };
         let declared = self.declared.get(&key).map_or(&[][..], Vec::as_slice);
         if crate::picked::unexplained((lo, hi), shown, declared) {
-            crate::picked::found(shadow, lo);
+            if crate::picked::rotates() {
+                self.evidence.entry(key).or_insert((lo, hi));
+            } else {
+                crate::picked::found(shadow, lo);
+            }
         }
+    }
+
+    /// Feed the source's rotating scheduler only after consuming the
+    /// real GPU comparison flags. Staging and GPU baseline are unaffected.
+    fn finish_observation(self, copies: &[std::sync::Arc<crate::shadow::Shadow>]) {
+        if !crate::picked::rotates() {
+            return;
+        }
+        let mut shown = Vec::new();
+        let mut evidence = Vec::new();
+        for shadow in copies {
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            if let Some(ranges) = self.shown.get(&key) {
+                shown.extend(ranges.iter().map(|&(lo, hi)| (shadow.clone(), lo, hi - lo)));
+            }
+            if let Some(&(lo, hi)) = self.evidence.get(&key) {
+                evidence.push((shadow.clone(), lo, hi - lo));
+            }
+        }
+        crate::picked::rotate(shown, evidence);
     }
 }
 
@@ -851,7 +878,7 @@ impl Host {
             return;
         }
         let scope = declared_scope(runs);
-        let picked = picked_observation(runs);
+        let mut picked = picked_observation(runs);
         let plans: Vec<_> = copies.iter().enumerate().filter_map(|(copy, shadow)| {
             let card = shadow.card()?;
             let (start, _) = shadow.range();
@@ -900,7 +927,7 @@ impl Host {
                 for (i, flag) in flags.iter().enumerate() {
                     if flag & 1 != 0 {
                         let (from, to) = card_piece_of(start as usize, card.size as usize, &span, i as u32);
-                        if let Some(picked) = &picked {
+                        if let Some(picked) = &mut picked {
                             picked.flagged(shadow, from, to);
                         }
                         match ranges.last_mut() {
@@ -914,6 +941,9 @@ impl Host {
                 fetches.push((copy, lo, hi));
                 total += (hi - lo) as u64;
             }
+        }
+        if let Some(picked) = picked {
+            picked.finish_observation(copies);
         }
         if fetches.is_empty() {
             return;

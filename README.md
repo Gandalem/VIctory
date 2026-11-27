@@ -302,7 +302,16 @@ submission are merged. Existing declarations, aliased title pages,
 ambiguous memory callbacks, held-back writes or unknown/overlapping
 GPU marks take precedence: cancel automatic landing and release its
 snapshot. This does not retroactively land the original discovery.
-The source's rotating GPU probes and async relay remain unported.
+Experimental `VICTORY_PICKED_ROTATE=1` (with `VICTORY_PICKED_WRITES=1`
+or `2`) ports the reference's once-per-frame rotation scheduler and
+coverage tests. `VICTORY_PICKED_MB` sets the logical probe slice (32 MiB
+by default). This branch retains one unexplained flagged piece per
+candidate until its turn, so a one-time observation is not dropped
+between frames. It rotates discovery over completed comparison flags,
+not GPU hashing: the normal comparison, readback and merge still run
+at their existing coverage. A removed UAV cannot be used for a later
+automatic declaration. The source's reduced GPU compare workload,
+look-only hash mode and async relay remain unported.
 Run the ignored `picked_writes_land_only_after_discovery` test with
 the card-buffer options and `VICTORY_PICKED_WRITES=2` on an adapter.
 These optional paths need real-adapter verification.
