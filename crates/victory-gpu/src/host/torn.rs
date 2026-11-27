@@ -77,8 +77,7 @@ fn hash_plain(bytes: &[u8]) -> u32 {
 fn hash_avx2(bytes: &[u8]) -> u32 {
     use std::arch::x86_64::*;
     let mut parts = seeds();
-    let rows = bytes.chunks_exact(1024);
-    let rest = rows.remainder();
+    let (rows, rest) = bytes.as_chunks::<1024>();
     let mul = _mm256_setr_epi32(
         MUL[0] as i32, MUL[1] as i32, MUL[2] as i32, MUL[3] as i32, MUL[0] as i32, MUL[1] as i32, MUL[2] as i32, MUL[3] as i32,
     );
