@@ -405,26 +405,38 @@ not returned while the resource lives. This option is disabled by
 default: the dedicated initialization fence and zero fill may outweigh
 pooling savings; validate both correctness and performance on Windows.
 The upstream first-use texture creation and whole-texture descriptor
-invalidation/eviction remain in use. The older committed-resource
-Evict/MakeResident state machine is not restored in this integration.
+invalidation/eviction remain in use. Placed and reserved resources are
+excluded from the committed-resource residency state machine below.
 
-## Experimental committed texture residency priorities
+## Experimental committed texture residency
 
-`VICTORY_TEXTURE_RESIDENCY=1` restores the paging-priority portion of
-the earlier 0d427fb4 port: under the current local or sampled allocation
-pressure policy, committed, title-memory-fed sampled textures of at
-least 1 MiB receive a LOW priority hint after five seconds of inactivity.
-Active textures and textures which became host-written return to NORMAL
-on a subsequent sweep, as do cold textures when pressure clears.
-At most 128 priority changes are attempted per second. Placed resources,
-reserved tile-backed resources, writable textures and twins are excluded.
-Unsupported drivers leave the normal allocation and eviction path intact.
+`VICTORY_TEXTURE_RESIDENCY=1` restores the conservative state machine
+from 0d427fb4 and ff33360. Independent committed sampled textures
+of at least 1 MiB may be explicitly evicted only while never published
+to GPU callers, after two seconds under local or sampled residency
+pressure. A per-copy gate restores residency before the first GPU-facing
+access and permanently excludes exposed copies from explicit eviction.
+Exposed cold textures receive LOW priority after five seconds and
+return to NORMAL when active or pressure clears. Oldest unpublished
+copies are considered first, with at most 128 transitions per second.
+Placed, reserved, writable and twin resources are excluded.
 
-This is a driver paging hint, not explicit eviction, a measured VRAM
-saving, or a change to resource lifetime. Current upstream whole-texture
-eviction and descriptor rebuilding are unchanged; the earlier
-Evict/MakeResident and deferred nonresident creation paths are not
-restored. The option is off by default pending Windows and GPU validation.
+`VICTORY_LAZY_RESIDENCY=1` (requires the first switch) also restores
+CREATE_NOT_RESIDENT admission for eligible committed fallbacks, retaining
+castable formats and the resident fallback on unsupported drivers.
+Existing tile and placed allocation paths take precedence. Failure to
+restore residency stops the run rather than publishing a nonresident
+texture. Logical nonresident bytes are balanced at creation, eviction,
+restoration and destruction. Local headroom uses the greater of DXGI
+usage and the estimated resident allocation size; the explicit sampled
+allocation cap still counts all logical allocations.
+
+The latest renderer already makes host textures on demand and rebuilds
+evicted descriptors; this port does not reintroduce eager creation.
+Most newly created textures are exposed immediately, so these options
+may provide little additional saving or cost more than they recover.
+No physical VRAM savings have been measured. Both switches are off by
+default pending Windows and GPU validation.
 
 ## Debugging
 

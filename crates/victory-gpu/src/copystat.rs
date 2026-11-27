@@ -328,6 +328,8 @@ pub(crate) fn log(frames: f64) {
         nonlocal_budget_mib = ?video.map(|m| m[2] >> 20),
         nonlocal_usage_mib = ?video.map(|m| m[3] >> 20),
         sampled_texture_logical_mib = sampled >> 20,
+        sampled_texture_nonresident_logical_mib = crate::resource::nonresident_texture_bytes() >> 20,
+        sampled_texture_resident_estimate_mib = sampled.saturating_sub(crate::resource::nonresident_texture_bytes()) >> 20,
         target_texture_logical_mib = targets >> 20,
         tiled_mapped_mib = mapped_tiles >> 20,
         tiled_heap_capacity_mib = tile_heaps >> 20,
