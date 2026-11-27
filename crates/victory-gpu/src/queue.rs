@@ -123,7 +123,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         let mut held = held();
         for &l in lists {
             for segment in crate::list::segments(l) {
-                let waits = segment.waits();
+                let waits = segment.host().waits();
                 held.push(this as usize, Item::Segment(segment, waits));
             }
         }
@@ -154,7 +154,7 @@ use crate::hold::Item;
 
 /// Every queue's held work.
 #[cfg(windows)]
-type Holding = crate::hold::Held<std::sync::Arc<crate::host::HostList>>;
+type Holding = crate::hold::Held<crate::list::Detached>;
 
 #[cfg(windows)]
 static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held::new());
@@ -204,13 +204,13 @@ fn pump(held: &mut Holding, why: Why) {
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
-    let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
+    let mut run = |_: usize, segments: Vec<crate::list::Detached>| {
+        let lists: Vec<&crate::host::HostList> = segments.iter().map(crate::list::Detached::host).collect();
         let at = std::time::Instant::now();
         host.execute(&lists);
         ran += at.elapsed();
         drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
+        segments.into_iter().for_each(crate::list::Detached::recycle);
     };
     let mut signal = |f: usize, value: u64| {
         crate::fence::set(f as This, value);

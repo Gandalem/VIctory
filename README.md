@@ -413,9 +413,22 @@ back to the private direct fetch. Run the ignored
 `relay_copy_queue_reads_completed_direct_writes` test on an adapter
 with a high-priority copy queue.
 This is still a serialized queue handoff, not the source's concurrent
-copy-queue relay. Persistent suspect/refetch tracking, detached title
-lists and overlapping title submissions remain unported.
-The default is unchanged. The ignored
+copy-queue relay. Persistent suspect/refetch tracking and overlapping
+title submissions remain unported.
+Experimental `VICTORY_LIST_DETACH=1` adapts the reference's Detached
+list/recording ownership to this branch's segmented Arc-based queues.
+All submitted segments share one owner for uploads and draw state,
+including dynamic descriptor slots; repeat submissions of the same
+closed recording retain it too. Reset and Release can leave these
+owners with the queue. Recycle after checked execution, and keep
+resources until the last submitted or title reference is gone. Unlike
+the source, retain the closed recording for repeat submissions until
+Reset instead of replacing it at submission time. On Reset, prepare
+every required replacement before changing the recording; allocation
+failure returns E_OUTOFMEMORY without consuming its resources.
+The queue remains synchronous. Run the ignored
+`detached_segments_survive_title_reset_and_release` test on an adapter.
+The default keeps the existing Arc/leave path. The ignored
 `carded_shadow_refresh_compare_and_copy_back` and
 `picked_writes_land_only_after_discovery` adapter tests can also
 be run with `VICTORY_FETCH_CHECK=1`. Run the ignored
