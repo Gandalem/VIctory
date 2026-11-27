@@ -10,7 +10,8 @@
 //! same physical pages) in the runtime's memory; elsewhere, a content hash
 //! of the whole memory at every submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! Tracked textures detile retained source spans touched by dirty pages;
+//! untracked textures may opt into per-span content hashes.
 //! Textures read through descriptor tables are brought up to date, and for
 //! shaders that index the heap themselves every texture with a resource
 //! object the heap views (`crate::bindless`); textures the title placed in
@@ -57,6 +58,8 @@ pub(crate) struct Staging {
     /// its start, whole layout blocks); empty where the layout gives none.
     spans: Vec<(usize, usize)>,
     last: Mutex<Last>,
+    /// Retry a failed detile even when the dirty tracker is now clean.
+    retry: std::sync::atomic::AtomicBool,
     /// Uploads [`record_upload`] recorded, and the subresources they
     /// copied.
     uploads: std::sync::atomic::AtomicU64,
@@ -69,27 +72,67 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     hashes: Vec<Option<blake3::Hash>>,
+    // Retained source-span hashes for the opt-in untracked path.
+    span_hashes: SpanHashes,
+    // A layout that rejected bounded detiling uses the full-source fallback.
+    full_source: bool,
 }
 
-/// Per subresource of `layout` (`mips` per array slice; a 3D texture's
-/// are its mips), the bytes of the texture's memory it lies in, rounded out
-/// to the layout's blocks; empty if the layout cannot say.
+type SourceGroups = std::collections::BTreeMap<(usize, usize), Vec<usize>>;
+type SpanHashes = std::collections::BTreeMap<(usize, usize), blake3::Hash>;
+
+/// Exact conservative source interval from the format layout. Packed tails
+/// share an interval; volumes keep the full layout. No corner-based
+/// approximation is used for swizzled layouts.
 fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32, first_mip: u32) -> Vec<(usize, usize)> {
-    use victory_formats::texture::Dimension;
-    let d = &layout.desc;
-    let block = layout.alignment.max(256);
+    if mips == 0 {
+        return Vec::new();
+    }
     (0..count)
         .map(|i| {
             let (mip, slice) = (i % mips + first_mip, i / mips);
-            let m = layout.mips.get(mip as usize)?;
-            let (z0, z1) = if d.dimension == Dimension::Tex3d { (0, m.depth.max(1) - 1) } else { (slice, slice) };
-            let first = layout.offset(mip, 0, 0, z0).ok()?;
-            let last = layout.offset(mip, m.width.max(1) - 1, m.height.max(1) - 1, z1).ok()? + u64::from(d.element_bytes);
-            let (from, to) = (first / block * block, last.div_ceil(block) * block);
-            Some((from as usize, (to.min(layout.size)) as usize))
+            let (a, b) = layout.source_span(mip, slice)?;
+            Some((usize::try_from(a).ok()?, usize::try_from(b).ok()?))
         })
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default()
+}
+
+/// Group mips that share packed source bytes, as in the original fork's
+/// tracked and untracked source-span refreshes. Unsupported intervals
+/// are rejected before touching any GPU staging memory.
+fn source_groups(spans: &[(usize, usize)], count: usize, size: usize) -> Option<SourceGroups> {
+    if spans.len() != count {
+        return None;
+    }
+    let mut groups = SourceGroups::new();
+    for (i, &(a, b)) in spans.iter().enumerate() {
+        if a >= b || b > size {
+            return None;
+        }
+        groups.entry((a, b)).or_default().push(i);
+    }
+    Some(groups)
+}
+
+fn span_dirty((a, b): (usize, usize), start: usize, dirty: &[(usize, usize)]) -> bool {
+    dirty.iter().any(|&(from, to)| from < start + b && to > start + a)
+}
+
+/// The old fork's per-span hash census, independent of mutable descriptors.
+/// Return the retained subresources whose source changed, once per span.
+fn changed_source_spans(groups: &SourceGroups, previous: &SpanHashes, tiled: &[u8]) -> (SpanHashes, Vec<u32>) {
+    let mut next = SpanHashes::new();
+    let mut fresh = Vec::new();
+    for (&(a, b), indices) in groups {
+        let digest = blake3::hash(&tiled[a..b]);
+        if previous.get(&(a, b)) != Some(&digest) {
+            fresh.extend(indices.iter().map(|&i| i as u32));
+        }
+        next.insert((a, b), digest);
+    }
+    fresh.sort_unstable();
+    (next, fresh)
 }
 
 /// Staging buffers for detiles to reuse, by size: the menu movie rewrites
@@ -610,7 +653,8 @@ impl Staging {
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
-        self.tracked.as_ref().is_none_or(|t| !t.clean())
+        self.retry.load(std::sync::atomic::Ordering::Relaxed)
+            || self.tracked.as_ref().is_none_or(|t| !t.clean())
     }
 
     /// A staging buffer with the texture memory detiled into it if it
@@ -639,74 +683,82 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
-            // Most refreshes find nothing: the tracker's dense bit says so
-            // without its lock (123,000 refreshes a frame, run evict3).
-            if t.clean() {
+            // Most tracked refreshes remain a single clean-bit check.
+            use std::sync::atomic::Ordering::Relaxed;
+            let retry = self.retry.load(Relaxed);
+            if t.clean() && !retry {
                 return (0, None);
             }
             let ranges = t.take(start, start + size);
-            if ranges.is_empty() {
+            if ranges.is_empty() && !retry {
                 return (0, None);
             }
-            // Only the subresources in the pages that changed (streamed
-            // textures change page by page; a whole re-read and detile of
-            // each cost up to 430 MB a frame, run integ2).
             let n = self.footprints.len();
-            let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
-            let touched: Vec<usize> = (0..n)
-                .filter(|&i| {
-                    let (a, b) = span(i);
-                    ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
-                })
-                .collect();
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page. Not kept: it would
-            // double each texture's system memory. Only the touched spans
-            // are written, and only they are hashed and detiled.
-            let mut scratch = Scratch::take(size);
-            let read = &mut scratch.0[..size];
-            let mut bytes = 0;
-            let mut done: Vec<(usize, usize)> = Vec::new();
-            for &i in &touched {
-                let (a, b) = span(i);
-                if !done.contains(&(a, b)) {
-                    // SAFETY: inside the buffer of the texture's size.
-                    crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
-                    (bytes, _) = (bytes + b - a, done.push((a, b)));
-                }
-            }
-            // A changed page that holds only the subresource's bytes says it
-            // changed. Pages it shares with other data the title writes
-            // (small textures): its own bytes decide. (Hashing a movie frame
-            // cost 8 ms a frame.)
-            let page = crate::watch::PAGE;
+            // Port bd1c79f7's bounded per-span scratch reads, retaining
+            // the current renderer's per-submission staging allocation.
+            let groups = (!last.full_source).then(|| source_groups(&self.spans, n, size)).flatten();
+            let bounded = groups.is_some();
+            let groups = groups.unwrap_or_else(|| {
+                std::iter::once(((0, size), (0..n).collect())).collect()
+            });
+            let mut bytes = 0usize;
+            let mut fresh = Vec::new();
+            let mut staging = None;
+            let mut failed = false;
             last.hashes.resize(n, None);
-            let fresh: Vec<u32> = touched
-                .into_iter()
-                .filter(|&i| {
-                    let (a, b) = span(i);
-                    let (a0, b0) = (start + a, start + b);
-                    if ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
-                        last.hashes[i] = None;
-                        return true;
+            let page = crate::watch::PAGE;
+            'groups: for ((a, b), indices) in groups {
+                if !retry && !span_dirty((a, b), start, &ranges) {
+                    continue;
+                }
+                // Only the selected span is read into CPU scratch. Packed
+                // tails share this read; an unsupported layout reads whole.
+                let mut scratch = Scratch::take(b - a);
+                crate::host::copy_mapped(scratch.0.as_mut_ptr(), self.memory.wrapping_add(a), b - a, false);
+                bytes = bytes.saturating_add(b - a);
+                // Preserve the upstream whole-dirty-page fast path and
+                // hash shared pages only once per distinct source span.
+                let (a0, b0) = (start + a, start + b);
+                let whole_page = ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0));
+                let digest = (!whole_page).then(|| blake3::hash(&scratch.0));
+                let changed: Vec<usize> = indices.into_iter().filter(|&i| {
+                    let changed = retry || whole_page || last.hashes[i] != digest;
+                    last.hashes[i] = digest;
+                    changed
+                }).collect();
+                if changed.is_empty() {
+                    continue;
+                }
+                if staging.is_none() {
+                    staging = staging_space(self.size);
+                }
+                let Some((_, _, data)) = &staging else {
+                    failed = true;
+                    break;
+                };
+                for i in changed {
+                    if !self.detile_one(&scratch.0, *data, i, bounded) {
+                        // Retry using the original full-layout path if the
+                        // bounded format walk rejected this layout.
+                        last.full_source |= bounded;
+                        failed = true;
+                        break 'groups;
                     }
-                    let hash = blake3::hash(&read[a..b]);
-                    last.hashes[i].replace(hash) != Some(hash)
-                })
-                .map(|i| i as u32)
-                .collect();
-            if fresh.is_empty() {
-                return (bytes, None);
-            }
-            let buffer = self.detile(read, &fresh);
-            if buffer.is_none() {
-                for &i in &fresh {
-                    last.hashes[i as usize] = None;
+                    fresh.push(i as u32);
                 }
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
-            return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
+            if failed {
+                // Consumed dirty pages alone cannot schedule a retry.
+                // Never publish a partially prepared upload.
+                last.hashes.clear();
+                self.retry.store(true, Relaxed);
+                return (bytes, None);
+            }
+            self.retry.store(false, Relaxed);
+            fresh.sort_unstable();
+            return (bytes, staging.map(|(b, at, _)| (b, at, fresh)));
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -742,15 +794,42 @@ impl Staging {
     }
 
     fn refresh_untracked(&self, last: &mut Last, tiled: &[u8]) -> (usize, Option<Upload>) {
+        static PARTIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let partial = *PARTIAL.get_or_init(|| std::env::var("VICTORY_PARTIAL_UNTRACKED_UPLOADS").as_deref() == Ok("1"));
         let size = tiled.len();
-        let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return (size, None);
         }
-        let every = all();
+        // 2c9e2a13: retain the whole-image digest, but skip detiling and
+        // GPU copies for source spans whose contents did not change.
+        if partial && self.footprints.len() > 1 && self.footprints.len() <= 256
+            && let Some(groups) = source_groups(&self.spans, self.footprints.len(), size)
+        {
+            let (next, fresh) = changed_source_spans(&groups, &last.span_hashes, tiled);
+            if fresh.is_empty() {
+                last.hash = Some(hash);
+                last.span_hashes = next;
+                return (size, None);
+            }
+            let buffer = self.detile(tiled, &fresh);
+            if buffer.is_some() {
+                last.hash = Some(hash);
+                last.span_hashes = next;
+            } else {
+                // The upstream staging allocation is per submission. On a
+                // failure retry all retained spans and publish no upload.
+                last.hash = None;
+                last.span_hashes.clear();
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            return (size, buffer.map(|(b, at)| (b, at, fresh)));
+        }
+        last.span_hashes.clear();
+        let every: Vec<u32> = (0..self.footprints.len() as u32).collect();
         let buffer = self.detile(tiled, &every);
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
@@ -778,24 +857,34 @@ impl Staging {
             }
         }
         for &i in subresources {
-            let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
-            let (mip, slice) = (i % self.mips, i / self.mips);
-            let f = footprint.Footprint;
-            let pitch = f.RowPitch as usize;
-            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
-            // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
-            // keeping the slice strictly inside the mapped staging buffer even when
-            // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip + self.first_mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+            if !self.detile_one(tiled, data, i as usize, false) {
                 return None;
             }
         }
         Some((buffer, at))
+    }
+
+    /// Port the original fork's one-subresource format walk, targeting a
+    /// range owned by this submission instead of a permanent mapping.
+    fn detile_one(&self, tiled: &[u8], data: *mut u8, i: usize, span: bool) -> bool {
+        let footprint = &self.footprints[i];
+        let rows = self.rows[i];
+        let (mip, slice) = (i as u32 % self.mips + self.first_mip, i as u32 / self.mips);
+        let f = footprint.Footprint;
+        let pitch = f.RowPitch as usize;
+        let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
+        // SAFETY: the length is clamped to the staging allocation; this
+        // worker owns that range until the submission is prepared.
+        let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+        let result = if span {
+            self.layout.detile_span(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+        } else {
+            self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+        };
+        if let Err(e) = &result {
+            tracing::warn!(?e, mip, slice, "texture not detiled");
+        }
+        result.is_ok()
     }
 }
 
@@ -918,6 +1007,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         tracked: crate::watch::track(memory as usize, layout_size, true),
         spans,
         last: Mutex::default(),
+        retry: true.into(),
         uploads: Default::default(),
         copied: Default::default(),
     });
@@ -936,6 +1026,38 @@ mod tests {
         assert_eq!(chunk_len([256 * mb, mb].into_iter(), 128 * mb, 32), 1);
         assert_eq!(chunk_len(std::iter::repeat_n(mb, 100), 128 * mb, 32), 32);
         assert_eq!(chunk_len(std::iter::empty(), 128 * mb, 32), 0);
+    }
+
+    #[test]
+    fn tracked_source_groups_select_only_intersecting_array_slices() {
+        let groups = source_groups(&[(0, 64), (64, 128), (64, 128)], 3, 128).unwrap();
+        assert_eq!(groups.get(&(64, 128)), Some(&vec![1, 2]));
+        let dirty = [(1000 + 64, 1000 + 128)];
+        let touched: Vec<_> = groups.iter()
+            .filter(|(span, _)| span_dirty(**span, 1000, &dirty))
+            .flat_map(|(_, indices)| indices.iter().copied()).collect();
+        assert_eq!(touched, [1, 2]);
+        assert!(source_groups(&[(0, 129)], 1, 128).is_none());
+        assert!(source_groups(&[(64, 64)], 1, 128).is_none());
+        assert!(source_groups(&[(0, 64)], 2, 128).is_none());
+    }
+
+    #[test]
+    fn untracked_span_hashes_skip_unchanged_slices_and_share_packed_tails() {
+        let groups = source_groups(&[(0, 64), (64, 128), (64, 128)], 3, 128).unwrap();
+        let mut bytes = vec![0x37u8; 128];
+        let (first, changed) = changed_source_spans(&groups, &SpanHashes::new(), &bytes);
+        assert_eq!(changed, [0, 1, 2]);
+        assert_eq!(first.len(), 2);
+        assert!(changed_source_spans(&groups, &first, &bytes).1.is_empty());
+        bytes[64] = 0x91;
+        let (second, changed) = changed_source_spans(&groups, &first, &bytes);
+        assert_eq!(changed, [1, 2]);
+        assert!(changed_source_spans(&groups, &second, &bytes).1.is_empty());
+        bytes[0] = 0x72;
+        assert_eq!(changed_source_spans(&groups, &second, &bytes).1, [0]);
+        // A failed upload clears the census, causing every span to retry.
+        assert_eq!(changed_source_spans(&groups, &SpanHashes::new(), &bytes).1, [0, 1, 2]);
     }
 
     #[test]
@@ -970,6 +1092,10 @@ mod tests {
                 let len = pitch * rows;
                 let mut expected = vec![0u8; len];
                 title.detile(&bytes, mip + drop, slice, &mut expected, pitch, len).unwrap();
+                let (a, b) = upload.spans[host_index];
+                let mut actual = vec![0u8; len];
+                title.detile_span(&bytes[a..b], mip + drop, slice, &mut actual, pitch, len).unwrap();
+                assert_eq!(actual, expected);
             }
         }
         std::mem::drop(upload);

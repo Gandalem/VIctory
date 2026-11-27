@@ -317,6 +317,16 @@ intervals for each Shadow remain serial. An unmarked GPU write refreshes
 only the copy whose snapshot it needs; marked writes keep the upstream
 page-arm shortcut. All jobs are joined before title writes or GPU execution.
 
+Tracked texture preparation reads only dirty retained source spans into
+temporary CPU scratch, sharing packed-tail reads and falling back to the
+whole layout when needed. Failed detiles are retried even if the dirty
+tracker is clean; partial uploads are never published.
+
+`VICTORY_PARTIAL_UNTRACKED_UPLOADS=1` also selects changed retained spans
+for untracked textures (up to 256 subresources), using content hashes.
+It still reads and hashes the whole source, but avoids unchanged
+detiling and GPU copies. The default untracked upload path is unchanged.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
