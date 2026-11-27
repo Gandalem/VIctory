@@ -2540,7 +2540,8 @@ impl HostList {
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
                     if !marked {
-                        batch.flush();
+                        // Only this copy needs to be current for its snapshot.
+                        batch.flush_one(shadow);
                     }
                     shadow.writing(*address, *len, *marked);
                     continue;
@@ -2659,6 +2660,28 @@ pub(crate) fn take_refresh_savings() -> [u64; 2] {
     REFRESH_SAVINGS.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
 }
 
+/// One independent host allocation and its exact uncovered byte ranges.
+/// All ranges of the same Shadow stay on one worker: its dirty-page
+/// tracker, snapshots and persistent mapping must not race themselves.
+struct RefreshJob {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl RefreshJob {
+    fn run(self) -> usize {
+        let mut copied = 0usize;
+        for (a, b) in self.ranges {
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            copied += self.shadow.update(a, b - a);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::range(a, b - a, started.elapsed().as_micros() as u64, 0);
+        }
+        copied
+    }
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
@@ -2694,40 +2717,67 @@ impl Batch {
         self.current.clear();
     }
 
-    /// Does the refreshes; returns the bytes copied.
+    /// Reserve the exact uncovered ranges for one job. The caller always
+    /// waits for all jobs before any later step observes this coverage.
+    fn refresh_job(&mut self, shadow: std::sync::Arc<crate::shadow::Shadow>, ranges: RefreshRanges) -> Option<RefreshJob> {
+        #[cfg(feature = "diagnostics")]
+        REFRESH_SAVINGS[0].fetch_add(ranges.gap_bytes(), Ordering::Relaxed);
+        let key = std::sync::Arc::as_ptr(&shadow) as usize;
+        let (_, current) = self.current.entry(key)
+            .or_insert_with(|| (shadow.clone(), RefreshRanges::default()));
+        let mut jobs = Vec::new();
+        for (from, to) in ranges.0 {
+            let missing = current.missing(from, to);
+            #[cfg(feature = "diagnostics")]
+            {
+                let bytes: usize = missing.iter().map(|&(a, b)| b - a).sum();
+                REFRESH_SAVINGS[1].fetch_add((to - from - bytes) as u64, Ordering::Relaxed);
+            }
+            for (a, b) in missing {
+                current.insert(a, b);
+                jobs.push((a, b));
+            }
+        }
+        (!jobs.is_empty()).then_some(RefreshJob { shadow, ranges: jobs })
+    }
+
+    fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> usize {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let Some(index) = self.pending.remove(&key) else { return 0 };
+        let (shadow, ranges) = self.refreshes.swap_remove(index);
+        if let Some((moved, _)) = self.refreshes.get(index) {
+            self.pending.insert(std::sync::Arc::as_ptr(moved) as usize, index);
+        }
+        let started = std::time::Instant::now();
+        let copied = self.refresh_job(shadow, ranges).map_or(0, RefreshJob::run);
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        copied
+    }
+
+    /// Does the refreshes; returns the bytes copied. Independent shadows
+    /// have distinct mapped allocations. Source memory is read-only here;
+    /// its shared page-protection registry is synchronized by watch.
+    /// Keep the original fence and title-writing barriers.
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
-        let mut total = 0;
-        for (shadow, ranges) in self.refreshes.drain(..) {
-            #[cfg(feature = "diagnostics")]
-            REFRESH_SAVINGS[0].fetch_add(ranges.gap_bytes(), Ordering::Relaxed);
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, current) = self.current.entry(key)
-                .or_insert_with(|| (shadow.clone(), RefreshRanges::default()));
-            for (from, to) in ranges.0 {
-                // A previous flush may already have copied part of this
-                // view. Never refresh that part again until title_written.
-                let missing = current.missing(from, to);
-                #[cfg(feature = "diagnostics")]
-                {
-                    let bytes: usize = missing.iter().map(|&(a, b)| b - a).sum();
-                    REFRESH_SAVINGS[1].fetch_add((to - from - bytes) as u64, Ordering::Relaxed);
-                }
-                for (a, b) in missing {
-                    let started = std::time::Instant::now();
-                    let copied = shadow.update(a, b - a);
-                    let us = started.elapsed().as_micros() as u64;
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::range(a, b - a, us, 0);
-                    PREPARING[0].fetch_add(us, Ordering::Relaxed);
-                    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-                    total += copied;
-                    current.insert(a, b);
-                }
-            }
+        if self.refreshes.is_empty() {
+            return 0;
         }
+        let started = std::time::Instant::now();
+        let refreshes = std::mem::take(&mut self.refreshes);
+        let jobs: Vec<_> = refreshes.into_iter().filter_map(|(shadow, ranges)| self.refresh_job(shadow, ranges)).collect();
+        let threads = if jobs.len() >= 4 && !crate::shadow::memory_pressured() {
+            crate::texture_workers::configured_threads()
+        } else {
+            1
+        };
+        let total: usize = crate::texture_workers::ordered_map(jobs, threads, RefreshJob::run).into_iter().sum();
+        // Report elapsed wall time rather than the sum of worker times.
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(total as u64, Ordering::Relaxed);
         total
     }
 }
@@ -4252,6 +4302,56 @@ mod batch {   // `mod tests` is already taken at the top of this file
         drop(batch);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn refresh_one_keeps_other_copies_pending_and_parallel_flush_reads_each() {
+        use crate::watch::{PAGE, tests as pools};
+        let mut copies = Vec::new();
+        for i in 0..5usize {
+            let p = pools::pool(2);
+            // SAFETY: test owns both writable pages.
+            unsafe {
+                (p as *mut u32).write_volatile((i + 11) as u32);
+                ((p + PAGE) as *mut u32).write_volatile((i + 31) as u32);
+            }
+            crate::shadow::register(p, p as u64, (2 * PAGE) as u64);
+            let Some(copy) = crate::shadow::find(p as u64, (2 * PAGE) as u64) else {
+                crate::shadow::unregister(p, p as u64);
+                pools::free(p);
+                for (p, copy) in copies {
+                    crate::shadow::unregister(p, p as u64);
+                    drop(copy);
+                    pools::free(p);
+                }
+                return;
+            };
+            copies.push((p, copy));
+        }
+        let mut batch = Batch::default();
+        for (p, copy) in &copies {
+            batch.add(copy, *p, PAGE);
+        }
+        assert_eq!(batch.flush_one(&copies[1].1), PAGE);
+        assert_eq!(batch.pending.len(), 4);
+        // The last pending entry moved into the removed slot. Adding a
+        // second page must update the right job, not the removed one.
+        batch.add(&copies[4].1, copies[4].0 + PAGE, PAGE);
+        assert_eq!(batch.flush(), 5 * PAGE);
+        for (i, (p, copy)) in copies.iter().enumerate() {
+            assert_eq!(copy.read_host(*p as u64, 1)[0], (i + 11) as u32);
+        }
+        assert_eq!(copies[4].1.read_host((copies[4].0 + PAGE) as u64, 1)[0], 35);
+        for (p, copy) in &copies {
+            batch.add(copy, *p, PAGE);
+        }
+        assert_eq!(batch.flush(), 0);
+        drop(batch);
+        for (p, copy) in copies {
+            crate::shadow::unregister(p, p as u64);
+            drop(copy);
+            pools::free(p);
+        }
     }
 
     /// A host copy of tracked title memory: a submission whose lists all ask

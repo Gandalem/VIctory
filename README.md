@@ -311,6 +311,12 @@ is serial. Tracked reads use the existing checked copy; untracked reads
 are serial unless `VICTORY_PARALLEL_UNTRACKED=1` opts into owned kernel
 snapshots. GPU recording, upload lifetimes and fence ordering are unchanged.
 
+Independent buffer copies use the same bounded workers when at least
+four jobs are ready and CPU memory is not pressured. Exact uncovered
+intervals for each Shadow remain serial. An unmarked GPU write refreshes
+only the copy whose snapshot it needs; marked writes keep the upstream
+page-arm shortcut. All jobs are joined before title writes or GPU execution.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
