@@ -511,8 +511,16 @@ metadata after completion. Failed direct maps retry serially;
 failed unmaps restore the previous owner metadata. Duplicate
 destinations and read-after-map dependencies break groups.
 Larger mapped-view edits, multi-page alias ranges and self-alias
-ranges retain the serial path. The source auto-thread policy and
-priority changes are not enabled. Like the source, independent
+ranges retain the serial path. `VICTORY_MAP_THREADS=auto` ports
+the source Busy/asked_threads/side_by_side controller: sample
+mapping-call elapsed time over 250 ms windows; switch from 1
+to 16 threads above 25% mapping time and return to 1 at or
+below 5%. Keep the batch callback installed even while idle,
+sample only in auto mode, and initialize the source wide pool
+on demand. Fixed default 1 and maximum 16 are retained here.
+The source threshold regression test is included unchanged.
+Thread-priority changes and diagnostics switching are not enabled.
+Like the source, independent
 batch operations may finish even if another operation fails.
 GPU alternate-view journal and overlapping title flights remain
 unported.

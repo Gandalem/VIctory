@@ -19,7 +19,7 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
-    if super::xmem::map_threads() > 1 {
+    if super::xmem::map_batch_enabled() {
         victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     }
     #[cfg(windows)]

@@ -10,7 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
@@ -934,6 +934,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    let _busy = Busy::begin();
     let mut physical = physical();
     // Keep the whole transaction visible, including the gap between views.
     let _changing = victory_gpu::title_memory_remapping();
@@ -1014,6 +1015,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    let _busy = Busy::begin();
     let mut physical = physical();
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
@@ -1041,12 +1043,89 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
-/// Source xmem::side_by_side: opt-in on this branch, capped to
-/// 16 threads including the caller. No priority changes or auto mode.
-pub(super) fn map_threads() -> usize {
-    static THREADS: LazyLock<usize> = LazyLock::new(|| std::env::var("VICTORY_MAP_THREADS")
-        .ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1usize).clamp(1, 16));
-    *THREADS
+/// Source side_by_side: retain this branch's fixed default of one
+/// thread, or select 1/16 with the source auto hysteresis.
+fn map_threads() -> usize {
+    match asked_threads() {
+        Some(n) => n,
+        None if BUSY.2.load(Ordering::Relaxed) => WIDE,
+        None => 1,
+    }
+}
+
+/// Keep the many-page callback installed even while auto is idle.
+pub(super) fn map_batch_enabled() -> bool {
+    asked_threads() != Some(1)
+}
+
+/// Threads while the title streams fast: they stand in the host's queue side
+/// by side, each for a millisecond or two a page in the world's first seconds.
+const WIDE: usize = 16;
+
+/// `VICTORY_MAP_THREADS` as a number; `None`: by how much there is to map.
+fn asked_threads() -> Option<usize> {
+    static ASKED: LazyLock<Option<usize>> = LazyLock::new(|| {
+        match std::env::var("VICTORY_MAP_THREADS") {
+            Ok(v) if v.trim() == "auto" => None,
+            v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1).clamp(1, 16)),
+        }
+    });
+    *ASKED
+}
+
+/// Of the window under way: when it began, the nanoseconds spent mapping in
+/// it; and whether the last one was busy.
+static BUSY: (Mutex<Option<std::time::Instant>>, AtomicU64, std::sync::atomic::AtomicBool) =
+    (Mutex::new(None), AtomicU64::new(0), std::sync::atomic::AtomicBool::new(false));
+
+/// Counts the time a mapping call of the title's takes, as long as it lives.
+/// More than a quarter of a window, and the calls are what loading waits for
+/// (one thread of the title's makes them); less than a twentieth, they are
+/// not any more.
+struct Busy(std::time::Instant);
+
+impl Busy {
+    fn begin() -> Option<Busy> {
+        // The existing fixed-thread path does not need sampling.
+        asked_threads().is_none().then(|| Busy(std::time::Instant::now()))
+    }
+}
+
+/// Whether mapping is busy after a window of `window` with `spent` in it.
+fn busy_after(was: bool, spent: std::time::Duration, window: std::time::Duration) -> bool {
+    spent * if was { 20 } else { 4 } > window
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+        // Serialize accumulation and reset; simultaneous callers must
+        // not lose a sample during the source window's rollover.
+        let mut began = BUSY.0.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let spent = (now - self.0).as_nanos() as u64;
+        let all = BUSY.1.fetch_add(spent, Ordering::Relaxed) + spent;
+        let window = now - *began.get_or_insert(self.0);
+        if window < WINDOW {
+            return;
+        }
+        *began = Some(now);
+        BUSY.1.store(0, Ordering::Relaxed);
+        let was = BUSY.2.load(Ordering::Relaxed);
+        let is = busy_after(was, std::time::Duration::from_nanos(all), window);
+        if was != is {
+            BUSY.2.store(is, Ordering::Relaxed);
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if asked_threads().is_none() && SAID.fetch_add(1, Ordering::Relaxed) < 200 {
+                tracing::info!(
+                    "title pages are mapped by {} (VICTORY_MAP_THREADS): {:.0} ms of the last {:.0} ms went into mapping calls",
+                    if is { "several threads" } else { "the caller alone" },
+                    all as f64 / 1e6,
+                    window.as_secs_f64() * 1e3
+                );
+            }
+        }
+    }
 }
 
 const GROUP: usize = 64;
@@ -1067,6 +1146,7 @@ fn independent_prefix(wanted: &[(usize, Option<usize>)]) -> usize {
 fn scatter_with(wanted: &[(usize, usize)], threads: usize) -> bool {
     let mut at = 0;
     while at < wanted.len() {
+        let _busy = Busy::begin();
         let mut p = physical();
         let _changing = victory_gpu::title_memory_remapping();
         let mut touched = std::collections::HashSet::new();
@@ -1122,6 +1202,7 @@ fn map_aliases_with(ranges: &[(u64, u64, u64)], threads: usize) -> bool {
         let wanted: Vec<_> = ranges[at..].iter().take(GROUP).take_while(|r| eligible(r))
             .map(|&(to, from, _)| (to as usize, (from != 0).then_some(from as usize))).collect();
         let n = independent_prefix(&wanted);
+        let _busy = Busy::begin();
         let mut p = physical();
         let _changing = victory_gpu::title_memory_remapping();
         let mut ops = Vec::with_capacity(n);
@@ -1284,7 +1365,8 @@ mod mapping_pool {
         static STARTED: std::sync::Once = std::sync::Once::new();
         let pool = POOL.get_or_init(|| Pool { batches: Mutex::default(), more: Condvar::new() });
         STARTED.call_once(|| {
-            for i in 1..threads {
+            // Source pool sizing: auto reserves the wide pool once.
+            for i in 1..super::asked_threads().unwrap_or(super::WIDE).max(threads) {
                 let _ = std::thread::Builder::new().name(format!("victory-mapping-{i}")).spawn(move || serve(pool));
             }
         });
@@ -1969,6 +2051,15 @@ mod tests {
         }
         assert_eq!(p.holes.len(), 1);
         assert_eq!(p.holes.get(&(65_537 * PAGE)), Some(&PAGE));
+    }
+
+    #[test]
+    fn mapping_is_busy_from_a_quarter_of_the_time_to_a_twentieth() {
+        let ms = std::time::Duration::from_millis;
+        assert!(!busy_after(false, ms(60), ms(250)) && busy_after(false, ms(70), ms(250)));
+        assert!(busy_after(true, ms(15), ms(250)) && !busy_after(true, ms(12), ms(250)));
+        // A window without a call, then one short one.
+        assert!(!busy_after(true, ms(5), ms(4000)));
     }
 
     #[test]
