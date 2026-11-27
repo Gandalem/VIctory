@@ -1320,6 +1320,13 @@ impl Host {
         }
     }
 
+    /// Best-effort preparation between synchronous submissions; never
+    /// block a worker on the active GPU submission.
+    pub(crate) fn prepare_heap_ahead(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
+        let Ok(_submitted) = self.submitted.try_lock() else { return };
+        crate::bindless::prepare_ahead(viewed);
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -1336,6 +1343,7 @@ impl Host {
         crate::resource::evict_unused();
         // Refresh pressure even on submissions without a new presented frame.
         video_memory_bytes();
+        crate::bindless::maintain_ready();
         crate::resource::maintain_residency_priority(self);
         if crate::tiles::enabled() {
             crate::tiles::maintain();
@@ -1385,8 +1393,8 @@ impl Host {
         drop(uploading);
         let runs: Vec<&HostList> = uploads
             .as_ref()
-            .map(|u| u.list())
             .into_iter()
+            .flat_map(|u| u.lists())
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];
@@ -2292,6 +2300,8 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
             deferred.copies.push(Step::Heap(viewed.clone()));
+            drop(deferred);
+            crate::bindless::kick(viewed);
         }
     }
 

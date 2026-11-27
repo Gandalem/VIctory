@@ -62,6 +62,8 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
     /// Retry a failed detile even when the dirty tracker is now clean.
     retry: std::sync::atomic::AtomicBool,
+    /// Invalidate earlier speculative preparations on any newer refresh.
+    revision: std::sync::atomic::AtomicU64,
     /// Uploads [`record_upload`] recorded, and the subresources they
     /// copied.
     uploads: std::sync::atomic::AtomicU64,
@@ -497,8 +499,24 @@ pub(crate) fn record_upload(
     list: &HostList,
     copy: &Arc<crate::resource::HostTexture>,
     staging: &Staging,
-    (buffer, at, subresources): &Upload,
+    upload: &Upload,
 ) -> Option<D3D12_RESOURCE_BARRIER> {
+    record_upload_inner(list, copy, staging, upload, true)
+}
+
+fn count_upload(staging: &Staging, upload: &Upload) {
+    staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    staging.copied.fetch_add(upload.2.len() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn record_upload_inner(
+    list: &HostList,
+    copy: &Arc<crate::resource::HostTexture>,
+    staging: &Staging,
+    upload: &Upload,
+    count: bool,
+) -> Option<D3D12_RESOURCE_BARRIER> {
+    let (buffer, at, subresources) = upload;
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     if let Some(b) = list.move_texture(copy, COPY_DEST) {
@@ -507,8 +525,9 @@ pub(crate) fn record_upload(
     }
     copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
     list.keep(buffer);
-    staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    if count {
+        count_upload(staging, upload);
+    }
     list.move_texture(copy, SHADER_RESOURCE)
 }
 
@@ -653,6 +672,102 @@ fn parallel_untracked() -> bool {
 /// submission-owned upload buffers. No worker outlives this call.
 pub(crate) type RefreshWork = (Arc<Staging>, Arc<crate::resource::HostTexture>, u32);
 
+/// A private speculative upload from the earlier heap-worker port.
+/// It does not retain a title object pointer and its bytes cannot be
+/// recycled with the ordinary submission pool.
+pub(crate) struct AheadUpload {
+    copy: Arc<crate::resource::HostTexture>,
+    staging: Arc<Staging>,
+    upload: Upload,
+    revision: u64,
+}
+
+fn ahead_current(prepared: u64, current: u64, clean: bool, retry: bool) -> bool {
+    prepared == current && clean && retry
+}
+
+impl AheadUpload {
+    pub(crate) fn copy(&self) -> &Arc<crate::resource::HostTexture> {
+        &self.copy
+    }
+
+    pub(crate) fn staging(&self) -> &Arc<Staging> {
+        &self.staging
+    }
+
+    /// Called only under the host submission lock, before the normal
+    /// refresh pass. A later preparation or dirty write invalidates us.
+    pub(crate) fn revalidate(&self, work: &RefreshWork) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        Arc::ptr_eq(&self.copy, &work.1)
+            && Arc::ptr_eq(&self.staging, &work.0)
+            && work.2 == u32::MAX
+            && !self.copy.host_written.load(Relaxed)
+            && ahead_current(
+                self.revision,
+                self.staging.revision.load(Relaxed),
+                self.staging.tracked.as_ref().is_some_and(|t| t.clean()),
+                self.staging.retry.load(Relaxed),
+            )
+    }
+
+    /// The submitter validated the entire batch. An unsuccessful batch
+    /// never calls this, so the consumed dirty pages cannot be lost.
+    pub(crate) fn accept(&self, recorded: bool) {
+        self.staging.retry.store(false, std::sync::atomic::Ordering::Relaxed);
+        if recorded {
+            count_upload(&self.staging, &self.upload);
+        }
+    }
+
+    pub(crate) fn record(&self, list: &HostList, count: bool) -> Option<D3D12_RESOURCE_BARRIER> {
+        record_upload_inner(list, &self.copy, &self.staging, &self.upload, count)
+    }
+}
+
+/// Bound source reads and private GPU upload allocations. Restrict
+/// speculative reuse to fully tracked textures: an untracked snapshot
+/// cannot be revalidated by a cheap clean-bit test.
+pub(crate) fn prepare_ahead(
+    resource: This,
+    copy: Arc<crate::resource::HostTexture>,
+    remaining: u64,
+) -> Option<(u64, Option<AheadUpload>)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MAX_SOURCE: u64 = 4 << 20;
+    let (_, desc) = crate::resource::texture_memory(resource)?;
+    let source = crate::resource::texture_layout(&desc)?.planes[0].layout.size;
+    if source == 0 || source > MAX_SOURCE.min(remaining)
+        || !title_written(&copy.texture) || copy.host_written.load(Relaxed)
+        || copy.twin.get().is_some_and(Option::is_some)
+    {
+        return None;
+    }
+    let staging = staging(resource, &copy.texture)?;
+    if staging.range_capable || staging.tracked.as_ref()?.bit().is_none()
+        || !copy.staging.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            .is_some_and(|s| Arc::ptr_eq(s, &staging))
+        || !staging.maybe_changed(u32::MAX)
+    {
+        return None;
+    }
+    let cost = source.saturating_add(staging.size);
+    if cost > remaining || staging.size == 0 {
+        return None;
+    }
+    let (_, upload) = staging.refresh_now_with(true, u32::MAX, true);
+    let prepared = upload.map(|upload| {
+        // Refresh took dirty pages and updated hashes. Until accepted,
+        // force a full retry on *any* normal submission of this staging.
+        // Expiry, allocation failures and replaced batches cannot lose
+        // dirty texels, even if another heap asks for the same texture.
+        staging.retry.store(true, Relaxed);
+        let revision = staging.revision.load(Relaxed);
+        AheadUpload { copy, staging, upload, revision }
+    });
+    Some((cost, prepared))
+}
+
 pub(crate) fn refresh_all(work: &[RefreshWork]) -> Vec<Option<Upload>> {
     use std::sync::atomic::Ordering::Relaxed;
     let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed(work[i].2)).collect();
@@ -688,7 +803,7 @@ pub(crate) fn refresh_all(work: &[RefreshWork]) -> Vec<Option<Upload>> {
             vec![first.refresh_now(work[changed[at]].2)]
         } else {
             let jobs = changed[at..at + n].iter().map(|&i| (work[i].0.clone(), work[i].2)).collect();
-            crate::texture_workers::ordered_map(jobs, threads, |(staging, mips): (Arc<Staging>, u32)| staging.refresh_now_with(true, mips))
+            crate::texture_workers::ordered_map(jobs, threads, |(staging, mips): (Arc<Staging>, u32)| staging.refresh_now_with(true, mips, false))
         };
         for (k, (bytes, upload)) in results.into_iter().enumerate() {
             read = read.saturating_add(bytes);
@@ -730,10 +845,11 @@ impl Staging {
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
     fn refresh_now(&self, mips: u32) -> (usize, Option<Upload>) {
-        self.refresh_now_with(false, mips)
+        self.refresh_now_with(false, mips, false)
     }
 
-    fn refresh_now_with(&self, checked_untracked: bool, mips: u32) -> (usize, Option<Upload>) {
+    fn refresh_now_with(&self, checked_untracked: bool, mips: u32, ahead: bool) -> (usize, Option<Upload>) {
+        self.revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -792,7 +908,13 @@ impl Staging {
                     continue;
                 }
                 if staging.is_none() {
-                    staging = staging_space(self.size);
+                    staging = if ahead {
+                        // Unlike submission-owned pool chunks, this buffer
+                        // is never rewound or reused before its owner dies.
+                        host().and_then(|h| h.upload_buffer(self.size)).map(|(b, data)| (b, 0, data))
+                    } else {
+                        staging_space(self.size)
+                    };
                 }
                 let Some((_, _, data)) = &staging else {
                     failed = true;
@@ -1103,6 +1225,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         spans,
         last: Mutex::default(),
         retry: true.into(),
+        revision: Default::default(),
         uploads: Default::default(),
         copied: Default::default(),
     });
@@ -1113,6 +1236,14 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ahead_requires_the_current_revision_and_clean_tracker() {
+        assert!(ahead_current(5, 5, true, true));
+        assert!(!ahead_current(5, 6, true, true));
+        assert!(!ahead_current(5, 5, false, true));
+        assert!(!ahead_current(5, 5, true, false));
+    }
 
     #[test]
     fn srv_mip_uploads_initialize_all_then_preserve_unseen_pending_levels() {

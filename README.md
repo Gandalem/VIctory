@@ -327,6 +327,32 @@ for untracked textures (up to 256 subresources), using content hashes.
 It still reads and hashes the whole source, but avoids unchanged
 detiling and GPU copies. The default untracked upload path is unchanged.
 
+## Experimental bindless lookahead and ready lists
+
+`VICTORY_HEAP_WORKER=1` reverse-ports the earlier bounded bindless
+worker (ac64cdb1) to the current submission-owned upload allocator.
+Weak heap requests are deduplicated in a queue of eight, and work is
+rotated through at most 32 entries. A pass is bounded by a combined
+16 MiB source/private upload allocation budget (4 MiB source per
+texture), with an 8 ms soft time limit between entries. A busy
+submission lock or memory pressure skips speculation.
+
+`VICTORY_HEAP_READY_LISTS=1` additionally ports e6be9a0c's closed-list
+handoff. Up to eight prepared batches, each owning its private upload
+buffers, are kept; age over 250 ms or pressure discards them at the next
+worker or submission pass. Only current fully tracked sampled textures
+are eligible. The submitter validates every destination, staging owner,
+refresh revision and clean tracker in the batch before accepting it.
+Discarded uploads force a mandatory full retry; no private buffers are
+recycled with the submission pool. Accepted lists precede the normal
+upload and title lists and retain owners through the existing fence.
+
+This port deliberately falls back to ordinary preparation for untracked
+textures, and disables lookahead when `VICTORY_SRV_MIP_UPLOADS=1` is
+selected; the actual submission must determine its MIP union.
+No asynchronous GPU execution or deferred descriptor publication.
+Both options are off by default pending Windows/GPU validation.
+
 ## Experimental SRV MIP upload selection
 
 `VICTORY_SRV_MIP_UPLOADS=1` reverse-ports the conservative SRV range
