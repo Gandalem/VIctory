@@ -72,7 +72,7 @@ pub(crate) struct Staging {
 
 /// What was last detiled: the hash of the memory (not tracked), or of each
 /// subresource's bytes (tracked).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     hashes: Vec<Option<blake3::Hash>>,
@@ -306,6 +306,16 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let (buffer, data) = host()?.upload_buffer(CHUNK)?;
         crate::host::name(&buffer, || "texture staging chunk".into());
         c.all.push((buffer, data as usize));
+    }
+}
+
+/// Ahead allocations are private: the submission pool may rewind while
+/// a ready entry lives, but these buffers are owned through the fence.
+fn refresh_space(size: u64, ahead: bool) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    if ahead {
+        host()?.upload_buffer(size).map(|(buffer, data)| (buffer, 0, data))
+    } else {
+        staging_space(size)
     }
 }
 
@@ -680,13 +690,29 @@ pub(crate) struct AheadUpload {
     staging: Arc<Staging>,
     upload: Upload,
     revision: u64,
+    /// Untracked preparation is tentative: do not publish digests or
+    /// pending-level state until the checked source hash is revalidated.
+    untracked: Option<(blake3::Hash, Last)>,
 }
 
 fn ahead_current(prepared: u64, current: u64, clean: bool, retry: bool) -> bool {
     prepared == current && clean && retry
 }
 
+/// The private upload contains the full prepared dirty set; select
+/// only levels the submission requests, with the initial full fallback.
+fn prepared_mips(last: &Last, mips: u32, prepared: &[u32]) -> Vec<u32> {
+    let requested = last.requested(mips);
+    prepared.iter().copied()
+        .filter(|&i| i < 32 && requested & (1u32 << i) != 0)
+        .collect()
+}
+
 impl AheadUpload {
+    pub(crate) fn can_record(&self) -> bool {
+        self.untracked.is_none() && !crate::texture::srv_ranges_enabled()
+    }
+
     pub(crate) fn copy(&self) -> &Arc<crate::resource::HostTexture> {
         &self.copy
     }
@@ -699,25 +725,61 @@ impl AheadUpload {
     /// refresh pass. A later preparation or dirty write invalidates us.
     pub(crate) fn revalidate(&self, work: &RefreshWork) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        Arc::ptr_eq(&self.copy, &work.1)
-            && Arc::ptr_eq(&self.staging, &work.0)
-            && work.2 == u32::MAX
-            && !self.copy.host_written.load(Relaxed)
-            && ahead_current(
-                self.revision,
-                self.staging.revision.load(Relaxed),
-                self.staging.tracked.as_ref().is_some_and(|t| t.clean()),
-                self.staging.retry.load(Relaxed),
-            )
+        if !Arc::ptr_eq(&self.copy, &work.1)
+            || !Arc::ptr_eq(&self.staging, &work.0)
+            || self.copy.host_written.load(Relaxed)
+            || self.revision != self.staging.revision.load(Relaxed)
+        {
+            return false;
+        }
+        if let Some((expected, _)) = &self.untracked {
+            // The earlier worker used a checked untracked snapshot.
+            // Re-read and hash it now rather than accepting stale bytes.
+            let mut snapshot = Scratch::take(self.staging.layout.size as usize);
+            return crate::host::read_into(self.staging.memory, &mut snapshot.0)
+                && blake3::hash(&snapshot.0) == *expected;
+        }
+        ahead_current(
+            self.revision,
+            self.staging.revision.load(Relaxed),
+            self.staging.tracked.as_ref().is_some_and(|t| t.clean()),
+            self.staging.retry.load(Relaxed),
+        )
     }
 
-    /// The submitter validated the entire batch. An unsuccessful batch
-    /// never calls this, so the consumed dirty pages cannot be lost.
-    pub(crate) fn accept(&self, recorded: bool) {
-        self.staging.retry.store(false, std::sync::atomic::Ordering::Relaxed);
-        if recorded {
-            count_upload(&self.staging, &self.upload);
+    /// The submitter validated the entire batch. A CPU-only batch can
+    /// now select the actual SRV union; a closed list is always full.
+    /// Hidden levels remain pending, and a discarded preparation never
+    /// publishes an untracked digest or acknowledges its dirty levels.
+    pub(crate) fn accept(&self, list: Option<&HostList>, mips: u32) -> (bool, Option<D3D12_RESOURCE_BARRIER>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, next)) = &self.untracked {
+            *last = next.clone();
         }
+        let selected;
+        let upload = if self.staging.range_capable {
+            debug_assert!(list.is_some());
+            selected = (self.upload.0.clone(), self.upload.1, prepared_mips(&last, mips, &self.upload.2));
+            &selected
+        } else {
+            &self.upload
+        };
+        let copied = !upload.2.is_empty();
+        let barrier = if !copied {
+            None
+        } else if let Some(list) = list {
+            record_upload_inner(list, &self.copy, &self.staging, upload, true)
+        } else {
+            count_upload(&self.staging, upload);
+            None
+        };
+        if self.staging.range_capable {
+            last.acknowledge(&upload.2, self.staging.footprints.len());
+        }
+        self.staging.retry.store(false, Relaxed);
+        self.staging.revision.fetch_add(1, Relaxed);
+        (copied, barrier)
     }
 
     pub(crate) fn record(&self, list: &HostList, count: bool) -> Option<D3D12_RESOURCE_BARRIER> {
@@ -725,9 +787,9 @@ impl AheadUpload {
     }
 }
 
-/// Bound source reads and private GPU upload allocations. Restrict
-/// speculative reuse to fully tracked textures: an untracked snapshot
-/// cannot be revalidated by a cheap clean-bit test.
+/// Bound source reads and private GPU upload allocations. Fully tracked
+/// sources use their clean bit; untracked sources use checked snapshots
+/// and a tentative digest. Partially tracked sources retain the fallback.
 pub(crate) fn prepare_ahead(
     resource: This,
     copy: Arc<crate::resource::HostTexture>,
@@ -744,16 +806,33 @@ pub(crate) fn prepare_ahead(
         return None;
     }
     let staging = staging(resource, &copy.texture)?;
-    if staging.range_capable || staging.tracked.as_ref()?.bit().is_none()
+    if staging.tracked.as_ref().is_some_and(|t| t.bit().is_none())
         || !copy.staging.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
             .is_some_and(|s| Arc::ptr_eq(s, &staging))
         || !staging.maybe_changed(u32::MAX)
     {
         return None;
     }
+    // A shared host copy may already own staging from another title alias.
+    // Bound and snapshot the actual staging layout, not that alias's estimate.
+    let source = staging.layout.size;
     let cost = source.saturating_add(staging.size);
-    if cost > remaining || staging.size == 0 {
+    if source == 0 || source > MAX_SOURCE || cost > remaining || staging.size == 0 {
         return None;
+    }
+    if staging.tracked.is_none() {
+        let mut snapshot = Scratch::take(source as usize);
+        if !crate::host::read_into(staging.memory, &mut snapshot.0) {
+            return Some((cost, None));
+        }
+        let mut next = staging.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (_, upload) = staging.refresh_untracked(&mut next, &snapshot.0, u32::MAX, true);
+        let prepared = upload.and_then(|upload| {
+            let expected = next.hash?;
+            let revision = staging.revision.load(Relaxed);
+            Some(AheadUpload { copy, staging, upload, revision, untracked: Some((expected, next)) })
+        });
+        return Some((cost, prepared));
     }
     let (_, upload) = staging.refresh_now_with(true, u32::MAX, true);
     let prepared = upload.map(|upload| {
@@ -763,7 +842,7 @@ pub(crate) fn prepare_ahead(
         // dirty texels, even if another heap asks for the same texture.
         staging.retry.store(true, Relaxed);
         let revision = staging.revision.load(Relaxed);
-        AheadUpload { copy, staging, upload, revision }
+        AheadUpload { copy, staging, upload, revision, untracked: None }
     });
     Some((cost, prepared))
 }
@@ -908,13 +987,7 @@ impl Staging {
                     continue;
                 }
                 if staging.is_none() {
-                    staging = if ahead {
-                        // Unlike submission-owned pool chunks, this buffer
-                        // is never rewound or reused before its owner dies.
-                        host().and_then(|h| h.upload_buffer(self.size)).map(|(b, data)| (b, 0, data))
-                    } else {
-                        staging_space(self.size)
-                    };
+                    staging = refresh_space(self.size, ahead);
                 }
                 let Some((_, _, data)) = &staging else {
                     failed = true;
@@ -942,7 +1015,7 @@ impl Staging {
             }
             self.retry.store(false, Relaxed);
             fresh.sort_unstable();
-            if self.range_capable {
+            if self.range_capable && !ahead {
                 last.acknowledge(&fresh, n);
             }
             return (bytes, staging.map(|(b, at, _)| (b, at, fresh)));
@@ -962,7 +1035,7 @@ impl Staging {
             }
             let zeros = vec![0u8; size];
             let every = all();
-            let buffer = self.detile(&zeros, &every);
+            let buffer = self.detile(&zeros, &every, false);
             last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
             if self.range_capable && buffer.is_some() {
                 last.acknowledge(&every, self.footprints.len());
@@ -974,16 +1047,16 @@ impl Staging {
             // reads, using this integration's bounded RAII scratch pool.
             let mut snapshot = Scratch::take(size);
             if crate::host::read_into(self.memory, &mut snapshot.0) {
-                return self.refresh_untracked(last, &snapshot.0, mips);
+                return self.refresh_untracked(last, &snapshot.0, mips, false);
             }
             return (0, None);
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        self.refresh_untracked(last, tiled, mips)
+        self.refresh_untracked(last, tiled, mips, false)
     }
 
-    fn refresh_untracked(&self, last: &mut Last, tiled: &[u8], mips: u32) -> (usize, Option<Upload>) {
+    fn refresh_untracked(&self, last: &mut Last, tiled: &[u8], mips: u32, ahead: bool) -> (usize, Option<Upload>) {
         static PARTIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let partial = *PARTIAL.get_or_init(|| std::env::var("VICTORY_PARTIAL_UNTRACKED_UPLOADS").as_deref() == Ok("1"));
         let size = tiled.len();
@@ -997,8 +1070,8 @@ impl Staging {
             }
             // Clean source but a newly visible MIP is still pending.
             let fresh = last.select_uploads(count, mips, &[]);
-            let buffer = self.detile(tiled, &fresh);
-            if buffer.is_some() {
+            let buffer = self.detile(tiled, &fresh, ahead);
+            if buffer.is_some() && !ahead {
                 last.acknowledge(&fresh, count);
             }
             return (size, buffer.map(|(b, at)| (b, at, fresh)));
@@ -1019,11 +1092,11 @@ impl Staging {
                 last.span_hashes = next;
                 return (size, None);
             }
-            let buffer = self.detile(tiled, &fresh);
+            let buffer = self.detile(tiled, &fresh, ahead);
             if buffer.is_some() {
                 last.hash = Some(hash);
                 last.span_hashes = next;
-                if self.range_capable {
+                if self.range_capable && !ahead {
                     last.acknowledge(&fresh, count);
                 }
             } else {
@@ -1043,9 +1116,9 @@ impl Staging {
             last.hash = Some(hash);
             return (size, None);
         }
-        let buffer = self.detile(tiled, &fresh);
+        let buffer = self.detile(tiled, &fresh, ahead);
         last.hash = buffer.is_some().then_some(hash);
-        if self.range_capable && buffer.is_some() {
+        if self.range_capable && buffer.is_some() && !ahead {
             last.acknowledge(&fresh, count);
         }
         #[cfg(feature = "diagnostics")]
@@ -1056,8 +1129,8 @@ impl Staging {
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
-        let (buffer, at, data) = staging_space(self.size)?;
+    fn detile(&self, tiled: &[u8], subresources: &[u32], ahead: bool) -> Option<(ID3D12Resource, u64)> {
+        let (buffer, at, data) = refresh_space(self.size, ahead)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -1236,6 +1309,37 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ahead_range_selection_acknowledges_only_the_actual_submission_union() {
+        let mut last = Last::default();
+        let initial = last.select_uploads(4, u32::MAX, &[0, 1, 2, 3]);
+        assert_eq!(prepared_mips(&last, 0b1100, &initial), [0, 1, 2, 3]);
+        assert!(!last.full_initialized);
+        last.acknowledge(&initial, 4);
+        let dirty = last.select_uploads(4, u32::MAX, &[0, 2, 3]);
+        let selected = prepared_mips(&last, 0b1100, &dirty);
+        assert_eq!(selected, [2, 3]);
+        assert_eq!(last.pending_mips, 0b1101);
+        last.acknowledge(&selected, 4);
+        assert_eq!(last.pending_mips, 1);
+        assert_eq!(prepared_mips(&last, 1, &[0]), [0]);
+        assert!(prepared_mips(&last, 0b1100, &[0]).is_empty());
+    }
+
+    #[test]
+    fn tentative_untracked_state_does_not_acknowledge_discarded_preparation() {
+        let mut last = Last::default();
+        last.acknowledge(&[0, 1, 2, 3], 4);
+        let mut next = last.clone();
+        next.hash = Some(blake3::hash(b"speculative"));
+        assert_eq!(next.select_uploads(4, u32::MAX, &[0, 2]), [0, 2]);
+        assert!(last.hash.is_none());
+        assert_eq!(last.pending_mips, 0);
+        let selected = prepared_mips(&next, 1, &[0, 2]);
+        next.acknowledge(&selected, 4);
+        assert_eq!(next.pending_mips, 0b0100);
+    }
 
     #[test]
     fn ahead_requires_the_current_revision_and_clean_tracker() {

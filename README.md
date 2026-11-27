@@ -335,23 +335,30 @@ Weak heap requests are deduplicated in a queue of eight, and work is
 rotated through at most 32 entries. A pass is bounded by a combined
 16 MiB source/private upload allocation budget (4 MiB source per
 texture), with an 8 ms soft time limit between entries. A busy
-submission lock or memory pressure skips speculation.
+submission lock or memory pressure skips speculation. Untracked source
+preparation uses an owned checked snapshot and tentative digest state;
+the submitter must re-read and verify its full hash before publishing
+that state or using the prepared bytes.
 
 `VICTORY_HEAP_READY_LISTS=1` additionally ports e6be9a0c's closed-list
 handoff. Up to eight prepared batches, each owning its private upload
 buffers, are kept; age over 250 ms or pressure discards them at the next
-worker or submission pass. Only current fully tracked sampled textures
-are eligible. The submitter validates every destination, staging owner,
-refresh revision and clean tracker in the batch before accepting it.
-Discarded uploads force a mandatory full retry; no private buffers are
-recycled with the submission pool. Accepted lists precede the normal
-upload and title lists and retain owners through the existing fence.
+worker or submission pass. Closed-list batches contain only fully
+tracked sampled textures. The submitter validates every destination,
+staging owner, refresh revision and clean tracker or checked digest.
+Discarded tracked uploads force a mandatory full retry; discarded
+untracked preparations leave their prior digests unchanged. No private
+buffers are recycled with the submission pool. Accepted lists precede
+the normal upload and title lists and retain owners through the fence;
+a failed fence wait stops the run instead of recycling live buffers.
 
-This port deliberately falls back to ordinary preparation for untracked
-textures, and disables lookahead when `VICTORY_SRV_MIP_UPLOADS=1` is
-selected; the actual submission must determine its MIP union.
-No asynchronous GPU execution or deferred descriptor publication.
-Both options are off by default pending Windows/GPU validation.
+As in ff33360, CPU lookahead remains available with
+`VICTORY_SRV_MIP_UPLOADS=1`, but closed speculative GPU lists are
+bypassed. The submitter selects the actual union from the private
+prepared dirty set and acknowledges only copied levels, retaining
+unseen MIPs for later requests. Partially tracked sources use the
+ordinary fallback. No asynchronous GPU execution or deferred descriptor
+publication. Both options are off by default pending Windows/GPU validation.
 
 ## Experimental SRV MIP upload selection
 

@@ -1463,9 +1463,13 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        if WaitForSingleObject(self.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                            fail(format_args!("host submission fence wait failed"));
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    // Every upload buffer and recorded owner relies on
+                    // this fence. Do not recycle on an unconfirmed wait.
+                    Err(e) => fail(format_args!("host submission fence setup failed: {e}")),
                 }
             }
             #[cfg(feature = "diagnostics")]

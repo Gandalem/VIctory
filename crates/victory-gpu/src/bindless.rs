@@ -232,14 +232,14 @@ static READY: Mutex<Vec<Ready>> = Mutex::new(Vec::new());
 fn worker_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_HEAP_WORKER").as_deref() == Ok("1"))
-        // This port prepares a full dirty set. SRV unions must instead
-        // be selected by the actual submission.
-        && !crate::texture::srv_ranges_enabled()
 }
 
 fn ready_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    worker_enabled() && *ON.get_or_init(|| std::env::var("VICTORY_HEAP_READY_LISTS").as_deref() == Ok("1"))
+    // ff33360: the speculative full dirty list cannot know the actual
+    // submission's SRV union. Keep CPU preparation in range mode.
+    worker_enabled() && !crate::texture::srv_ranges_enabled()
+        && *ON.get_or_init(|| std::env::var("VICTORY_HEAP_READY_LISTS").as_deref() == Ok("1"))
 }
 
 fn ahead_pressured() -> bool {
@@ -367,7 +367,7 @@ pub(crate) fn prepare_ahead(viewed: &Arc<Viewed>) {
     if entries.is_empty() || ahead_pressured() {
         return;
     }
-    let list = if ready_enabled() {
+    let list = if ready_enabled() && entries.iter().all(crate::texture::AheadUpload::can_record) {
         crate::host::host().and_then(|host| host.new_list().ok()).map(|list| {
             list.set_ours();
             let readable: Vec<_> = entries.iter().filter_map(|e| e.record(&list, false)).collect();
@@ -490,14 +490,16 @@ pub(crate) fn uploads(
                 continue;
             }
             for entry in &ready.entries {
-                entry.accept(ready.list.is_some());
-                used.insert(Arc::as_ptr(entry.staging()));
-                if ready.list.is_none() {
-                    readable.extend(entry.record(list, true));
-                    recorded = true;
+                let key = Arc::as_ptr(entry.staging());
+                let mips = work[staged[&key]].2;
+                let (copied, barrier) = entry.accept(ready.list.is_none().then_some(list), mips);
+                used.insert(key);
+                readable.extend(barrier);
+                if copied {
+                    recorded |= ready.list.is_none();
+                    #[cfg(feature = "diagnostics")]
+                    UPLOADED.fetch_add(1, Relaxed);
                 }
-                #[cfg(feature = "diagnostics")]
-                UPLOADED.fetch_add(1, Relaxed);
             }
             accepted.push(ready);
         }
