@@ -396,12 +396,22 @@ queue, before the resource is published. Castable formats are
 preserved or the existing placed/committed allocation path is used. Reserved
 resources do not participate in committed-resource Evict/MakeResident.
 
-The production path maps **all retained MIPs** up front: without
-sparse MIP-aware descriptor remapping, exposing a view of an unmapped level
-would risk wrong sampling. The allocator's group selection is ready
-for sparse MIP mapping, but dynamic view remapping and selective live
-mapping remain unimplemented. Like the reference, mapped tiles are
-not returned while the resource lives. This option is disabled by
+The production path maps **all retained MIPs** up front. The incremental
+mapping core now ports cool_fox's per-group admission: requesting any
+packed level selects the entire tail; already mapped groups are not
+remapped; newly leased groups are initialized before their mask is
+published. The same resource-lifetime COM owner retains later leases.
+An isolated ignored Windows GPU test
+(`sparse_group_expansion_preserves_existing_texels_and_leases`) creates
+a partial map, writes a coarse texel, expands to another MIP, then checks
+readback, accounting and lifetime. This test must be run on a tier-2
+adapter before considering live activation.
+
+Live descriptor remapping, held-level detection, and GPU-write
+`claim`/`unclaim` tracking are not yet ported. Enabling partial maps in
+the title path before those are available could lose writes or expose
+unbacked levels. Like the reference, mapped tiles are not returned while
+the resource lives. This option is disabled by
 default: the dedicated initialization fence and zero fill may outweigh
 pooling savings; validate both correctness and performance on Windows.
 The upstream first-use texture creation and whole-texture descriptor

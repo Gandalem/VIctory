@@ -2,9 +2,11 @@
 //!
 //! Adapted from DoubleGhosty/cool_fox tiles.rs (f4b48ad): 64 KiB tiles,
 //! 64 MiB heaps, free runs, standard MIP groups and atomic packed tails.
-//! Back and initialize every retained level before publishing the resource.
-//! The current renderer can give up whole textures and rebuild descriptors;
-//! sparse live MIP mappings still require separate descriptor coordination.
+//! Track and extend indivisible mapping groups, retaining their leases
+//! through the resource's COM lifetime. The title path still backs every
+//! retained level before publication. Partial expansion is exercised by
+//! an isolated GPU test; live descriptor and GPU-write coordination remain
+//! prerequisites for exposing sparse resources to title commands.
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
@@ -51,11 +53,24 @@ fn groups(standard: &[u32], packed_levels: u32, packed_tiles: u32, total: u32) -
     Some(result)
 }
 
+impl Group {
+    fn mask(self) -> u32 {
+        ((1u32 << self.levels) - 1) << self.first
+    }
+}
+
 fn selected(groups: &[Group], mask: u32) -> impl Iterator<Item = Group> + '_ {
-    groups.iter().copied().filter(move |g| {
-        let bits = ((1u32 << g.levels) - 1) << g.first;
-        bits & mask != 0
-    })
+    groups.iter().copied().filter(move |g| g.mask() & mask != 0)
+}
+
+/// cool_fox Tiled::with_level/without/give_locked: requesting one packed
+/// level allocates the entire tail, and previously mapped groups stay put.
+fn group_mask(groups: &[Group], mask: u32) -> u32 {
+    selected(groups, mask).fold(0, |bits, group| bits | group.mask())
+}
+
+fn missing_groups(groups: &[Group], mapped: u32, wanted: u32) -> impl Iterator<Item = Group> + '_ {
+    selected(groups, wanted).filter(move |g| g.mask() & mapped == 0)
 }
 
 fn free_count(runs: &[Run]) -> u32 {
@@ -188,15 +203,63 @@ pub(crate) fn usage() -> (u64, u64) {
     (MAPPED_BYTES.load(Relaxed), pool.len() as u64 * MAX_BYTES)
 }
 
-/// The resource itself retains the lease through SetPrivateDataInterface.
-/// This is deliberately not tied to HostTexture's Arc or a COM reference
-/// count query: the eager renderer also keeps raw COM owners in slots and
-/// in the retired-descriptor queue. No cycle: the owner holds only heaps.
+/// Per-resource group residency, adapted from cool_fox's Tiled/Given.
+/// The mask is published only after a successful initialization fence.
+/// Each group owns its leases; existing groups are never remapped.
+struct Mapping {
+    groups: Vec<Group>,
+    mapped: u32,
+    leases: Vec<Lease>,
+}
+
+impl Mapping {
+    fn new(groups: Vec<Group>) -> Self {
+        Self { groups, mapped: 0, leases: Vec::new() }
+    }
+
+    fn every_level(&self) -> u32 {
+        group_mask(&self.groups, u32::MAX)
+    }
+
+    fn given_bytes(&self) -> u64 {
+        self.leases.iter().map(|lease| u64::from(lease.count) * TILE).sum()
+    }
+
+    /// Add only the missing groups. Allocation is transactional until the
+    /// queue is touched; a failed admission returns every tentative run.
+    /// Once the queue is touched initialize() either finishes its fence
+    /// or terminates the run, so no in-flight leases can be reused.
+    ///
+    /// SAFETY: the caller must own a live resource matching these groups
+    /// and desc, in COMMON state, with no concurrent recording/submission
+    /// that accesses its mappings. For the title path this is guaranteed
+    /// only before first publication. The isolated test also waits for
+    /// all preceding work before extending the map.
+    unsafe fn map_more(&mut self, host: &crate::host::Host, texture: &ID3D12Resource,
+        desc: &D3D12_RESOURCE_DESC, wanted: u32) -> Option<u32> {
+        let additions = missing_groups(&self.groups, self.mapped, wanted)
+            .map(|group| Some((group, take(&host.device, group.tiles)?)))
+            .collect::<Option<Vec<_>>>()?;
+        if additions.is_empty() {
+            return Some(self.mapped);
+        }
+        initialize(host, texture, desc, &additions)?;
+        let mapped = additions.iter().fold(self.mapped, |bits, (group, _)| bits | group.mask());
+        self.leases.extend(additions.into_iter().map(|(_, lease)| lease));
+        self.mapped = mapped;
+        Some(mapped)
+    }
+}
+
+/// The resource itself retains the shared mapping state through
+/// SetPrivateDataInterface, including any subsequently added groups.
+/// This is not tied to HostTexture's Arc: raw COM owners in slots and
+/// retired descriptors can outlive it. No cycle: the state owns heaps.
 #[repr(C)]
 struct Owner {
     vtable: *const IUnknown_Vtbl,
     refs: AtomicU32,
-    _leases: Vec<Lease>,
+    _mapping: Arc<Mutex<Mapping>>,
 }
 
 unsafe extern "system" fn query(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
@@ -238,8 +301,8 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
 static VTABLE: IUnknown_Vtbl = IUnknown_Vtbl { QueryInterface: query, AddRef: add_ref, Release: release };
 const OWNER_KEY: GUID = GUID::from_u128(0xf36b88b5_a067_4c2d_9fec_f11eaa6b0a72);
 
-fn attach(texture: &ID3D12Resource, leases: Vec<Lease>) -> windows::core::Result<()> {
-    let raw = Box::into_raw(Box::new(Owner { vtable: &VTABLE, refs: AtomicU32::new(1), _leases: leases }));
+fn attach(texture: &ID3D12Resource, mapping: Arc<Mutex<Mapping>>) -> windows::core::Result<()> {
+    let raw = Box::into_raw(Box::new(Owner { vtable: &VTABLE, refs: AtomicU32::new(1), _mapping: mapping }));
     // SAFETY: Owner begins with a valid IUnknown vtable and owns one ref.
     let unknown = unsafe { IUnknown::from_raw(raw.cast()) };
     // SAFETY: the resource stores its own reference to the owner.
@@ -295,9 +358,9 @@ fn query_groups(device: &ID3D12Device, texture: &ID3D12Resource, levels: u32) ->
     groups(&sizes, u32::from(packed.NumPackedMips), packed.NumTilesForPackedMips, total)
 }
 
-/// A separate fenced initialization queue. No title GPU command can
-/// name the reserved resource until its mappings and zero initialization
-/// have completed. Never use the title submission mutex recursively.
+/// A separate fenced initialization queue. The caller must exclude other
+/// GPU uses until mapping and zero initialization have completed.
+/// Never use the title submission mutex recursively.
 struct Mapper {
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
@@ -328,7 +391,11 @@ fn initialize(host: &crate::host::Host, texture: &ID3D12Resource, desc: &D3D12_R
     mappings: &[(Group, Lease)]) -> Option<()> {
     let mut footprints = Vec::with_capacity(desc.MipLevels as usize);
     let mut largest = 0u64;
-    for level in 0..u32::from(desc.MipLevels) {
+    // Whole standard MIPs or every subresource in an added packed tail.
+    // Do not zero levels which already held mapped texture contents.
+    let added = mappings.iter().fold(0, |bits, (group, _)| bits | group.mask());
+    if added == 0 { return Some(()); }
+    for level in (0..u32::from(desc.MipLevels)).filter(|&level| added & (1 << level) != 0) {
         let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let mut bytes = 0;
         // SAFETY: one footprint output for one valid subresource.
@@ -340,7 +407,7 @@ fn initialize(host: &crate::host::Host, texture: &ID3D12Resource, desc: &D3D12_R
             return None;
         }
         largest = largest.max(bytes);
-        footprints.push(footprint);
+        footprints.push((level, footprint));
     }
     let (zero, data) = host.upload_buffer(largest)?;
     // SAFETY: the upload mapping is at least largest bytes.
@@ -367,7 +434,7 @@ fn initialize(host: &crate::host::Host, texture: &ID3D12Resource, desc: &D3D12_R
     unsafe {
         list.ResourceBarrier(&[alias, crate::host::transition(texture,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
-        for (level, &footprint) in footprints.iter().enumerate() {
+        for &(level, footprint) in &footprints {
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&zero),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -376,7 +443,7 @@ fn initialize(host: &crate::host::Host, texture: &ID3D12Resource, desc: &D3D12_R
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(texture),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: level as u32 },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: level },
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
         }
@@ -423,11 +490,10 @@ fn initialize(host: &crate::host::Host, texture: &ID3D12Resource, desc: &D3D12_R
     Some(())
 }
 
-/// A pooled reserved texture, initialized before publication. Preserve
-/// the existing castable format list on Device10 or decline the path.
-/// A failure before queue publication falls back to committed creation.
-pub(crate) fn make(host: &crate::host::Host, desc: &D3D12_RESOURCE_DESC,
-    formats: &[DXGI_FORMAT]) -> Option<(ID3D12Resource, u64)> {
+/// Create an unpublished reserved resource with no physical groups
+/// yet assigned. Keep the same format/tier/budget admission policy.
+fn reserve(host: &crate::host::Host, desc: &D3D12_RESOURCE_DESC,
+    formats: &[DXGI_FORMAT]) -> Option<(ID3D12Resource, D3D12_RESOURCE_DESC, Arc<Mutex<Mapping>>)> {
     if !candidate(desc) || !tier2(&host.device) || pressured() {
         return None;
     }
@@ -450,14 +516,28 @@ pub(crate) fn make(host: &crate::host::Host, desc: &D3D12_RESOURCE_DESC,
     if !(MIN_BYTES..=MAX_BYTES).contains(&bytes) {
         return None;
     }
-    let all = (1u32 << desc.MipLevels) - 1;
-    let mappings = selected(&groups, all).map(|group| Some((group, take(&host.device, group.tiles)?)))
-        .collect::<Option<Vec<_>>>()?;
-    initialize(host, &texture, &desc, &mappings)?;
-    let leases = mappings.into_iter().map(|(_, lease)| lease).collect();
-    // Initialization has completed. If attaching the COM owner fails,
-    // this resource is unpublished and can safely fall back.
-    attach(&texture, leases).ok()?;
+    let mapping = Arc::new(Mutex::new(Mapping::new(groups)));
+    // Attach before allocating; a failed attachment cannot leave any
+    // queued mappings without a resource-lifetime owner.
+    attach(&texture, mapping.clone()).ok()?;
+    Some((texture, desc, mapping))
+}
+
+/// Production remains fully mapped before first publication. The
+/// incremental allocator is shared with the isolated sparse GPU test;
+/// live partial mapping is NOT enabled until descriptor/write tracking
+/// and readback verification are complete.
+pub(crate) fn make(host: &crate::host::Host, desc: &D3D12_RESOURCE_DESC,
+    formats: &[DXGI_FORMAT]) -> Option<(ID3D12Resource, u64)> {
+    let (texture, desc, state) = reserve(host, desc, formats)?;
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    let all = state.every_level();
+    // SAFETY: reserve returned an unpublished COMMON-state resource.
+    if unsafe { state.map_more(host, &texture, &desc, all) }? != all {
+        return None;
+    }
+    let bytes = state.given_bytes();
+    drop(state);
     Some((texture, bytes))
 }
 
@@ -475,6 +555,19 @@ mod tests {
         assert!(groups(&[16, 4, 1], 4, 2, 22).is_none());
         assert!(groups(&[0], 1, 1, 1).is_none());
         assert!(groups(&[1], 0, 1, 2).is_none());
+    }
+
+    #[test]
+    fn incremental_mapping_expands_packed_tail_and_skips_existing_groups() {
+        let groups = groups(&[16, 4, 1], 4, 2, 23).unwrap();
+        let tail = group_mask(&groups, 1 << 5);
+        assert_eq!(tail, 0b1111000);
+        assert_eq!(group_mask(&groups, 1 << 1), 1 << 1);
+        assert_eq!(group_mask(&groups, u32::MAX), 0b1111111);
+        assert_eq!(missing_groups(&groups, tail, 1 << 4).count(), 0);
+        assert_eq!(missing_groups(&groups, tail, tail | 1).collect::<Vec<_>>(),
+            [Group { first: 0, levels: 1, tiles: 16 }]);
+        assert_eq!(missing_groups(&groups, 0, 0).count(), 0);
     }
 
     #[test]
@@ -517,9 +610,97 @@ mod tests {
         let retained = texture.clone();
         drop(texture);
         assert_eq!(usage().0, before + bytes);
-        // Read a texel from the first and packed-tail MIP after the
-        // zero-initialization fence. A recycled heap must not leak old
-        // texture contents.
+        // A recycled heap must not leak old texture contents.
+        assert_eq!(read_texels(host, &retained, &desc, [0, 7]), [0, 0]);
+        drop(retained);
+        assert_eq!(usage().0, before);
+    }
+
+    #[test]
+    #[ignore = "requires a tiled-resource tier-2 D3D12 adapter; run alone"]
+    fn sparse_group_expansion_preserves_existing_texels_and_leases() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        let host = crate::host::host().expect("D3D12 device");
+        assert!(tier2(&host.device));
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024, Height: 1024, DepthOrArraySize: 1, MipLevels: 8,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let before = usage().0;
+        let (texture, desc, mapping) = reserve(host, &desc, &[]).expect("reserved texture");
+        let tail = {
+            let mut map = mapping.lock().unwrap();
+            let tail = group_mask(&map.groups, 1 << 7);
+            assert_ne!(tail, map.every_level());
+            // SAFETY: unpublished COMMON-state texture.
+            assert_eq!(unsafe { map.map_more(host, &texture, &desc, 1 << 7) }, Some(tail));
+            assert_eq!(usage().0, before + map.given_bytes());
+            tail
+        };
+        // Write a recognizable value into a mapped coarse MIP, then wait.
+        // The new mapping must not clear this already initialized group.
+        let marker = 0x11223344;
+        write_texel(host, &texture, &desc, 7, marker);
+        {
+            let mut map = mapping.lock().unwrap();
+            let bytes = map.given_bytes();
+            // SAFETY: write_texel returned after a fence and restored COMMON.
+            assert_eq!(unsafe { map.map_more(host, &texture, &desc, 1 << 7) }, Some(tail));
+            assert_eq!(map.given_bytes(), bytes);
+            assert_eq!(unsafe { map.map_more(host, &texture, &desc, 1) }, Some(tail | 1));
+            assert!(map.given_bytes() > bytes);
+            assert_eq!(usage().0, before + map.given_bytes());
+        }
+        assert_eq!(read_texels(host, &texture, &desc, [0, 7]), [0, marker]);
+        let retained = texture.clone();
+        drop(mapping);
+        drop(texture);
+        assert!(usage().0 > before);
+        drop(retained);
+        assert_eq!(usage().0, before);
+    }
+
+    fn write_texel(host: &crate::host::Host, texture: &ID3D12Resource,
+        desc: &D3D12_RESOURCE_DESC, level: u32, value: u32) {
+        let (upload, data) = host.upload_buffer(512).unwrap();
+        // SAFETY: the upload is mapped and holds one RGBA8 texel.
+        unsafe { data.cast::<u32>().write_unaligned(value) };
+        let list = host.new_list().unwrap();
+        // SAFETY: the mapped test level and upload remain live; state is
+        // restored to COMMON and execute waits before returning.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(texture,
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: desc.Format, Width: 1, Height: 1, Depth: 1, RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: level },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.list.ResourceBarrier(&[crate::host::transition(texture,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+        list.close();
+        host.execute(&[&list]);
+    }
+
+    fn read_texels(host: &crate::host::Host, texture: &ID3D12Resource,
+        desc: &D3D12_RESOURCE_DESC, levels: [u32; 2]) -> [u32; 2] {
         let mut back: Option<ID3D12Resource> = None;
         let properties = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
         let buffer = D3D12_RESOURCE_DESC {
@@ -538,11 +719,11 @@ mod tests {
         // SAFETY: live resources, a closed/fenced list below, and two
         // non-overlapping 512-byte-aligned single-texel footprints.
         unsafe {
-            list.list.ResourceBarrier(&[crate::host::transition(&retained,
+            list.list.ResourceBarrier(&[crate::host::transition(texture,
                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            for (i, level) in [0, 7].into_iter().enumerate() {
+            for (i, level) in levels.into_iter().enumerate() {
                 let from = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&retained),
+                    pResource: std::mem::transmute_copy(texture),
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: level },
                 };
@@ -561,7 +742,7 @@ mod tests {
                 let area = D3D12_BOX { left: 0, top: 0, front: 0, right: 1, bottom: 1, back: 1 };
                 list.list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&area));
             }
-            list.list.ResourceBarrier(&[crate::host::transition(&retained,
+            list.list.ResourceBarrier(&[crate::host::transition(texture,
                 D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
         }
         list.close();
@@ -570,12 +751,9 @@ mod tests {
         // SAFETY: readback follows successful GPU completion.
         unsafe {
             back.Map(0, None, Some(&mut data)).unwrap();
-            assert_eq!(*data.cast::<u32>(), 0);
-            assert_eq!(*data.cast::<u8>().add(512).cast::<u32>(), 0);
+            let values = [*data.cast::<u32>(), *data.cast::<u8>().add(512).cast::<u32>()];
             back.Unmap(0, None);
+            values
         }
-        drop(list);
-        drop(retained);
-        assert_eq!(usage().0, before);
     }
 }
