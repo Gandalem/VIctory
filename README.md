@@ -340,6 +340,17 @@ This removes one independent check fence wait on eligible submissions.
 With `VICTORY_CARD_COMPARE_RANGES=1` or per-list GPU timing enabled,
 use the previous post-fence check path. This is not asynchronous relay:
 the next title submission still waits for the current CPU merge.
+Experimental `VICTORY_SEND_OWN=1` ports the source's submission-owned
+send snapshot and short aligned word scatter shader. Long and unaligned
+runs use byte copies; aligned runs up to 256 bytes use packed offset/word
+pairs. Every snapshot survives its checked sync fence, then returns to
+a bounded 128 MiB idle pool. A 512 MiB active allocation ceiling, memory
+pressure or allocation/pipeline failure falls back to existing synchronous
+staging copies. This separates ownership for future relay work; no
+concurrent title submissions, send-generation merging or BAR allocation
+are enabled. Run the ignored
+`owned_card_send_keeps_original_bytes_after_staging_changes` test with
+the card-buffer options and `VICTORY_SEND_OWN=1` on a real adapter.
 Run the ignored `card_check_tail_shares_title_fence` test on an adapter
 with the card-buffer and tail options, ranges/timing off.
 Run the ignored `logical_card_hash_length_excludes_padding_writes`

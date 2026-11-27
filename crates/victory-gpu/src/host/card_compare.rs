@@ -998,7 +998,7 @@ impl Host {
     /// Adapt the source card_before: copy CPU-dirty ranges, then hash the
     /// joined pieces on the device before the title's lists execute.
     pub(super) fn card_before(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>], submitted: &mut u64) {
-        let dirty: Vec<_> = copies.iter().filter_map(|shadow| {
+        let dirty: Vec<card_send::Dirty<'_>> = copies.iter().filter_map(|shadow| {
             let card = shadow.card()?;
             let ranges = card.take_dirty();
             (!ranges.is_empty()).then_some((shadow, card, ranges))
@@ -1006,7 +1006,13 @@ impl Host {
         if dirty.is_empty() {
             return;
         }
+        let own = card_send::take(self, &dirty);
         let list = self.card_list(CardPhase::Sync);
+        if let Some(own) = &own {
+            // SAFETY: open sync list, dirty owners and snapshot retained
+            // until the same checked fence; buffers start in COMMON.
+            unsafe { own.record(&list.list, &dirty) };
+        }
         // Reference card_before: record all CPU-to-card copies first, then
         // one resource-barrier batch, then the hashing passes. Independent
         // card buffers no longer serialize a copy and a hash per buffer.
@@ -1016,17 +1022,21 @@ impl Host {
             let (start, _) = shadow.range();
             let size = shadow.card_hash_size();
             let spans = dirty_hash_spans(start as usize, size as usize, ranges);
-            // SAFETY: ranges lie in both live resources; buffers decayed to
-            // COMMON after the preceding fence and promote to COPY_DEST.
-            unsafe {
-                for &(from, to) in ranges {
-                    list.list.CopyBufferRegion(&shadow.buffer, from as u64,
-                        &card.staging, from as u64, (to - from) as u64);
+            if own.is_none() {
+                // SAFETY: ranges lie in both live resources; buffers decayed
+                // to COMMON after the preceding fence, promote to COPY_DEST.
+                unsafe {
+                    for &(from, to) in ranges {
+                        list.list.CopyBufferRegion(&shadow.buffer, from as u64,
+                            &card.staging, from as u64, (to - from) as u64);
+                    }
+                }
+                if !spans.is_empty() {
+                    sent.push(transition(&shadow.buffer,
+                        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
                 }
             }
             if !spans.is_empty() {
-                sent.push(transition(&shadow.buffer,
-                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
                 hashing.push((shadow, card, size, spans));
             }
         }
@@ -1034,6 +1044,8 @@ impl Host {
             // SAFETY: live distinct buffers, all uploads already recorded.
             // Each transition names its actual COPY_DEST state.
             unsafe { list.list.ResourceBarrier(&sent) };
+        }
+        if !hashing.is_empty() {
             for (shadow, card, size, spans) in hashing {
                 // SAFETY: the source is now in SRV state; each CardWork
                 // owns distinct hash buffers and disjoint piece ranges.
@@ -1047,6 +1059,9 @@ impl Host {
             compare_barrier(&list.list);
         }
         self.run_card_list(CardPhase::Sync, list, submitted);
+        if let Some(own) = own {
+            own.give_back();
+        }
     }
 
     /// Adapt source card_back: compare on the device, read flags after
@@ -1169,6 +1184,53 @@ impl Host {
     }
 }
 
+
+/// Actual scatter/copy commands use the owned snapshot, even when
+/// staging changes after take. Also exercise the normal warmup sync.
+#[test]
+#[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_SEND_OWN=1 and D3D12; run alone"]
+fn owned_card_send_keeps_original_bytes_after_staging_changes() {
+    let host = host().expect("D3D12 device");
+    let p = crate::watch::tests::pool(2);
+    let len = 2 * PIECE;
+    crate::shadow::register(p, p as u64, len as u64);
+    let shadow = crate::shadow::find(p as u64, len as u64).expect("registered copy");
+    let card = shadow.card().expect("device-local copy");
+    // SAFETY: owned title pages, initialize the first 32 bytes.
+    unsafe { (p as *mut u8).write_bytes(0, 32) };
+    let warm = host.new_list().unwrap();
+    shadow.refresh(&warm, p as u64, len as u64);
+    warm.close();
+    host.execute(&[&warm]);
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    host.settle_baked_uploads();
+    shadow.write_host(p as u64, &[1, 2, 3, 4]);
+    shadow.write_host((p + 8) as u64, &[5, 6, 7, 8]);
+    shadow.write_host((p + 17) as u64, &[9, 10, 11]);
+    let dirty = [(&shadow, card, vec![(0, 4), (8, 12), (17, 20)])];
+    let own = card_send::take(host, &dirty).expect("owned upload and scatter pipeline");
+    shadow.write_host(p as u64, &[99; 20]);
+    let sync = host.card_list(CardPhase::Sync);
+    // SAFETY: the owned bytes and exact destination owners are retained
+    // through the checked sync fence; all buffers start in COMMON.
+    unsafe { own.record(&sync.list, &dirty) };
+    host.run_card_list(CardPhase::Sync, sync, &mut submitted);
+    own.give_back();
+    let (readback, mapped) = host.mapped_buffer(32, true).unwrap();
+    let fetch = host.card_list(CardPhase::Fetch);
+    // SAFETY: both resources live, source decayed to COMMON, valid range.
+    unsafe { fetch.list.CopyBufferRegion(&readback, 0, &shadow.buffer, 0, 32) };
+    host.run_card_list(CardPhase::Fetch, fetch, &mut submitted);
+    // SAFETY: mapped bytes from the completed readback.
+    let got = unsafe { std::slice::from_raw_parts(mapped, 32) };
+    let mut expected = [0u8; 32];
+    expected[..4].copy_from_slice(&[1, 2, 3, 4]);
+    expected[8..12].copy_from_slice(&[5, 6, 7, 8]);
+    expected[17..20].copy_from_slice(&[9, 10, 11]);
+    assert_eq!(got, expected);
+    drop(submitted);
+    crate::shadow::unregister(p, p as u64);
+}
 
 /// Exercise the real tail path and verify that the check shares the
 /// title fence on both a changed and a clean submission.

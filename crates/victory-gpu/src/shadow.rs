@@ -723,6 +723,12 @@ impl Shadow {
             std::env::var_os("VICTORY_CARD_HASH_LEN").is_some_and(|v| v == "1")))
     }
 
+    /// CPU side of a card copy, for the source's owned sends. The
+    /// submitting thread must hold its lock and validate the byte range.
+    pub(crate) fn card_data(&self) -> *const u8 {
+        self.data
+    }
+
     fn card_changed(&self, from: usize, to: usize) {
         if let Some(card) = &self.card {
             card.changed(from, to);
