@@ -24,6 +24,9 @@ use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 pub(crate) mod card_compare;
 mod card_send;
 mod relay;
+mod late;
+
+pub(crate) use late::{PendingTitle, SettleWhy, late_enabled};
 mod torn;
 
 /// Resource states without the console's own bits (compression hints from

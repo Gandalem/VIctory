@@ -1202,6 +1202,11 @@ impl Staging {
         })
     }
 
+    /// Source Staging::memory: conservative full title-source interval.
+    pub(crate) fn memory(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
+    }
+
     pub(crate) fn observe_held(
         &self, copy: &crate::resource::HostTexture,
         hints: &std::collections::BTreeMap<u64, u32>,

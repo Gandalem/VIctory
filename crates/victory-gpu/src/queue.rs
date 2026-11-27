@@ -196,23 +196,52 @@ fn pump(held: &mut Holding, why: Why) {
         return;
     }
     let Some(host) = crate::host::host() else { return };
-    let read = read_value;
+    let late = crate::host::late_enabled();
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
     }
-    let fence = |f: usize| crate::fence::value(f as This);
+    use crate::host::{PendingTitle, SettleWhy};
     let started = std::time::Instant::now();
-    let mut ran = std::time::Duration::ZERO;
+    let ran = std::cell::Cell::new(std::time::Duration::ZERO);
+    let flight = std::cell::RefCell::new(None::<PendingTitle<'_>>);
+    let settle = |why| {
+        let pending = flight.borrow_mut().take();
+        if let Some(pending) = pending {
+            let at = std::time::Instant::now();
+            pending.settle(why);
+            ran.set(ran.get() + at.elapsed());
+        }
+    };
+    let read = |address: u64, bytes: u8| {
+        let why = flight.borrow().as_ref().map(|p| p.read_reason(address as usize, usize::from(bytes)));
+        if let Some(why) = why {
+            settle(why);
+        }
+        read_value(address, bytes)
+    };
+    let fence = |f: usize| {
+        settle(SettleWhy::Fence);
+        crate::fence::value(f as This)
+    };
     let mut run = |_: usize, segments: Vec<crate::list::Detached>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(crate::list::Detached::host).collect();
+        let why = flight.borrow().as_ref().map(|p| p.late_blocked(&segments));
+        if let Some(why) = why {
+            settle(why);
+        }
         let at = std::time::Instant::now();
-        host.execute(&lists);
-        ran += at.elapsed();
-        drop(lists);
-        segments.into_iter().for_each(crate::list::Detached::recycle);
+        if late {
+            *flight.borrow_mut() = Some(host.execute_late(segments));
+        } else {
+            let lists: Vec<&crate::host::HostList> = segments.iter().map(crate::list::Detached::host).collect();
+            host.execute(&lists);
+            drop(lists);
+            segments.into_iter().for_each(crate::list::Detached::recycle);
+        }
+        ran.set(ran.get() + at.elapsed());
     };
     let mut signal = |f: usize, value: u64| {
+        settle(SettleWhy::Fence);
         crate::fence::set(f as This, value);
         crate::fence::let_go(f as This);
     };
@@ -222,9 +251,11 @@ fn pump(held: &mut Holding, why: Why) {
         run: &mut run,
         signal: &mut signal,
     });
+    // Finish all publications before returning or scheduling a timer.
+    settle(SettleWhy::PumpEnd);
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
-        a.pump += started.elapsed().saturating_sub(ran);
+        a.pump += started.elapsed().saturating_sub(ran.get());
         a.pieces += pumped.pieces;
         a.segments += pumped.segments;
         a.unknown += pumped.unknown;

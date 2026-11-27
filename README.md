@@ -452,7 +452,20 @@ and returned after settlement, and each recorded piece is released
 at that boundary. The pool mutex protects only the idle slot. This
 does not yet permit overlapping title submissions. Run the ignored
 `owned_texture_piece_survives_recording_until_reset` adapter test.
+Experimental first stage `VICTORY_LATE_WAIT=1` with
+`VICTORY_LIST_DETACH=1` (per-list GPU timing off) adapts the source
+`send_late`, joined write ranges and `blocked_by` to the held queue
+pump. One signalled flight retains the recordings and submission
+guard. Classify explicit shader/picked and pipe writes against
+copy-source/destination, fill, texture and refresh dependencies;
+opaque paths remain conservative. Settle before any next list's
+preparation, memory or fence observation, signal, or pump return.
+Unlike the source, disjoint ranges still wait because shared marks,
+compare flags and physical aliases are not flight-independent.
+No second flight or speculative wait satisfaction is enabled.
 Run the ignored
+`late_title_flight_retains_recording_and_publishes_on_settle` test.
+The default remains synchronous. Run the ignored
 `sent_title_publishes_pipe_writes_only_after_settlement` adapter test.
 The default keeps the existing Arc/leave path. The ignored
 `carded_shadow_refresh_compare_and_copy_back` and

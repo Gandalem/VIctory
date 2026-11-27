@@ -206,7 +206,7 @@ impl Detached {
 }
 
 #[cfg(windows)]
-fn detach_enabled() -> bool {
+pub(crate) fn detach_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_DETACH").is_some_and(|v| v == "1"))
 }
@@ -2225,6 +2225,31 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(repeated);
         assert!(weak.upgrade().is_none());
+        assert_eq!(allocator_release(allocator), 0);
+    }
+
+    /// The first late-wait stage owns detached lists through the
+    /// title fence and publishes the pipe value only on settlement.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires D3D12 adapter; run alone"]
+    fn late_title_flight_retains_recording_and_publishes_on_settle() {
+        let host = crate::host::host().expect("D3D12 device");
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut title = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut title), S_OK);
+        let mut value = 0u64;
+        host_list(title).unwrap().defer_write((&raw mut value).cast(),
+            crate::queue::Written::Value(0x1234), 8);
+        assert_eq!(close(title), S_OK);
+        let flight = host.execute_late(detach(title, true));
+        assert_eq!(flight.read_reason((&raw const value) as usize, 8), crate::host::SettleWhy::Write);
+        assert_eq!(value, 0);
+        assert_eq!(list_release(title), 0);
+        flight.settle(crate::host::SettleWhy::Fence);
+        assert_eq!(value, 0x1234);
         assert_eq!(allocator_release(allocator), 0);
     }
 
