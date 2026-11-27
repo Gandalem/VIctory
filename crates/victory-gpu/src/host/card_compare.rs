@@ -843,7 +843,7 @@ fn add_range(scope: &mut CardScope, shadow: &std::sync::Arc<crate::shadow::Shado
 
 /// Returns None for the original full-coverage path. An empty declaration
 /// set is not evidence that arbitrary command lists cannot have written.
-fn declared_scope(runs: &[&HostList]) -> Option<CardScope> {
+fn declared_scope(runs: &[&HostList], marks: Option<&[crate::shadow::MarkRange]>) -> Option<CardScope> {
     if !ranges_enabled() {
         return None;
     }
@@ -866,8 +866,8 @@ fn declared_scope(runs: &[&HostList]) -> Option<CardScope> {
     if !declared {
         return None;
     }
-    for (shadow, address, len) in crate::shadow::card_mark_ranges()? {
-        add_range(&mut scope, &shadow, address, len, true);
+    for (shadow, address, len) in marks? {
+        add_range(&mut scope, shadow, *address, *len, true);
     }
     Some(scope)
 }
@@ -913,11 +913,12 @@ pub(super) fn prepare_picked(runs: &[&HostList], flight: u64) -> Vec<crate::pick
 /// picked candidate selection excludes overlapping declared writes.
 pub(super) type RelayPicked = std::collections::BTreeMap<usize, (usize, usize)>;
 
-pub(super) fn relay_picked(ranges: &[crate::picked::Range], withholding: bool) -> RelayPicked {
+pub(super) fn relay_picked(ranges: &[crate::picked::Range], withholding: bool,
+    marks: Option<&[crate::shadow::MarkRange]>) -> RelayPicked {
     if !crate::shadow::card_relay_merge_enabled() || withholding || ranges.is_empty() {
         return RelayPicked::new();
     }
-    let Some(marks) = crate::shadow::card_mark_ranges() else { return RelayPicked::new() };
+    let Some(marks) = marks else { return RelayPicked::new() };
     ranges.iter().filter(|range| !marks.iter().any(|mark| crate::picked::overlaps(range, mark)))
         .filter_map(|(shadow, address, len)| {
             let (start, size) = shadow.range();
@@ -984,27 +985,24 @@ fn land_fetch_batch(pool: &CardFetch, copies: &[std::sync::Arc<crate::shadow::Sh
 /// Reference picked::with / hand_back: land newly written bytes before
 /// the title's completion signal. The current branch's mark and withholding
 /// semantics take precedence; release cancelled snapshots without merging.
-pub(super) fn finish_picked(ranges: &[crate::picked::Range], withholding: bool, relay: &RelayPicked) {
+pub(super) fn merge_picked(ranges: &[crate::picked::Range], withholding: bool, relay: &RelayPicked,
+    marks: Option<&[crate::shadow::MarkRange]>) {
     if ranges.is_empty() {
         return;
     }
-    let marks = if withholding { None } else { crate::shadow::card_mark_ranges() };
+    let marks = if withholding { None } else { marks };
     for range in ranges {
         let (shadow, address, len) = range;
         if relay.contains_key(&(std::sync::Arc::as_ptr(shadow) as usize)) {
             // Its changed pieces have landed directly from the fenced
-            // fetch. Release the pending declaration/snapshot without
-            // remerging or marking the GPU bytes dirty for upload.
-            shadow.keep_writes(*address, *len);
+            // fetch. Retirement happens with all the flight's ranges.
             continue;
         }
-        let safe = marks.as_ref().is_some_and(|marks|
+        let safe = marks.is_some_and(|marks|
             !marks.iter().any(|mark| crate::picked::overlaps(range, mark)));
         if safe {
-            let written = shadow.copy_back(*address, *len);
+            let written = shadow.copy_back_merge(*address, *len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-        } else {
-            shadow.keep_writes(*address, *len);
         }
     }
 }
@@ -1021,7 +1019,7 @@ struct PickedObservation {
     evidence: std::collections::BTreeMap<usize, (usize, usize)>,
 }
 
-fn picked_observation(runs: &[&HostList]) -> Option<PickedObservation> {
+fn picked_observation(runs: &[&HostList], marks: Option<&[crate::shadow::MarkRange]>) -> Option<PickedObservation> {
     if !crate::picked::on() {
         return None;
     }
@@ -1051,8 +1049,8 @@ fn picked_observation(runs: &[&HostList]) -> Option<PickedObservation> {
     if shown.is_empty() {
         return None;
     }
-    for (shadow, address, len) in crate::shadow::card_mark_ranges()? {
-        add_range(&mut declared, &shadow, address, len, true);
+    for (shadow, address, len) in marks? {
+        add_range(&mut declared, shadow, *address, *len, true);
     }
     Some(PickedObservation { shown, declared, evidence: Default::default() })
 }
@@ -1525,13 +1523,14 @@ impl Host {
     /// the fence and land flagged full pieces before the CPU merge.
     /// Full coverage is the default and the conservative fallback.
     pub(super) fn card_back(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>],
-        runs: &[&HostList], tail: Option<CardCheck>, relay: &RelayPicked, submitted: &mut u64)
+        runs: &[&HostList], tail: Option<CardCheck>, relay: &RelayPicked,
+        marks: Option<&[crate::shadow::MarkRange]>, submitted: &mut u64)
     {
         if copies.is_empty() {
             return;
         }
         let deferred = deferred_hashes();
-        let mut picked = picked_observation(runs);
+        let mut picked = picked_observation(runs, marks);
         let (plans, flag_lease) = if let Some(check) = tail {
             // Host::execute checked the title fence and device status,
             // and its tail was queued before that fence. Assert the
@@ -1544,7 +1543,7 @@ impl Host {
             self.recycle_card_list(CardPhase::Check, work);
             (plans, flags)
         } else {
-            let scope = declared_scope(runs);
+            let scope = declared_scope(runs, marks);
             let plans = card_plans(copies, scope.as_ref());
             if plans.is_empty() {
                 return;

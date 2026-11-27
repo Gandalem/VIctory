@@ -1292,25 +1292,29 @@ impl Shadow {
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
+    #[cfg(test)]
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        self.copy_back_or_not(address, len, true)
+        let written = self.copy_back_merge(address, len);
+        self.copy_back_done(address, len);
+        written
     }
 
-    /// After the submission ran: what its shaders wrote in the range stays
-    /// in the copy and does not go into title memory (they computed it
-    /// from memory with no copy, `crate::memory`).
+    /// Test convenience: a withheld range has no merge.
+    #[cfg(test)]
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
-        self.copy_back_or_not(address, len, false);
+        self.copy_back_done(address, len);
     }
 
-    fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+    /// Merge a completed flight's declared range, without retiring its
+    /// snapshot or disarming its pages. Source relay_land completes
+    /// all merges first and only then calls copy_back_done.
+    pub(crate) fn copy_back_merge(&self, address: usize, len: usize) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
-            && back
             && from < to
         {
             let before = &before[from - taken..to - taken];
@@ -1400,10 +1404,16 @@ impl Shadow {
                 t.taken(&whole);
             }
         }
-        // Host deduplicates exact declarations before copy-back. With
-        // source Flights accounting, a completion releases only one
-        // flight's claim. Snapshot/armed-page teardown is last-owner only.
-        // Copy-back itself still requires serial execution.
+        written
+    }
+
+    /// Source copy_back_done, adapted to the segmented snapshot and
+    /// armed-page tracker. Retire the exact declaration once, only
+    /// after all merges of this completed flight are done. Keep the
+    /// before -> pending lock order and last-owner cleanup.
+    pub(crate) fn copy_back_done(&self, address: usize, len: usize) {
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let (segments, compared) = &mut *snapshot;
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.done((address, address + len));
         if pending.is_empty() {
@@ -1415,7 +1425,6 @@ impl Shadow {
                 t.disarm();
             }
         }
-        written
     }
 
     /// After a submission whose shaders marked the 64 KiB title page at
@@ -1830,119 +1839,151 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
-/// Snapshot the current GPU write marks without clearing them. The
-/// reference's declared-range planner must also cover this branch's
-/// marked-page copy-back, including held-back memory writes. Called
-/// after the title fence and before copy_back_marks, under submitted.
-pub(crate) fn card_mark_ranges() -> Option<Vec<(Arc<Shadow>, usize, usize)>> {
-    let maps = [bitmap(false)?, bitmap(true)?];
-    let m = marks();
-    let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
-    let used = (m.end as usize).div_ceil(32).min(words);
-    let mut out = Vec::new();
-    for b in maps {
-        // SAFETY: the GPU completed its writes and the submission lock
-        // excludes further GPU writes or clearing of the mapped bitmap.
-        let bits = unsafe { std::slice::from_raw_parts(b.data as *const u32, words) };
-        // The last bit represents an untrackable write. Do not narrow.
-        if bits[words - 1] & (1 << 31) != 0 {
-            return None;
-        }
-        for (w, &word) in bits[..used].iter().enumerate() {
-            let mut x = word;
-            while x != 0 {
-                let n = (w * 32) as u32 + x.trailing_zeros();
-                x &= x - 1;
-                let (&base, owner) = m.owners.range(..=n).next_back()?;
-                let copy = owner.upgrade()?;
-                let k = n - base;
-                if k >= pages(copy.start, copy.len) {
-                    return None;
-                }
-                if copy.card().is_some() {
-                    let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-                    out.push((copy, page, PAGE));
-                }
-            }
-        }
-    }
-    Some(out)
+/// A resolved written page, pinned until the flight's landing ends.
+/// Store the index too: the original order is bitmap order, with
+/// ordinary and title-memory writes deduplicated by the same bit.
+struct MarkPage {
+    index: u32,
+    copy: Arc<Shadow>,
+    page: usize,
 }
 
-/// After a submission: every page its shaders marked as written through
-/// views goes back ([`Shadow::copy_back_marked`]), but for pages in
-/// `withheld` (ranges of copies that lists whose writes stay out of title
-/// memory declared) and, with `memory_withheld`, pages that shaders using
-/// title memory marked; the bitmaps are cleared. Before the copy-backs of
-/// declared ranges, which disarm the copies.
-// shortcut: marks do not tell lists apart: a page that a withheld list and
-// another both wrote through views goes back unless the withheld list
-// declared it.
-pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
-    let (mut marked, mut held) = (Vec::new(), Vec::new());
-    for memory in [false, true] {
-        let Some(b) = bitmap(memory) else {
-            continue;
-        };
-        let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
-        // SAFETY: the mapped bitmap; the GPU is done with it (one submission
-        // runs at a time).
-        let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
-        // Marks of offsets past the bitmap land in its last bit, no copy's.
-        bits[words - 1] = 0;
-        let used = (marks().end as usize).div_ceil(32).min(words);
-        for (w, word) in bits[..used].iter_mut().enumerate() {
-            let mut x = std::mem::take(word);
-            let into = if memory && memory_withheld { &mut held } else { &mut marked };
-            while x != 0 {
-                into.push((w * 32) as u32 + x.trailing_zeros());
-                x &= x - 1;
+pub(crate) type MarkRange = (Arc<Shadow>, usize, usize);
+
+/// Adapt the source relay_land's owned write ranges to this branch's
+/// marked-page and withholding paths. Capture after the checked title
+/// fence, resolve owners once, then use the same snapshot in all
+/// compare/picked/landing decisions. GPU bitmap allocation/binding is
+/// still global; do NOT capture while another title flight is running.
+pub(crate) struct FlightMarks {
+    resolved: [Vec<MarkPage>; 2],
+    known: bool,
+}
+
+/// Consume the valid write marks, preserving all real bits in the last
+/// word. Its top bit alone is the untrackable-write sentinel. Read-slot
+/// bits live outside this slice and are never consumed here.
+fn drain_mark_bits(bits: &mut [u32], used: usize) -> (Vec<u32>, bool) {
+    let last = bits.len() - 1;
+    let known = bits[last] & (1 << 31) == 0;
+    bits[last] &= !(1 << 31);
+    let mut out = Vec::new();
+    let used = used.min(bits.len());
+    for (w, word) in bits[..used].iter_mut().enumerate() {
+        let mut x = std::mem::take(word);
+        while x != 0 {
+            out.push((w * 32) as u32 + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
+    (out, known)
+}
+
+impl FlightMarks {
+    pub(crate) fn capture() -> Self {
+        let maps = [bitmap(false), bitmap(true)];
+        let mut resolved: [Vec<MarkPage>; 2] = Default::default();
+        let mut known = true;
+        // If an invalid mark found a live owner, keep it until after
+        // unlocking MARKS; dropping the last Arc can acquire MARKS.
+        let mut invalid = Vec::new();
+        {
+            let m = marks();
+            let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+            let used = (m.end as usize).div_ceil(32).min(words);
+            for (kind, bitmap) in maps.into_iter().enumerate() {
+                let Some(b) = bitmap else {
+                    known = false;
+                    continue;
+                };
+                // SAFETY: title fence checked and submitted guard held;
+                // no GPU or other capture accesses the mapped write bits.
+                let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
+                let (indices, complete) = drain_mark_bits(bits, used);
+                known &= complete;
+                for index in indices {
+                    let Some((&base, copy)) = m.owners.range(..=index).next_back() else {
+                        known = false;
+                        continue;
+                    };
+                    let Some(copy) = copy.upgrade() else {
+                        known = false;
+                        continue;
+                    };
+                    let k = index - base;
+                    if k >= pages(copy.start, copy.len) {
+                        invalid.push(copy);
+                        known = false;
+                        continue;
+                    }
+                    let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
+                    resolved[kind].push(MarkPage { index, copy, page });
+                }
             }
         }
+        drop(invalid);
+        Self { resolved, known }
     }
-    #[cfg(feature = "diagnostics")]
-    let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
-    marked.sort_unstable();
-    marked.dedup();
-    let page_of = |m: &Marks, n: u32| {
-        let (&base, copy) = m.owners.range(..=n).next_back()?;
-        let copy = copy.upgrade()?;
-        let k = n - base;
-        (k < pages(copy.start, copy.len)).then(|| {
-            let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-            (copy, page)
-        })
-    };
-    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
-    if !held.is_empty() {
-        let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
-            crate::memory::drop_withheld(page, PAGE);
+
+    /// Unknown/untrackable marks forbid narrowing or a speculative
+    /// picked merge. Known pages still use the original landing path.
+    pub(crate) fn card_ranges(&self) -> Option<Vec<MarkRange>> {
+        self.known.then(|| self.resolved.iter().flatten()
+            .filter(|p| p.copy.card().is_some())
+            .map(|p| (p.copy.clone(), p.page, PAGE)).collect())
+    }
+
+    /// The original withholding semantics and bit order: held title
+    /// memory pages are retaken first; non-withheld marks go back once.
+    /// Resolve no bitmap owners at landing time.
+    pub(crate) fn land(self, withheld: &[MarkRange], memory_withheld: bool) {
+        let [mut marked, memory] = self.resolved;
+        if memory_withheld {
+            for p in memory {
+                crate::memory::drop_withheld(p.page, PAGE);
+            }
+        } else {
+            marked.extend(memory);
         }
-    }
-    if marked.is_empty() {
-        return;
-    }
-    let pages: Vec<(Arc<Shadow>, usize)> = {
-        let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
-    };
-    for (copy, page) in pages {
-        if withheld
-            .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
-        {
-            continue;
-        }
-        let written = copy.copy_back_marked(page);
         #[cfg(feature = "diagnostics")]
-        {
-            crate::copystat::add(crate::copystat::C::MarkedPages, 1);
-            crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
+        marked.sort_unstable_by_key(|p| p.index);
+        marked.dedup_by_key(|p| p.index);
+        for MarkPage { copy, page, .. } in marked {
+            if withheld.iter().any(|(c, a, n)| Arc::ptr_eq(c, &copy)
+                && *a < page + PAGE && page < a + n)
+            {
+                continue;
+            }
+            let written = copy.copy_back_marked(page);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::MarkedPages, 1);
+                crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = written;
         }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = written;
     }
+}
+
+#[cfg(test)]
+fn copy_back_marks(withheld: &[MarkRange], memory_withheld: bool) {
+    FlightMarks::capture().land(withheld, memory_withheld);
+}
+
+#[test]
+fn flight_mark_bits_keep_real_last_word_and_isolate_later_capture() {
+    let mut bits = [1u32 << 3, (1 << 31) | (1 << 29), 0x12345678];
+    let (first, known) = drain_mark_bits(&mut bits[..2], 2);
+    assert_eq!(first, [3, 61]);
+    assert!(!known, "unknown write cannot narrow the check");
+    assert_eq!(bits, [0, 0, 0x12345678], "read marks are untouched");
+    bits[0] = 1 << 4;
+    let (next, known) = drain_mark_bits(&mut bits[..2], 2);
+    assert!(known);
+    assert_eq!(next, [4]);
+    assert_eq!(first, [3, 61], "the earlier result is owned");
 }
 
 struct Entry {
@@ -2666,11 +2707,19 @@ pub(crate) mod tests {
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
-        assert_eq!(copy.copy_back(p + 16, 64), 64, "the range's part of the piece");
-        assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE), PAGE, "the piece written");
-        assert_eq!(copy.copy_back(p + PAGE, PAGE), 0, "compared once");
-        assert_eq!(copy.copy_back(p + 3 * PAGE, 100), 0);
-        assert_eq!(copy.copy_back(p + 80, 8), 0);
+        assert_eq!(copy.copy_back_merge(p + 16, 64), 64, "the range's part of the piece");
+        assert_eq!(copy.copy_back_merge(p + PAGE, 2 * PAGE), PAGE, "the piece written");
+        assert_eq!(copy.copy_back_merge(p + PAGE, PAGE), 0, "compared once");
+        assert_eq!(copy.copy_back_merge(p + 3 * PAGE, 100), 0);
+        assert_eq!(copy.copy_back_merge(p + 80, 8), 0);
+        assert_eq!(bytes(&copy), 72 + 2 * PAGE + 100, "merge does not retire snapshots");
+        assert!(!copy.pending.lock().unwrap().is_empty());
+        for (at, n) in [(p + 16, 64), (p + PAGE, 2 * PAGE), (p + PAGE, PAGE),
+            (p + 3 * PAGE, 100), (p + 80, 8)]
+        {
+            copy.copy_back_done(at, n);
+        }
+        assert!(copy.pending.lock().unwrap().is_empty());
         // SAFETY: our pool.
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
@@ -2726,6 +2775,36 @@ pub(crate) mod tests {
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
+    }
+
+    /// Capture pins the original owner even after its registry entry
+    /// disappears. A later mark remains in its own bitmap snapshot.
+    #[test]
+    #[ignore = "requires D3D12 adapter; run alone"]
+    fn flight_mark_capture_pins_owners_and_separates_results() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).expect("registered copy");
+        let base = copy.marks.expect("mark allocation");
+        let b = bitmap(false).expect("write bitmap");
+        // SAFETY: isolated test, no GPU work; the two bits belong to copy.
+        unsafe { *(b.data as *mut u32).add((base / 32) as usize) |= 1 << (base % 32) };
+        let first = FlightMarks::capture();
+        let weak = Arc::downgrade(&copy);
+        let next = base + 1;
+        // SAFETY: same isolated mapping and a distinct valid page.
+        unsafe { *(b.data as *mut u32).add((next / 32) as usize) |= 1 << (next % 32) };
+        let second = FlightMarks::capture();
+        assert!(first.resolved[0].iter().any(|m| m.index == base && m.page == p));
+        assert!(second.resolved[0].iter().any(|m| m.index == next && m.page == p + PAGE));
+        assert!(!first.resolved[0].iter().any(|m| m.index == next));
+        unregister(p, p as u64);
+        drop(copy);
+        assert!(weak.upgrade().is_some());
+        drop(second);
+        assert!(weak.upgrade().is_some(), "first still holds original owner");
+        drop(first);
     }
 
     /// Marks of shaders using title memory stay out of title memory while

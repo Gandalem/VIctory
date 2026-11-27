@@ -475,9 +475,21 @@ Oversized plans, exhaustion or creation failure retain the original
 serial per-copy flag path. This fallback is not safe for future
 overlapping flights and must be preceded by settlement then.
 Run the ignored `packed_card_flags_survive_a_later_check` adapter
-test. This ports compare-result ownership only: this branch's global
-write/read bitmaps, hash updates and copy-back still require serial
-settlement. The default flag path is unchanged.
+test. The reference's relay_land / copy_back_done boundary is also
+applied to the existing write-mark path. After the checked title
+fence, drain the write bits once and resolve and pin their owners.
+The same completed FlightMarks result supplies the declared compare
+scope, picked discovery/relay eligibility and marked-page merge.
+Unknown owners or an overflow sentinel forbid narrowing. Preserve
+the real bits in the last word (only its top bit is a sentinel) and
+leave read-slot bits untouched. Preserve withheld/ordinary page
+ordering. Merge all declared and picked ranges before retiring
+their counted declarations, keeping the snapshots and page arms
+through that boundary. Run the ignored
+`flight_mark_capture_pins_owners_and_separates_results` test.
+This is completed-flight CPU ownership, not per-flight GPU bitmap
+binding: global write/read bitmaps, hashes and copy-back still
+require serial settlement. The default flag path is unchanged.
 Run the ignored
 `late_title_flight_retains_recording_and_publishes_on_settle` test.
 The default remains synchronous. Run the ignored

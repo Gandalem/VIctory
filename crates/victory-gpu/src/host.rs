@@ -1965,10 +1965,15 @@ impl Host {
             .collect();
         // The title fence has completed. Restore changed GPU pieces to
         // the CPU side before the existing marked/declared merge paths.
-        let relay = card_compare::relay_picked(&picked, withholding);
-        self.card_back(&carded, runs, tail, &relay, &mut submitted);
-        card_compare::finish_picked(&picked, withholding, &relay);
-        crate::shadow::copy_back_marks(&withheld, withholding);
+        // One owned mark result, resolved at the completed title fence.
+        // Every compare, picked decision and marked merge uses this
+        // same capture, before any declaration's snapshot is retired.
+        let marks = crate::shadow::FlightMarks::capture();
+        let card_marks = marks.card_ranges();
+        let relay = card_compare::relay_picked(&picked, withholding, card_marks.as_deref());
+        self.card_back(&carded, runs, tail, &relay, card_marks.as_deref(), &mut submitted);
+        card_compare::merge_picked(&picked, withholding, &relay, card_marks.as_deref());
+        marks.land(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         let bake = crate::descriptor::bake_enabled() && !read.is_empty();
@@ -1978,13 +1983,21 @@ impl Host {
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
-                let written = shadow.copy_back(address, len);
+                let written = shadow.copy_back_merge(address, len);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             } else {
-                shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
                 crate::memory::drop_withheld(address, len);
             }
+        }
+        // Reference relay_land: every merge completes before releasing
+        // any of this flight's counted declarations. Marked-page arms
+        // and comparison snapshots live through the whole landing.
+        for (shadow, address, len, _) in &back {
+            shadow.copy_back_done(*address, *len);
+        }
+        for (shadow, address, len) in &picked {
+            shadow.copy_back_done(*address, *len);
         }
         for list in runs {
             for work in &list.deferred().after {
