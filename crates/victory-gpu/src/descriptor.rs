@@ -199,6 +199,41 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Reference first_viewed / next_start aggregated over *all* live heaps.
+#[cfg(windows)]
+pub(crate) fn placed_judgements() -> std::collections::BTreeMap<u64, u32> {
+    let mut out = std::collections::BTreeMap::new();
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps stay live under this lock.
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
+            host.collect_placed_hints(&mut out);
+        }
+    }
+    out
+}
+
+/// Reference levels_changed / texture_views_remade, drained once for
+/// every heap after the synchronous GPU fence rather than by the first
+/// heap to consume a global address list.
+#[cfg(windows)]
+pub(crate) fn remake_tiled_views(
+    changed: &std::collections::BTreeMap<usize, std::sync::Arc<crate::resource::HostTexture>>,
+) {
+    if changed.is_empty() { return; }
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps stay live under this lock.
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND, Some(step)) =
+            (heap.host.get(), heap.desc.kind, increment(heap.desc.kind))
+        {
+            host.texture_views_remade(start, u64::from(step), changed);
+        }
+    }
+}
+
 /// Makes the views of slots `slots` that were left null (textures the title
 /// placed itself, textures given up) in every shader-visible view heap, now
 /// that shaders read them (`crate::shadow::take_reads`), and stamps what

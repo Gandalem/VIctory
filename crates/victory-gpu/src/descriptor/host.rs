@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -24,6 +25,8 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Sparse index of placed title records (opt-in observation only).
+    placed_hints: Mutex<PlacedHints>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -58,6 +61,40 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+}
+
+/// Subset of cool_fox's Spans: track the address and lowest requested
+/// title MIP of each slot, without its destructive stale-overlap policy.
+#[derive(Default)]
+struct PlacedHints(BTreeMap<u32, (u64, u32)>);
+
+impl PlacedHints {
+    fn note(&mut self, slot: u32, hint: Option<(u64, u32)>) {
+        if let Some(hint) = hint {
+            self.0.insert(slot, hint);
+        } else {
+            self.0.remove(&slot);
+        }
+    }
+
+    fn collect(&self, out: &mut BTreeMap<u64, u32>) {
+        for &(start, first) in self.0.values() {
+            out.entry(start).and_modify(|old| *old = (*old).min(first)).or_insert(first);
+        }
+    }
+}
+
+fn placed_hint(view: &View) -> Option<(u64, u32)> {
+    let View::Placed(unordered, resource, words) = view else { return None };
+    if resource[0] == 1 { return None; }
+    let start = u64::from(words[10]) | (u64::from(words[11]) << 32);
+    if start == 0 { return None; }
+    // The original placed view's first level is word 4. Unknown views
+    // and UAVs conservatively request level zero.
+    let first = if !unordered && words[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 {
+        words[4]
+    } else { 0 };
+    Some((start, first))
 }
 
 /// The key of the title record, not the GPU descriptor's contents.
@@ -215,6 +252,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            placed_hints: Mutex::default(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -495,6 +533,9 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        if index < self.count && crate::tiles::judgement_enabled() {
+            self.placed_hints.lock().unwrap_or_else(|e| e.into_inner()).note(index, None);
+        }
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -831,6 +872,9 @@ impl HostHeap {
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
+            if !self.sampler && crate::tiles::judgement_enabled() {
+                self.placed_hints.lock().unwrap_or_else(|e| e.into_inner()).note(index, placed_hint(&view));
+            }
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -846,6 +890,57 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// Merge every live heap's observations. The caller has synced the
+    /// title heaps, and these are hints, not proof of shader consumption.
+    pub(crate) fn collect_placed_hints(&self, out: &mut BTreeMap<u64, u32>) {
+        self.placed_hints.lock().unwrap_or_else(|e| e.into_inner()).collect(out);
+    }
+
+    /// Adapt the reference texture_views_remade to the fenced renderer.
+    /// Only existing placed SRVs of the exact changed host copy qualify.
+    /// The heap is live, and no GPU submission is running. Never resolve
+    /// a new host texture or replace a slot with a different resource.
+    pub(crate) fn texture_views_remade(
+        &self, start: u64, step: u64,
+        changed: &BTreeMap<usize, std::sync::Arc<crate::resource::HostTexture>>,
+    ) {
+        use windows::core::Interface;
+        if self.sampler { return; }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let candidates: Vec<_> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            kept.iter().take(self.count as usize).enumerate().filter_map(|(i, slot)| {
+                let (texture, shadow) = slot.as_ref()?;
+                if shadow.is_some() { return None; }
+                let copy = changed.get(&(texture.as_raw() as usize))?;
+                Some((i as u32, copy.clone()))
+            }).collect()
+        };
+        let Some(gpu) = host() else { return };
+        for (index, copy) in candidates {
+            let key = made[index as usize];
+            let handle = start + u64::from(index) * step;
+            if key == 0 || record_key(handle) != key { continue; }
+            let Some(View::Placed(false, resource, desc)) = view_at(key as u32, (key >> 32) as u32) else { continue };
+            if resource[0] == 1 || desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 { continue; }
+            let address = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+            let Some(r) = crate::resource::existing_placed_texture(address, &resource) else { continue };
+            if !crate::resource::made_copy(r).is_some_and(|current| std::sync::Arc::ptr_eq(&current, &copy)) {
+                continue;
+            }
+            let words: &[u32; 10] = desc[..10].try_into().expect("ten descriptor words");
+            if record_key(handle) != key { continue; }
+            let remade = shader_texture_view(&gpu.device, r, &copy, Some(words), self.cpu(index)).is_some();
+            if !remade || record_key(handle) != key {
+                // A failed or superseded write must not leave a stale
+                // descriptor. The ordinary mirror/read path retries it.
+                made[index as usize] = 0;
+                self.make_null(index);
+                crate::shadow::forget_read(index);
+            }
+        }
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1608,6 +1703,49 @@ fn typed_store(format: u32) -> bool {
     ok
 }
 
+/// The same SRV construction is used for first creation and for a
+/// fenced re-publication of an already-owned tiled texture.
+fn shader_texture_view(
+    device: &ID3D12Device, resource: crate::object::This,
+    copy: &crate::resource::HostTexture, desc: Option<&[u32; 10]>,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
+    copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
+    let texture = &copy.texture;
+    let mut desc = desc.map(srv_desc);
+    if desc.is_none() && !default_view(resource) {
+        return None;
+    }
+    if let Some(desc) = desc.as_mut()
+        && desc.Format.0 == 0
+        && let Some(format) = crate::resource::view_format_for(resource, texture)
+    {
+        desc.Format = DXGI_FORMAT(format as i32);
+    }
+    if let Some(d) = desc.as_mut() {
+        shift_view_levels(crate::resource::dropped(resource, texture), d);
+        if let Some(mapping) = &copy.tiled
+            && let Some(first) = mapping.lock().unwrap_or_else(|e| e.into_inner()).first_shown()
+        {
+            // SAFETY: the live reserved texture supplies the retained level count.
+            let levels = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+            crate::tiles::show_from(d, first, levels);
+        }
+    }
+    if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
+        return None;
+    }
+    // SAFETY: a live texture and a slot of our heap.
+    unsafe {
+        device.CreateShaderResourceView(
+            texture,
+            desc.as_ref().map(std::ptr::from_ref),
+            at,
+        )
+    };
+    Some(Some((texture.clone(), None)))
+}
+
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
@@ -1645,40 +1783,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(copy) = crate::resource::host_copy(resource) {
-                copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
-                let texture = &copy.texture;
-                let mut desc = desc.as_ref().map(srv_desc);
-                if desc.is_none() && !default_view(resource) {
-                    return None;
-                }
-                if let Some(desc) = desc.as_mut()
-                    && desc.Format.0 == 0
-                    && let Some(format) = crate::resource::view_format(resource)
-                {
-                    desc.Format = DXGI_FORMAT(format as i32);
-                }
-                if let Some(d) = desc.as_mut() {
-                    shift_view_levels(crate::resource::dropped(resource, texture), d);
-                    if let Some(mapping) = &copy.tiled
-                        && let Some(first) = mapping.lock().unwrap_or_else(|e| e.into_inner()).first_shown()
-                    {
-                        // SAFETY: the live reserved texture supplies the retained level count.
-                        let levels = u32::from(unsafe { texture.GetDesc() }.MipLevels);
-                        crate::tiles::show_from(d, first, levels);
-                    }
-                }
-                if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
-                    return None;
-                }
-                // SAFETY: a live texture and a slot of our heap.
-                unsafe {
-                    device.CreateShaderResourceView(
-                        texture,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    )
-                };
-                Some(Some((texture.clone(), None)))
+                shader_texture_view(device, resource, &copy, desc.as_ref(), at)
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -1986,6 +2091,32 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placed_hints_merge_heap_views_and_remove_rewritten_slots() {
+        let mut a = PlacedHints::default();
+        let mut b = PlacedHints::default();
+        a.note(1, Some((0x10000, 3)));
+        a.note(2, Some((0x10000, 1)));
+        b.note(1, Some((0x10000, 2)));
+        b.note(3, Some((0x18000, 0)));
+        let mut out = BTreeMap::new();
+        a.collect(&mut out);
+        b.collect(&mut out);
+        assert_eq!(out.get(&0x10000), Some(&1));
+        a.note(2, Some((0x20000, 4)));
+        a.note(1, None);
+        out.clear();
+        a.collect(&mut out);
+        b.collect(&mut out);
+        assert_eq!(out.get(&0x10000), Some(&2));
+        assert_eq!(out.get(&0x20000), Some(&4));
+        b.note(1, None);
+        out.clear();
+        a.collect(&mut out);
+        b.collect(&mut out);
+        assert!(!out.contains_key(&0x10000));
+    }
 
     #[test]
     fn baked_descriptor_record_keys_distinguish_rewrites() {

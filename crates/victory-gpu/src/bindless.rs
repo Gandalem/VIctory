@@ -471,6 +471,14 @@ pub(crate) fn uploads(
             }
         }
     }
+    // Observe title-held levels independently of dirty hashes and ahead
+    // reuse. Do not narrow allocations, uploads or published SRVs.
+    if crate::tiles::judgement_enabled() && work.iter().any(|(_, copy, _)| copy.tiled.is_some()) {
+        let hints = crate::descriptor::placed_judgements();
+        for (staging, copy, _) in &work {
+            staging.observe_held(copy, &hints);
+        }
+    }
     let mut recorded = false;
     let mut readable = Vec::new();
     let mut accepted = Vec::new();

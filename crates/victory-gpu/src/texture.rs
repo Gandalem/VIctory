@@ -911,7 +911,71 @@ pub(crate) fn refresh_all(work: &[RefreshWork]) -> Vec<Option<Upload>> {
     out
 }
 
+/// Reference first_viewed / next_start judgement. Ignore starts inside
+/// the first 4 KiB block, as cool_fox does for packed smallest levels.
+fn judgement(start: u64, size: u64, hints: &std::collections::BTreeMap<u64, u32>) -> (u32, u64) {
+    let first = hints.get(&start).copied().unwrap_or(0);
+    let lo = start.saturating_add(4096);
+    let end = start.saturating_add(size);
+    let limit = if lo < end {
+        hints.range(lo..end).next().map_or(u64::MAX, |(&at, _)| at - start)
+    } else { u64::MAX };
+    (first, limit)
+}
+
+/// Reference held_levels: check title level, source interval, and page
+/// commitment. The intervals use the current renderer's retained-MIP
+/// numbering, so dropped title levels do not shift the host mask twice.
+fn held_mask(spans: &[(usize, usize)], first_mip: u32, first: u32, limit: u64,
+    mut there: impl FnMut(usize, usize) -> bool) -> u32 {
+    spans.iter().take(32).enumerate().fold(0, |mask, (i, &(a, b))| {
+        if first_mip.saturating_add(i as u32) >= first
+            && b > a && b as u64 <= limit && there(a, b - a)
+        {
+            mask | (1u32 << i)
+        } else { mask }
+    })
+}
+
 impl Staging {
+    /// Advisory held MIPs, adapted from cool_fox's judgement/held_levels.
+    /// Query only the source bytes of retained levels and their packed
+    /// block. Unsupported layouts conservatively report every level.
+    fn held_levels(&self, hints: &std::collections::BTreeMap<u64, u32>) -> u32 {
+        let all = if self.mips >= 32 { u32::MAX } else { (1u32 << self.mips) - 1 };
+        if self.layout.slices != 1 || self.mips == 0 || self.mips > 32
+            || self.spans.len() != self.mips as usize
+            || self.first_mip as usize + self.mips as usize > self.layout.mips.len()
+        {
+            return all;
+        }
+        let (first, limit) = judgement(self.memory as u64, self.layout.size, hints);
+        let mut spans = self.spans.clone();
+        let tail = self.layout.first_tail_mip as usize;
+        if tail < self.layout.mips.len() {
+            let end = self.layout.alignment.min(self.layout.slice_size) as usize;
+            for (i, span) in spans.iter_mut().enumerate() {
+                if self.first_mip as usize + i >= tail {
+                    *span = (0, end);
+                }
+            }
+        }
+        held_mask(&spans, self.first_mip, first, limit, |at, len| {
+            committed(self.memory.wrapping_add(at), len)
+        })
+    }
+
+    pub(crate) fn observe_held(
+        &self, copy: &crate::resource::HostTexture,
+        hints: &std::collections::BTreeMap<u64, u32>,
+    ) {
+        let Some(mapping) = &copy.tiled else { return };
+        let levels = self.held_levels(hints);
+        if mapping.lock().unwrap_or_else(|e| e.into_inner()).observe_held(levels) {
+            tracing::debug!(memory = self.memory as usize, held = levels, "observed title-held MIPs (advisory)");
+        }
+    }
+
     /// A bake must be bounded and fully tracked. Untracked and partially
     /// tracked sources retain the existing mandatory upload path.
     pub(crate) fn bake_cost(&self) -> Option<u64> {
@@ -1350,6 +1414,20 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_judgement_uses_view_start_neighbour_and_committed_spans() {
+        let hints = std::collections::BTreeMap::from([
+            (0x10000, 2), (0x10100, 0), (0x16000, 0),
+        ]);
+        assert_eq!(judgement(0x10000, 0x20000, &hints), (2, 0x6000));
+        assert_eq!(judgement(0x10000, 0x400, &hints), (2, u64::MAX));
+        let spans = [(0x8000, 0x10000), (0x4000, 0x8000), (0, 0x4000), (0, 0x4000)];
+        assert_eq!(held_mask(&spans, 0, 2, 0x6000, |_, _| true), 0b1100);
+        assert_eq!(held_mask(&spans, 0, 0, u64::MAX, |at, _| at != 0), 0b0011);
+        assert_eq!(held_mask(&spans[2..], 2, 3, 0x6000, |_, _| true), 0b10);
+        assert_eq!(held_mask(&spans, 0, 0, 0x2000, |_, _| true), 0);
+    }
 
     #[test]
     fn ahead_range_selection_acknowledges_only_the_actual_submission_union() {

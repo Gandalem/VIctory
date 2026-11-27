@@ -2672,6 +2672,26 @@ pub(crate) fn placed_size(desc: &[u32; 14]) -> Option<u64> {
     (d.dimension != BUFFER).then(|| footprint(&d).map(|f| f.size)).flatten()
 }
 
+/// Find a permanent placed title object without creating a new host
+/// allocation. Used only to revalidate an already published descriptor.
+#[cfg(windows)]
+pub(crate) fn existing_placed_texture(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let mut desc = *desc;
+    (desc[1], desc[13]) = (0, 0);
+    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
+        .get(&(address, desc)).map(|&r| r as This)
+}
+
+#[cfg(windows)]
+pub(crate) fn view_format_for(
+    this: This, texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> Option<u32> {
+    let own = pc_format(resource(this).desc.format);
+    // SAFETY: the caller retains this exact host texture.
+    let format = unsafe { texture.GetDesc() }.Format.0 as u32;
+    (format != own).then_some(own)
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

@@ -420,13 +420,32 @@ fence, before on-read descriptor creation. The isolated ignored GPU test
 uses this submission path and exercises reversed list order and
 expansion without clearing the previous write.
 
-The reference's `show_from` clamp remains connected to explicit SRV
-creation. Production still fully backs and initializes every MIP,
-so its first shown level remains zero. Live partial admission,
-title-held level discovery and re-publishing existing descriptors on
-changes remain unported. Do not activate sparse title maps until those
-paths and GPU readback are verified. Like the reference, mapped tiles are
-not returned while the resource lives. This option is disabled by
+The reference's `show_from` clamp is shared by initial creation and
+fenced re-publication of existing placed 2D SRVs. A completed card write
+that changes the first shown level triggers a scan of all live view
+heaps, checking the record generation and exact retained host resource
+before rebuilding a matching slot. Stale or failed publication uses the
+ordinary null/read retry path. No new host texture is created by this
+pass. Other SRV forms and already recorded dynamic table slots still
+require coordination before live sparse admission.
+
+`VICTORY_TILED_MIP_JUDGEMENT=1` (with the tile pool enabled) also ports
+the reference's placed-view first-level and next-start judgement and
+title-held-level calculation. A sparse per-heap index collects placed
+view hints, merged across heaps; retained source spans, the packed
+source block and page commitment are checked for sampled tiled textures
+during submission preparation. Changed masks are logged at DEBUG as
+`observed title-held MIPs (advisory)`. These are inferred from title
+descriptors and memory commitment, not measured shader MIP access.
+Unsupported layouts conservatively report all retained levels.
+
+The observed mask is deliberately separate from the active held mask.
+Production still fully backs and initializes every retained MIP, so
+its first shown level is zero. The observation does not change uploads,
+allocation or sampling. Live partial admission and full descriptor/table
+coordination remain unported and require Windows GPU readback
+verification. Like the reference, mapped tiles are not returned while
+the resource lives. This option is disabled by
 default: the dedicated initialization fence and zero fill may outweigh
 pooling savings; validate both correctness and performance on Windows.
 The upstream first-use texture creation and whole-texture descriptor

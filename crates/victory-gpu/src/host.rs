@@ -1574,11 +1574,15 @@ impl Host {
         }
         // Publish GPU-authored levels only after successful completion,
         // before read-driven descriptor creation.
+        let mut reshown = std::collections::BTreeMap::new();
         for (copy, levels) in tile_writes.values() {
-            if let Some(mapping) = &copy.tiled {
-                mapping.lock().unwrap_or_else(|e| e.into_inner()).card_wrote(*levels);
+            if let Some(mapping) = &copy.tiled
+                && mapping.lock().unwrap_or_else(|e| e.into_inner()).card_wrote(*levels)
+            {
+                reshown.insert(copy.texture.as_raw() as usize, copy.clone());
             }
         }
+        crate::descriptor::remake_tiled_views(&reshown);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's

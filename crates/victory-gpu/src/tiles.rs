@@ -213,6 +213,9 @@ pub(crate) struct Mapping {
     /// Levels held by title data and levels actually written by the card.
     /// The production full-chain path treats every initialized level as held.
     held: u32,
+    /// Advisory held-level discovery. Never used to remove backing or
+    /// change the shown level until the sparse title path is validated.
+    observed_held: Option<u32>,
     card: u32,
     /// Packed-group claims are acquired at submission, never recording.
     /// Production initializes every group before a list records a write.
@@ -221,7 +224,7 @@ pub(crate) struct Mapping {
 
 impl Mapping {
     fn new(groups: Vec<Group>) -> Self {
-        Self { groups, mapped: 0, leases: Vec::new(), held: 0, card: 0, claimed: 0 }
+        Self { groups, mapped: 0, leases: Vec::new(), held: 0, observed_held: None, card: 0, claimed: 0 }
     }
 
     fn every_level(&self) -> u32 {
@@ -245,9 +248,18 @@ impl Mapping {
     /// after the real list's completion fence. It never maps tiles or
     /// acknowledges unbacked writes. Preserve exact authored subresources,
     /// rather than marking the entire packed tail as GPU-written.
-    pub(crate) fn card_wrote(&mut self, levels: u32) {
+    pub(crate) fn card_wrote(&mut self, levels: u32) -> bool {
+        let previous = self.first_shown();
         self.card |= levels & self.mapped;
         self.unclaim(levels);
+        previous != self.first_shown()
+    }
+
+    pub(crate) fn observe_held(&mut self, levels: u32) -> bool {
+        let levels = levels & self.every_level();
+        let changed = self.observed_held != Some(levels);
+        self.observed_held = Some(levels);
+        changed
     }
 
     /// Reference first_shown: first held or card-authored mapped level.
@@ -377,6 +389,14 @@ fn tier2(device: &ID3D12Device) -> bool {
         device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,
             (&raw mut options).cast(), size_of_val(&options) as u32)
     }.is_ok() && options.TiledResourcesTier.0 >= 2
+}
+
+/// Observation is separately opt-in: checking title page commitment
+/// adds CPU work and is not yet used as an allocation decision.
+pub(crate) fn judgement_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TILED_TEXTURE_POOL").as_deref() == Ok("1")
+        && std::env::var("VICTORY_TILED_MIP_JUDGEMENT").as_deref() == Ok("1"))
 }
 
 pub(crate) fn enabled() -> bool {
@@ -680,18 +700,21 @@ mod tests {
         // Recording was discarded or allocation failed.
         state.unclaim(1 << 5);
         assert_eq!(state.claim(1 << 6), tail);
-        state.card_wrote(1 << 6);
+        assert!(!state.card_wrote(1 << 6));
         assert_eq!(state.card, 0);
         assert_eq!(state.first_shown(), None);
         assert_eq!(state.claim(1 << 6), tail);
         state.mapped = tail;
-        state.card_wrote(1 << 6);
+        assert!(state.card_wrote(1 << 6));
         assert_eq!(state.card, 1 << 6);
         assert_eq!(state.claimed, 0);
         assert_eq!(state.first_shown(), Some(6));
         assert_eq!(state.claim(1 << 4), 0);
         state.held = 1 << 3;
         assert_eq!(state.first_shown(), Some(3));
+        assert!(state.observe_held(1 << 6));
+        assert!(!state.observe_held(1 << 6));
+        assert_eq!(state.first_shown(), Some(3), "observation cannot change published levels");
     }
 
     #[test]
