@@ -85,8 +85,17 @@ pub(crate) enum C {
     /// the time.
     CompareBytes,
     CompareUs,
+    /// Copying back pages shaders marked as written through views: pages
+    /// compared, bytes written back, the time; pages that kept the title's
+    /// bytes (it wrote them, their bytes from before unknown); pages whose
+    /// bytes the title's first write saved.
+    MarkedPages,
+    MarkedBytes,
+    MarkedUs,
+    MarkedKept,
+    SavedPages,
 }
-const COUNTERS: usize = 52;
+const COUNTERS: usize = 57;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -132,19 +141,23 @@ pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
         .or_default() += bytes;
 }
 
-/// Our process's working set, bytes.
-fn working_set() -> u64 {
+/// Current working set and private committed bytes. Neither is VRAM.
+fn process_memory() -> Option<[u64; 2]> {
     use windows_sys::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut c = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
-    c.WorkingSetSize as u64
+    let cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let mut c = PROCESS_MEMORY_COUNTERS_EX { cb, ..Default::default() };
+    // SAFETY: our own process and a writable extended structure of size cb.
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&mut c as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
+            cb,
+        )
+    } != 0;
+    ok.then_some([c.WorkingSetSize as u64, c.PrivateUsage as u64])
 }
 
 /// Our process's hard page faults so far (read from disk or the page
@@ -202,6 +215,7 @@ pub(crate) fn log(frames: f64) {
         .iter()
         .map(|a| a.swap(0, Relaxed) as f64 / frames)
         .collect();
+    let process = process_memory();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
@@ -215,7 +229,7 @@ pub(crate) fn log(frames: f64) {
          asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
-         heap texture uploads {:.1} ms, state preludes {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; working set {:.0} MB, \
+         heap texture uploads {:.1} ms, state preludes {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
          {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -270,12 +284,53 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PreludeUs as usize]),
         mb(c[C::CompareBytes as usize]),
         ms(c[C::CompareUs as usize]),
-        working_set() as f64 / 1e6,
+        c[C::MarkedPages as usize],
+        mb(c[C::MarkedBytes as usize]),
+        ms(c[C::MarkedUs as usize]),
+        c[C::MarkedKept as usize],
+        c[C::SavedPages as usize],
+        process.map_or(0, |m| m[0]) as f64 / 1e6,
         {
             static HARD: AtomicU64 = AtomicU64::new(0);
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    let (snapshots, cached, limit, loose, loose_bytes) = crate::shadow::cache_stats();
+    let memory = crate::shadow::memory_status();
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    let (sampled_bytes, target_bytes) = crate::resource::texture_budget_usage();
+    let (idle_upload_bytes, idle_upload_count, upload_made, upload_reused, oom_hold) = crate::upload_pool::stats();
+    let [gaps, covered] = crate::host::take_refresh_savings();
+    tracing::info!(refresh_gap_scope_bytes = gaps, refresh_already_covered_bytes = covered,
+        "buffer refresh scope avoided (logical bytes since last report)");
+    tracing::info!(
+        working_set_mib = ?process.map(|m| m[0] >> 20),
+        private_commit_mib = ?process.map(|m| m[1] >> 20),
+        memory_pressure = crate::shadow::memory_pressured(),
+        dxgi_pressure = crate::host::video_memory_pressured(),
+        local_budget_mib = ?video.map(|m| m[0] >> 20),
+        local_usage_mib = ?video.map(|m| m[1] >> 20),
+        nonlocal_budget_mib = ?video.map(|m| m[2] >> 20),
+        nonlocal_usage_mib = ?video.map(|m| m[3] >> 20),
+        physical_free_mib = ?memory.map(|m| m.1 >> 20),
+        available_commit_mib = ?memory.map(|m| m.2 >> 20),
+        idle_cpu_buffer_count = snapshots,
+        idle_cpu_buffer_mib = cached >> 20,
+        idle_cpu_buffer_limit_mib = limit >> 20,
+        sampled_texture_logical_mib = sampled_bytes >> 20,
+        sampled_texture_nonresident_logical_mib = crate::residency::nonresident_bytes() >> 20,
+        sampled_texture_resident_estimate_mib = sampled_bytes.saturating_sub(crate::residency::nonresident_bytes()) >> 20,
+        target_texture_logical_mib = target_bytes >> 20,
+        texture_staging_logical_mib = crate::texture::live_staging_bytes() >> 20,
+        idle_upload_mib = idle_upload_bytes >> 20,
+        idle_upload_count,
+        upload_made,
+        upload_reused,
+        allocation_oom_hold = oom_hold,
+        loose_shadow_count = loose,
+        loose_shadow_logical_mib = loose_bytes >> 20,
+        "memory cache census"
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

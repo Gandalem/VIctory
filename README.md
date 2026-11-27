@@ -41,7 +41,7 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
+| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, HDR and scaling are missing; depth bounds implementation pending runtime verification |
 | Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
@@ -154,6 +154,447 @@ Without this override, the validator loader selects the newest installed
 Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
+
+## GPU descriptor compatibility (experimental)
+
+The runtime probes for a 2,097,152-entry shader-visible view heap; otherwise
+it selects the portable 1,000,000-entry capacity. The capacity is fixed
+before shader translation and included in shader cache keys and prebuilt
+pipeline tags. Mirrored slots, dynamic tables, persistent pairs and null
+descriptors occupy separate regions. Oversized title heaps are clipped;
+complete remapping of all oversized heaps remains unimplemented.
+
+This follows the heap capacity and cache-key design in
+[DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox/tree/f4b48ad766ddbec1a1867022cd42f7645b0dd55e),
+adapted to the earlier runtime.
+
+## Structured-buffer compatibility (experimental)
+
+Untyped structured SRV/UAV descriptors are normalized to raw views with
+their original byte extent and stride metadata preserved. The translator
+computes byte offsets once and converts raw byte dimensions back to
+record counts for structured accesses. The descriptor and refresh paths
+use the same backing copy; views off 16-byte alignment use exact copies.
+
+This adapts the no-descriptor-twin approach described by
+[avatarmanz/VIctory-7900XTX b68e65e](https://github.com/avatarmanz/VIctory-7900XTX/commit/b68e65e08c4276e2159eb3c23b203a35985a0b7c)
+and its registered-buffer regression
+[ce42cc7](https://github.com/avatarmanz/VIctory-7900XTX/commit/ce42cc74b27e211f214673e135d87ac071b820d7).
+The test harness uses the same raw descriptor representation as runtime.
+The existing expected-value stride and gather tests are unchanged. This
+is a candidate fix for both failures, not a claim of a verified hardware
+result. Full GPU and shader regression testing is required before merge.
+
+## Low-VRAM texture profile (experimental)
+
+`VICTORY_TEXTURE_DROP_MIPS=0` (default) keeps the original texture sizes.
+`1` omits the largest mip of eligible sampled 2D textures, and `2`–`4`
+omit additional levels. `auto` selects one omitted level on a detected
+adapter with up to 8 GiB dedicated video memory, or zero when the adapter
+is unknown or has more memory. This is a process-wide choice; no live
+texture changes shape. Eligible textures have at least five mips and
+512 texels on the shorter side. Render targets, depth, UAV, MSAA and
+incompatible formats are excluded. Eligible texture chains typically
+use about a quarter of their original host bytes when one mip is omitted,
+not a quarter of total VRAM. This trades texture detail for memory.
+
+SRV mip ranges, tiled upload source mips, array slice indices, texture
+copies and alias transfers map to retained levels. Copies involving
+omitted levels do not copy those levels; resolves involving shortened
+textures are unsupported. Texture-to-buffer readback is not implemented
+in this older runtime. Full title-memory layout and tracking remain
+intact; the CPU may still read the full tiled allocation.
+
+DXGI local and nonlocal process usage and budget are sampled at most
+once per 100 ms. `VICTORY_TEXTURE_ROOM_PERCENT` (50–97, default 90) is a pressure
+threshold for reducing completed-list idle scratch retention, with a
+10-percentage-point recovery margin. This is **not** a hard VRAM cap:
+the older runtime creates textures eagerly and cannot safely reject
+required allocations. Deferred residency, eviction and queued texture
+admission are not included in this change.
+
+The mip mapping follows
+[fxceless/victory-fork PR 610](https://github.com/fxceless/victory-fork/pull/610)
+and [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/tree/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90).
+Validate both modes, including retained array uploads, before deployment.
+
+## Memory retention (experimental)
+
+The idle CPU buffer cache (snapshots and temporary texture detiling reads)
+is bounded by installed RAM, available physical RAM, and available commit.
+It is checked at most once per second during submissions or cache use; the default ceiling is 2048 MiB and the normal budget on a 32 GiB
+system is at most 512 MiB. Below 1 GiB available physical RAM or commit, idle
+snapshots are released. `VICTORY_SNAPSHOT_POOL_MB` overrides the ceiling
+(0–2048 MiB, 0 disables idle retention). It does not limit live snapshots
+or active temporary reads.
+
+Under pressure (physical RAM available <= 3 GiB or available commit
+<= 4 GiB), idle CPU storage is capped at 64 MiB; normal retention resumes
+when physical RAM reaches 5 GiB and commit headroom reaches 6 GiB.
+Below 1 GiB of either reserve, the idle budget is still zero. Failed OS
+memory samples retain the last successful observation. This adapts
+[cool_fox residency](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/residency.rs).
+
+After a completed command list is reset, retained scratch chunks are capped
+at 4 MiB per list (`VICTORY_SCRATCH_KEEP_MB`, 0–64 MiB), further capped at
+256 KiB during pressure. Temporary tiled texture reads reuse the bounded
+CPU pool rather than retaining a full allocation in every texture's Last.
+Active uploads and resources referenced by GPU work are not reclaimed.
+No required texture uploads are intentionally skipped.
+
+Diagnostics report a `memory cache census` with working set, private commit,
+physical and commit headroom, pressure state, idle CPU buffer bytes/budget,
+logical staging bytes and the count/logical size of loose shadows. The
+logical shadow sizes are not measurements of physical RAM or VRAM residency.
+Experimental `VICTORY_RECLAIM_LOOSE=1` adapts cool_fox's idle-window
+reclamation. Between synchronous submissions, at most 128 read-only
+loose windows are reclaimed per one-second sweep if the map is their sole
+owner, no other COM references or pending snapshots remain, and they have
+been idle for four submissions and ten seconds (one second under RAM/DXGI
+pressure). Descriptor slots and retired descriptors retain loose Shadow
+owners through the relevant fence. Potentially GPU-written windows and
+windows published to the all-address page table stay pinned: their prior
+contents might not be reconstructible. Dormant address metadata permits
+rebuilding a reclaimed window on lookup or before page-table publication;
+a failed restoration stops rather than publishing a partial address space.
+The option is off by default until Windows validation. This does not
+reclaim every live or GPU-authored window. Validate on identical synthetic
+or legally supplied workloads before drawing performance conclusions.
+
+The pressure-aware retention policy is informed by the RAM cache pressure
+handling in [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)
+(commit `c09a44e97df4170ef0caa8cc236f7cb46fd1ce90`), with independent changes to
+this repository's older snapshot and scratch implementations.
+
+## Exact buffer refresh and completed-submission merge
+
+Within a submission, refreshes now maintain disjoint byte intervals per
+host buffer. Overlapping or adjacent views join; unrelated views do not
+cause the bytes between them to be refreshed. Subsequent flushes subtract
+the already refreshed intervals until a title-memory write invalidates
+them. This uses the joined/outside range approach of
+[cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/shadow.rs)
+and [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/shadow.rs),
+adapted to synchronous submissions.
+
+Copy-back still waits for GPU completion and preserves concurrent title
+writes using the original bytewise merge rule. Equal blocks are skipped,
+unmixed blocks copied in bulk, and mixed blocks merged byte by byte.
+Temporary CPU read buffers reuse the bounded pool and are allocated only
+when needed. The mapped-memory checks and write tracking are unchanged.
+
+Diagnostics report the logical refresh gap and already-covered bytes
+avoided since the last report. These counters are not physical PCIe
+transfer measurements. No new GPU-local mirror, shared-heap mapping,
+or asynchronous submission lifetime is introduced here.
+
+## Bounded texture preparation workers (stage 1)
+
+Explicitly referenced texture staging buffers are collected and refreshed
+before a memory-writing step or GPU submission. The independent tracked
+reads use a persistent CPU worker pool, following the wide_each approach
+in [cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/shadow.rs)
+and [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX).
+Tracked source memory uses workers by default; untracked hash reads
+remain serial unless `VICTORY_PARALLEL_UNTRACKED=1` is set. That
+experimental path reads a complete owned snapshot through the kernel
+before hashing and detiling on a worker, rather than relying on the
+reference renderer's remapping read lock (which is absent here). Failed
+reads preserve the last valid staging contents and retry next use.
+Single textures and RAM-pressure fallback keep the serial path.
+The submitting thread participates and waits for every job before
+recorded GPU work can execute. Existing resource ownership, command
+order and GPU fences remain unchanged.
+
+`VICTORY_TEXTURE_WORKERS` selects total preparation threads including the
+submitting thread (1–8, bounded by available CPUs). The default is one on
+fewer than six logical CPUs and two to four otherwise. RAM pressure
+forces serial processing. Batches contain at most 32 textures and up to
+128 MiB of logical tiled read sizes; an oversized texture runs alone.
+The bound is on these temporary reads, not on all process memory.
+Texture preparation timing measures elapsed wall time.
+
+Stage 2 uses the same workers for bindless texture preparation under the
+existing view lock, checking shared staging aliases in order. Only
+changed textures record copies. Bindless buffer coverage is the exact
+union of live descriptor ranges, cached per copy and access kind rather
+than a single enclosing hull. GPU submission remains synchronous.
+
+`VICTORY_HEAP_WORKER=1` enables an experimental dedicated bindless
+preparation thread, adapted from [fxceless/victory-fork's heap worker](https://github.com/fxceless/victory-fork/blob/main/crates/victory-gpu/src/heap_worker.rs).
+It accepts up to eight deduplicated weak heap requests and prepares
+staging between synchronous submissions, never waiting on an occupied
+submission lock. Each pass rotates through at most 32 entries, 16 MiB
+of source reads (4 MiB per texture), and checks an 8 ms soft time budget
+between textures. Pressure and OOM stop speculative work.
+With the additional experimental `VICTORY_HEAP_READY_LISTS=1` switch,
+the worker also records closed upload command lists for tracked sampled
+textures. At most eight weak-heap ready batches are kept; entries expire
+after 250 ms or under memory pressure. Each list retains its host texture
+and staging owners but does not acknowledge pending changes until the
+submitter verifies current heap membership, host identity, staging
+identity and the complete dirty mask after a refresh. A stale batch
+falls back to normal submission-time recording without losing pending
+changes. Accepted lists run ahead of the synchronous fallback and title
+lists, with their state preludes and the existing submission fence.
+Neither switch is on by default pending Windows tests.
+
+Experimental `VICTORY_DEFER_TEXTURE_VIEWS=1` (with
+`VICTORY_LAZY_TEXTURES=1`) ports a conservative subset of the reference's
+[deferred descriptor publication](https://github.com/fxceless/victory-fork/blob/main/crates/victory-gpu/src/descriptor/host.rs).
+Mirroring an eligible lazy committed SRV queues its slot instead of
+creating or replacing the host descriptor on the title thread. Rewrites
+of queued slots coalesce. The submitter re-reads current records of
+heaps that its lists actually index; the current resource is briefly
+pinned through the view registry and an initial upload is recorded
+before its descriptor is made. The closed publication list runs before
+the bindless refresh and title lists. Throttled or failed preparation
+leaves a dimension-correct null descriptor and retries on the next
+relevant submission. Table draws retain their eager path; other view
+types retain their existing behavior. Recorded lists retain title heap
+ownership, not just the host descriptor heap, through reset.
+Publication is still synchronous under the existing submission lock;
+it is not yet the reference's worker-owned publication or late-wait
+asynchronous GPU execution. Both options remain off by default pending
+Windows validation.
+
+Experimental `VICTORY_SRV_MIP_UPLOADS=1` (requires deferred texture
+views) adapts the reference's SRV-driven `upload_from` selection to
+already initialized lazy committed 2D single-slice RGBA8 textures.
+Use the same retained-MIP shift as descriptor creation and maintain
+the union of SRV MIP masks for each heap, including rewrites and
+duplicate slots. Initial uploads and explicit copy/table paths remain
+full-range; subsequent bindless GPU refreshes copy only dirty MIPs in
+the current SRV union. Unseen dirty MIPs stay pending until visible or
+a full upload needs them. Unsupported views, formats, arrays and
+malformed ranges use the full fallback. Multiple heaps are processed
+without incorrectly skipping their different requested MIPs.
+CPU staging preparation still uses the existing refresh path; ready
+GPU-list recording is bypassed in range mode because its mask is not
+the current submission's view union. This is opt-in partial GPU
+upload selection, not yet the reference's sparse tile mapping or
+view-aware staging allocation. Verify GPU readback and mixed
+GPU-write/copy workloads before enabling it.
+
+## Parallel buffer refresh
+
+Independent host buffer copies share the bounded preparation worker
+pool when four or more copies are pending; ranges of one copy stay on
+one worker. This follows the separate-copy refresh and flush_one approach
+in [cool_fox host.rs](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/host.rs).
+Before a shader-write snapshot, only the corresponding buffer must be
+refreshed. Other pending copies stay batched until a memory write or
+submission barrier. All worker jobs join before the GPU executes.
+`VICTORY_TEXTURE_WORKERS=1` disables parallel preparation of both buffers
+and textures; RAM pressure also selects serial processing. Timing counts
+elapsed wall time. GPU copy-back is still synchronous.
+
+## Idle GPU upload reuse and allocation recovery
+
+Texture upload buffers use a bounded spare cache, adapted from
+[victory-nvidia-8gb staging](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/texture.rs).
+Recorded lists retain staging owners until successful reset, rather than
+just their COM buffer. Only fully released staging allocations can be
+reused; reuse clears the logical bytes. Entries are rounded to 64 KiB,
+at most 32 MiB each; idle retention defaults to 128 MiB / 128 entries.
+`VICTORY_STAGING_POOL=0` disables it, and `VICTORY_STAGING_POOL_MB` sets
+the idle byte limit (0–512). RAM or DXGI pressure clears idle uploads.
+
+For mapped upload and shared-buffer allocation failures with
+E_OUTOFMEMORY, reclaim idle upload/CPU caches and retry once if anything
+was freed. Idle GPU retention stays disabled for at least 500 ms after
+the failure, following the backoff idea in
+[cool_fox residency](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/residency.rs).
+Required allocations are not refused merely because of a budget or
+backoff. This is not live texture eviction or deferred texture admission.
+Diagnostics count idle upload bytes, allocations/reuses and OOM hold-down.
+
+`VICTORY_STAGING_BLOCKS=1` experimentally enables staging suballocation,
+adapted from [cool_fox pool.rs](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/pool.rs).
+Requests up to 32 MiB use 64 KiB-aligned slices of mapped 64 MiB D3D12
+upload blocks, with at most 16 blocks including pending allocations.
+Each recorded list retains the staging lease until safe reset; GPU
+copy footprints add the slice's base offset, while CPU detiling keeps
+relative offsets. Slices are zeroed before reuse. Only entirely idle
+blocks count toward the existing idle-byte cap and can be released on
+pressure or OOM. New blocks charge their full commit cost and are not
+grown under pressure. Larger requests and unavailable blocks fall back
+to the original dedicated upload path. This is off by default until
+Windows GPU tests validate the shared-buffer path; it does not pool
+host texture allocations or title-address upload arenas.
+
+## Dirty texture source spans
+
+Tracked texture updates read and detile only retained mip and array
+subresources overlapping dirty pages. Packed tails share a conservative
+source span; volumes use the full layout. First use fills every retained
+subresource. A failed detile retries even if dirty flags were consumed.
+This adapts retained-source handling from
+[victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/texture.rs).
+Untracked memory uses the original whole-layout hash by default.
+Experimental `VICTORY_PARTIAL_UNTRACKED_UPLOADS=1` additionally hashes
+distinct retained source spans after a changed whole-image hash. Packed
+tails share a hash; unchanged retained mips and array slices skip
+detiling and remain outside the pending copy mask. Unsupported layouts,
+single subresources and textures with more than 256 subresources retain
+the original full refresh. A failed detile invalidates the span census
+so the next refresh retries every retained subresource. Unlike the
+reference's view-dependent upload_from path, this selects changed
+content without assuming that eager descriptor slots remain unchanged.
+Bindless GPU uploads record only pending retained subresources.
+Pending changes accumulate across refreshes and are acknowledged on
+recording under the synchronous submission lock. Experimental
+`VICTORY_EXPLICIT_PARTIAL_UPLOADS=1` also selects pending subresources
+for explicit sampled-texture uploads that are the resource's first state
+use in a list with no preceding bindless heap use. Those copies move to
+the first-state prelude after all submission-time refreshes have joined.
+Recorded-list owners retain both texture and staging; dirty masks are
+acknowledged only after successful fence completion. Ineligible lists,
+failed refreshes, uninitialized staging and GPU-authored textures retain
+full-chain copies. Untracked hash changes keep the conservative
+full-chain path unless the optional retained-span hashing is enabled.
+This reduces logical copy traffic for bindless and eligible explicit
+preludes, not measured PCIe traffic. Both options are off by default
+pending GPU validation.
+
+## Memory-pressure admission and idle staging reclamation
+
+A weak registry of staging owners is swept once per second. A staging
+allocation with no recorded-list owner becomes reclaimable after ten
+seconds of disuse (one second under RAM/DXGI pressure). Host textures
+and descriptor identities are unchanged; explicit uploads still rebuild
+staging on the next use.
+
+Experimental `VICTORY_TEXTURE_SAME=1` adapts the reference
+[cool_fox unchanged() check](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/texture.rs#L1618).
+After the synchronous submission fence, reclaiming a sole-owned staging
+buffer can retain its acknowledged whole-layout BLAKE3 digest on the
+host texture. A later bindless upload with the identical source address,
+layout length and checked content hash can skip creating staging and
+copying the unchanged GPU image. Only complete untracked images with
+no pending copies qualify; tracked, GPU-authored, changed or unreadable
+sources fall back to the normal path. The temporary snapshot is capped
+at 16 MiB and disabled under host-memory pressure or recent OOM. Explicit
+recordings still allocate actual staging; this does not omit any
+pre-recorded copy command. The switch is off by default pending GPU
+validation.
+
+New speculative bindless staging allocations reserve at least 512 MiB
+of system commit after allocation and require at least 1 GiB before
+growing committed upload storage. Reusing an already committed spare
+requires only 512 MiB and does not charge the commit estimate again.
+The soft submission budget is 16 MiB below 1536 MiB of available commit
+or 64 MiB under memory pressure or on hosts with at most 32 GiB of RAM
+when live logical staging reaches 1 GiB. Long sweeps resample system
+commit at most every 32 ms and tighten their remaining budget as needed.
+A single larger first allocation may cross the soft budget only if
+commit permits. The 500 ms OOM hold-down pauses speculative work.
+Existing uploads and explicitly recorded texture uploads are not throttled. Unserved descriptors are
+checked again on later submissions. This is a conservative admission
+policy inspired by cool_fox residency.rs, not its full asynchronous
+prefetch queue. A fence wait failure now stops submission processing
+rather than releasing storage without confirmed GPU completion.
+
+## Soft sampled texture budget and target reserve
+
+Adapted from the room policy in
+[victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/resource.rs).
+`VICTORY_TEXTURE_DROP_MIPS=auto` or a positive
+`VICTORY_TEXTURE_BUDGET_MB` enables allocation-time adaptation.
+`VICTORY_CARD_ROOM_FOR_TARGETS_MB` defaults to 3072 MiB, capped at
+one third of the local DXGI budget. The outstanding target reserve
+reduces room for sampled textures. Eligible new textures use the most
+detailed retained chain that fits, or the smallest supported chain
+if none fits. Live compatible textures retain their shape. Targets,
+depth, UAV and ineligible textures retain their original shape.
+Numeric mip profiles without a budget keep their previous behavior.
+Required allocations are not refused to enforce a soft budget.
+
+Diagnostics distinguish logical sampled/target allocation bytes from
+actual DXGI usage. DXGI observations are cached for 100 ms and retain
+the last good local/non-local segment independently on query failure.
+When adaptive texture budgeting and experimental residency are enabled,
+the outstanding target reserve also triggers cold-resource residency
+maintenance before the raw DXGI usage threshold is crossed. Recovery
+requires a headroom margin (5% of budget, at most 256 MiB). This is soft
+headroom management, not physical VRAM reservation or live tiled residency.
+
+## Experimental sampled-texture residency
+
+`VICTORY_TEXTURE_RESIDENCY=1` enables an opt-in residency sweep. Under
+DXGI or configured sampled-texture budget pressure, committed sampled
+textures of at least 1 MiB that have **never exposed** their host resource
+can be evicted after two seconds and made resident synchronously before
+their first host access. Every host pointer/Arc publication and transition
+passes a per-texture residency gate. Published resources cannot be
+explicitly evicted in this renderer: existing recorded commands and
+descriptor slots may still name them. Their paging priority can instead
+be reduced after five seconds of inactivity and restored when active or
+pressure clears. Writable textures and twins are excluded. At most 128
+transitions per second are attempted; unsupported eviction falls back to
+a resident resource. Restore failure stops rather than submitting an
+unresident resource.
+
+With `VICTORY_TEXTURE_RESIDENCY=1` and `VICTORY_LAZY_RESIDENCY=1`,
+eligible sampled DEFAULT textures of at least 1 MiB are created with
+`D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT` where the driver accepts it.
+The existing resource identity and compatible-format creation path are
+retained, with a resident creation fallback on unsupported drivers.
+The same exposure gate makes the texture resident before a pointer or
+descriptor is published. Logical explicitly nonresident bytes are
+tracked through creation, eviction, restoration and destruction.
+DXGI headroom uses the greater of reported local usage and the logical
+resident estimate (sampled bytes minus explicitly nonresident bytes,
+plus targets), including the outstanding target reserve. The explicit
+allocation cap still counts all logical sampled allocations, so deferred
+creation cannot evade it; residency pressure instead counts the
+logical resident estimate. Under pressure, the oldest eligible
+unpublished textures are evicted first, stopping at the requested
+recovery margin or the sweep limit rather than evicting the whole
+registry. Non-local-only pressure does not trigger local eviction.
+Diagnostics separate these estimates from driver-reported usage; none
+is a measurement of actual physical VRAM residency.
+
+`VICTORY_LAZY_TEXTURES=1` additionally defers creation of the host
+D3D12 resource itself for independent committed, shader-readable 2D
+sampled textures with at least 1 MiB of title backing, no writable or
+deny-shader flags, no multisampling and no clear value. The title
+allocation and initial state still exist immediately; the first host
+access creates and shares the resource through the existing memory key,
+and concurrent accessors use the same OnceLock result. Descriptor
+creation is a host access, so this is not deferred descriptor
+publication. Placed/address-backed textures and writable resources
+retain the eager path. Unused deferred textures never create a host
+allocation. Published resources retain stable identity.
+
+Experimental `VICTORY_TILED_TEXTURE_POOL=1` ports the physical tile
+allocator and MIP-group mapping mechanism of
+[cool_fox tiles.rs](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/tiles.rs).
+On tier-2 adapters, eligible single-slice RGBA8 sampled textures with
+multiple retained MIPs and 1–64 MiB of tile backing use reserved
+resources, 64 KiB tiles, and a pool of up to sixteen 64 MiB heaps.
+Standard MIPs are independent groups; a packed tail is indivisible.
+Free runs coalesce on return and completely free heaps are trimmed
+under memory pressure. A private COM owner retains the physical heap
+leases for the full lifetime of the resource, including descriptor
+slots, recorded lists, and retired descriptors. All allocated texels
+are initialized to zero after an aliasing barrier on a separate fenced
+queue, before the resource is published. Castable formats are
+preserved or the existing committed allocation path is used. Reserved
+resources do not participate in committed-resource Evict/MakeResident.
+
+The production path maps **all retained MIPs** up front: without
+deferred descriptor publication, exposing a view of an unmapped level
+would risk wrong sampling. The allocator's group selection is ready
+for sparse MIP mapping, but dynamic view remapping and selective live
+mapping remain unimplemented. Like the reference, mapped tiles are
+not returned while the resource lives. This option is disabled by
+default: the dedicated initialization fence and zero fill may outweigh
+pooling savings; validate both correctness and performance on Windows.
+This complements the earlier conservative eviction, deferred initial
+residency, limited lazy resource creation and OS residency priorities.
+Logical evicted allocation bytes are not a measured VRAM reduction.
+The default is off until validated on Windows hardware.
 
 ## Debugging
 

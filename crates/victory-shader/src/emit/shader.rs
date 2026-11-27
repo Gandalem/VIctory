@@ -22,13 +22,47 @@ pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
 /// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+pub const HEAP_VIEWS: u32 = 1_000_000;
+pub const LARGE_HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
 /// (`emit`, "Buffer views at computed heap indices").
 pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// The view-mark table's register: `t2` (a raw root SRV) in
+/// [`MEMORY_SPACE`] (`emit`, "Write marks").
+pub const VIEW_MARKS: u32 = 2;
+/// The written-pages bitmap of buffer views: `u1` (a raw root UAV) in
+/// [`MEMORY_SPACE`].
+pub const VIEW_WRITES: u32 = 1;
+/// A view-mark table entry's base for a slot whose writes are not marked.
+pub const VIEW_MARK_NONE: u32 = u32::MAX;
+/// Bits in the written-pages bitmap of buffer views; marks past it go to
+/// the last bit.
+pub const VIEW_WRITE_BITS: u32 = 1 << 22;
+/// The first bit of the read marks of texture views (`emit`, "Read
+/// marks"), after the written pages in the same bitmap: one bit per
+/// resource-heap index, [`HEAP_VIEWS`] of them.
+pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
+
+static VIEW_HEAP_CAPACITY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Freeze the capacity before translating shaders. Offline translation uses
+/// the portable capacity; a later probe cannot invalidate emitted code.
+pub fn configure_view_heap_capacity(capacity: u32) -> u32 {
+    *VIEW_HEAP_CAPACITY.get_or_init(|| {
+        if capacity == LARGE_HEAP_VIEWS { LARGE_HEAP_VIEWS } else { HEAP_VIEWS }
+    })
+}
+
+pub fn view_heap_capacity() -> u32 {
+    configure_view_heap_capacity(HEAP_VIEWS)
+}
+
+pub fn null_buffer_view() -> u32 {
+    view_heap_capacity() - 2
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -100,6 +134,18 @@ pub(crate) struct Shader {
     pub memory_dirty: Option<V>,
     /// The view addresses' handle, once a descriptor's address is read.
     pub view_addresses: Option<V>,
+    /// The view-mark table's and the buffer views' written-pages bitmap's
+    /// handles, once a write through a view is marked.
+    pub view_marks: Option<V>,
+    pub view_writes: Option<V>,
+    /// The heap index of each handle of an unordered buffer view (writes
+    /// through it are marked by the index's view-mark entry).
+    pub view_index: std::collections::HashMap<V, V>,
+    /// The heap index of each handle of a texture shader view (its reads
+    /// are marked, `emit` "Read marks"), and those the instruction being
+    /// lowered uses.
+    pub texture_index: std::collections::HashMap<V, V>,
+    pub texture_reads: Vec<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -161,6 +207,11 @@ impl Shader {
             memory: None,
             memory_dirty: None,
             view_addresses: None,
+            view_marks: None,
+            view_writes: None,
+            view_index: std::collections::HashMap::new(),
+            texture_index: std::collections::HashMap::new(),
+            texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -398,6 +449,49 @@ impl Shader {
         h
     }
 
+    /// The handle of the view-mark table (`t2` in [`MEMORY_SPACE`], a raw
+    /// buffer: per resource-heap index, two dwords), made in the entry block.
+    pub fn view_marks_handle(&mut self) -> V {
+        if let Some(h) = self.view_marks {
+            return h;
+        }
+        let h = self.memory_space_handle(VIEW_MARKS, false);
+        self.view_marks = Some(h);
+        h
+    }
+
+    /// The handle of the buffer views' written-pages bitmap (`u1` in
+    /// [`MEMORY_SPACE`], a raw buffer), made in the entry block.
+    pub fn view_writes_handle(&mut self) -> V {
+        if let Some(h) = self.view_writes {
+            return h;
+        }
+        let h = self.memory_space_handle(VIEW_WRITES, true);
+        self.view_writes = Some(h);
+        h
+    }
+
+    /// A raw buffer bound at `register` in [`MEMORY_SPACE`] (`uav`: `u`,
+    /// else `t`), made in the entry block.
+    fn memory_space_handle(&mut self, register: u32, uav: bool) -> V {
+        let r = self.m.i32(register);
+        let bind = [r, r, self.m.i32(MEMORY_SPACE), self.m.i8(u8::from(uav))];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, if uav { 11 | 0x1000 } else { 11 }, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -456,7 +550,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { view_heap_capacity() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -468,13 +562,33 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        // Unordered typed, raw and structured buffers (kinds 10-12).
+        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
+            self.view_index.insert(h, index);
+        }
+        // Texture shader views (kinds 1-9).
+        if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&(props.0 & 0xFF)) {
+            self.texture_index.insert(h, index);
+        }
+        h
     }
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // The flags of what lowering made, as the module writes it: what only
+        // unread values or never-taken edges used is not written.
+        let uses = self.m.uses();
+        for (flag, used) in [
+            (flags::RESOURCE_HEAP, uses.heap),
+            (flags::SAMPLER_HEAP, uses.sampler_heap),
+            (flags::WAVE_OPS, uses.wave),
+            (flags::INT64, uses.int64),
+        ] {
+            self.flags = if used { self.flags | flag } else { self.flags & !flag };
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -489,6 +603,8 @@ impl Shader {
             || self.memory.is_some()
             || self.memory_dirty.is_some()
             || self.view_addresses.is_some()
+            || self.view_marks.is_some()
+            || self.view_writes.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -543,7 +659,11 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() || self.memory.is_some() || self.view_addresses.is_some() {
+            if !self.root_srvs.is_empty()
+                || self.memory.is_some()
+                || self.view_addresses.is_some()
+                || self.view_marks.is_some()
+            {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
@@ -556,6 +676,7 @@ impl Shader {
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory.map(|_| (MEMORY_SPACE, 0)))
                     .chain(self.view_addresses.map(|_| (MEMORY_SPACE, 1)))
+                    .chain(self.view_marks.map(|_| (MEMORY_SPACE, VIEW_MARKS)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![
@@ -580,7 +701,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() {
+            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -594,6 +715,7 @@ impl Shader {
                     .iter()
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
+                    .chain(self.view_writes.map(|_| (MEMORY_SPACE, VIEW_WRITES)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![

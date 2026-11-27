@@ -65,6 +65,9 @@ pub(crate) struct Heap {
     written: Option<crate::watch::Tracked>,
 }
 
+pub(crate) use host::fallback_samplers;
+
+/// A title heap's host copy.
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
     // SAFETY: called from descriptor heap methods only.
     unsafe { &*this.cast::<Heap>() }
@@ -189,6 +192,155 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// With deferred publication, keep the title heap (including its slot
+/// backing and host bookkeeping), not just the GPU descriptor heap.
+#[cfg(windows)]
+pub(crate) struct HeldHeap(usize);
+
+#[cfg(windows)]
+impl HeldHeap {
+    pub(crate) fn new(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HeldHeap {
+    fn drop(&mut self) {
+        release(self.0 as This);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn deferred_texture_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DEFER_TEXTURE_VIEWS").as_deref() == Ok("1"))
+}
+
+/// The submitter holds its submission lock (previous GPU work has
+/// completed). Publish only heaps the new batch actually indexes, and
+/// return the closed upload list which must run before their draws.
+#[cfg(windows)]
+pub(crate) fn publish_pending(device: &crate::host::Host,
+    used: &[std::sync::Arc<crate::bindless::Viewed>]) -> Option<crate::host::HostList>
+{
+    if !deferred_texture_views() || used.is_empty() {
+        return None;
+    }
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let due: Vec<_> = heaps.iter().filter_map(|&(_, _, at)| {
+        // SAFETY: the registry lock keeps each heap alive.
+        let h = unsafe { &*(at as *const Heap) }.host.get()?.as_ref()?;
+        (used.iter().any(|v| std::sync::Arc::ptr_eq(v, &h.viewed)) && h.has_pending_views())
+            .then_some(h)
+    }).collect();
+    if due.is_empty() {
+        return None;
+    }
+    let list = device.new_list().unwrap_or_else(|e|
+        crate::host::fail(format_args!("could not allocate deferred view upload list: {e}")));
+    list.set_ours();
+    let mut admission = crate::upload_pool::Admission::new();
+    for h in due {
+        h.publish_pending_views(&list, &mut admission);
+    }
+    list.close();
+    Some(list)
+}
+
+/// Makes the views of slots `slots` that were left null (textures the title
+/// placed itself) in every shader-visible view heap, now that shaders read
+/// them (`crate::shadow::take_reads`), while placed textures take under
+/// [`PLACED_CAP`] bytes.
+/// shortcut: past the cap, views read later stay null; nothing is released
+/// for them (placed textures are kept until the end); add eviction by the
+/// read marks if the cap is reached.
+#[cfg(windows)]
+pub(crate) fn make_read(slots: &[u32]) {
+    if !crate::resource::eviction_enabled()
+        && crate::resource::PLACED_BYTES.load(std::sync::atomic::Ordering::Relaxed) >= PLACED_CAP
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!("placed textures reached their cap: views shaders read now stay null"));
+        return;
+    }
+    // The placed textures those slots view are made first, without the
+    // heaps' lock, which every title thread writing a view waits on (making
+    // a texture takes up to milliseconds; title threads waited 1-6 s a frame,
+    // runs evict2, noevict1). They are never released, so they outlive it;
+    // the lock is held only to look the slots up and to make the views.
+    let placed: Vec<View> = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            // SAFETY: registered heaps are live (removed when dropped).
+            .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
+            .filter(|heap| heap.desc.kind == VIEWS_KIND)
+            .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
+            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i, heap.start + u64::from(i) * u64::from(increment(heap.desc.kind).unwrap_or(32)))))
+            .collect()
+    };
+    #[cfg(test)]
+    tests::while_making(slots);
+    // Several at a time (each a committed texture; hundreds in a new shot,
+    // 7 % of the submitting thread when made one by one, run evict5).
+    crate::texture::in_parallel(placed.len(), |i| {
+        let _ = host::placed_texture(&placed[i]);
+    });
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            continue;
+        };
+        if heap.desc.kind != VIEWS_KIND {
+            continue;
+        }
+        for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
+            host.mirror(i, start + u64::from(i) * u64::from(step), true);
+            host.stamp_read(i);
+        }
+    }
+}
+
+/// Console bytes of placed textures past which views shaders read stay
+/// null: the 12 GB card held 6.5 GB without them (run textures2).
+#[cfg(windows)]
+const PLACED_CAP: u64 = 3 << 30;
+
+/// The host textures (raw pointers) that slots `slots` of the
+/// shader-visible view heaps view.
+#[cfg(windows)]
+pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut textures = std::collections::HashSet::new();
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
+            textures.extend(host.textures_at(slots));
+        }
+    }
+    textures
+}
+
+/// Every shader-visible view heap's slots viewing one of the host textures
+/// `textures` (raw pointers) are left null, made again when read
+/// (`crate::resource::evict` gives those textures up).
+#[cfg(windows)]
+pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
+            host.evict(textures);
+        }
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
@@ -222,6 +374,11 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        // Nothing can find the heap by now. The table's lock is taken
+        // inside the heaps' lock (`memory::bind`), never the other way
+        // round, so it is taken here after the heaps' lock is let go.
+        drop(heaps);
+        crate::memory::release(at);
     }
 }
 
@@ -450,6 +607,40 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     (*current == generation).then(|| view.clone())
 }
 
+/// A short-lived pin for a shader or unordered view. A resource's destructor removes
+/// its VIEWS entries before freeing its allocation; acquiring the pin
+/// under that lock therefore cannot dereference a freed object or revive
+/// a zero-refcount resource.
+#[cfg(windows)]
+struct ShaderPin(usize);
+
+#[cfg(windows)]
+impl Drop for ShaderPin {
+    fn drop(&mut self) {
+        let this = self.0 as This;
+        object::slot::<extern "system" fn(This) -> u32>(this, 0x10)(this);
+    }
+}
+
+#[cfg(windows)]
+fn pinned_view_at(i: u32, generation: u32) -> Option<(View, Option<ShaderPin>)> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let (view, current) = views.list.get(i as usize)?;
+    if *current != generation {
+        return None;
+    }
+    let pin = match *view {
+        View::Shader(resource, _) | View::Unordered(resource, _, _) if resource != 0 => {
+            if !object::try_add_ref(resource as This) {
+                return None;
+            }
+            Some(ShaderPin(resource))
+        }
+        _ => None,
+    };
+    Some((view.clone(), pin))
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
@@ -469,11 +660,19 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -715,7 +914,27 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// Work to run while `make_read` makes the textures of a read slot (the
+    /// slot), outside the heaps' lock.
+    #[cfg(windows)]
+    pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
+
+    /// The work [`WHILE_MAKING`] runs.
+    #[cfg(windows)]
+    pub(crate) type Work = Box<dyn FnOnce() + Send>;
+
+    #[cfg(windows)]
+    pub(crate) fn while_making(slots: &[u32]) {
+        let mut hook = WHILE_MAKING.lock().unwrap_or_else(|e| e.into_inner());
+        if hook.as_ref().is_some_and(|(slot, _)| slots.contains(slot))
+            && let Some((_, work)) = hook.take()
+        {
+            drop(hook);
+            work();
+        }
+    }
+
     use super::*;
     use crate::object::{S_OK, slot};
 
@@ -727,6 +946,35 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    /// A released view heap takes its title memory page table with it, also
+    /// when no heap is made at its address afterwards (else the table, its
+    /// 16.8 MiB mapping and the copies it names live on).
+    #[test]
+    fn a_released_view_heap_drops_its_page_table() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 1000,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let key = h as usize;
+        assert!(heap(h).host().is_some(), "a host heap");
+        let list = host.new_list().unwrap();
+        assert!(crate::memory::bind(&list, key).is_some(), "a page table");
+        assert!(crate::memory::has_table(key));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        assert!(!crate::memory::has_table(key), "released with its heap");
     }
 
     #[test]
@@ -787,6 +1035,23 @@ mod tests {
         assert_eq!(view(s3), view(s1));
         assert_eq!(view(at(0) + 8), None);
         heap[0] = 0;
+    }
+
+    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
+    /// later read does not see the previous view.
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let a = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        create_srv(null, null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
     }
 
     /// A released resource's views go stale; the same view of a new
@@ -856,21 +1121,28 @@ mod tests {
             nodes: 1,
         };
         let mut h = std::ptr::null();
-        assert_eq!(
-            create(
-                desc,
-                Placement {
-                    address,
-                    size: 64 * 32
-                },
-                &mut h
-            ),
-            S_OK
-        );
+        let placement = Placement { address, size: 64 * 32 };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
+        // Remove the placed heap from the registry before its memory can
+        // be reused by another heap.
+        release(h);
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+        release(h);
+
+        #[cfg(windows)]
+        {
+            // Reuse the address without relying on the allocator to give it
+            // to another test. The descriptor write must reach the new heap.
+            assert_eq!(create(desc, placement, &mut h), S_OK);
+            create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), address);
+            let reused = heap(h);
+            let queued = reused.pending.lock().unwrap().as_slice() == [0];
+            release(h);
+            assert!(queued, "the descriptor write reached the heap at the reused address");
+        }
     }
 }
