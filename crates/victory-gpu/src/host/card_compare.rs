@@ -586,14 +586,18 @@ impl Host {
     /// Adapt cool_fox's make_prelude, initially closed so every lease,
     /// including the first, uses the same Reset path.
     fn make_card_prelude(&self) -> windows::core::Result<CardPrelude> {
+        self.make_card_prelude_for(D3D12_COMMAND_LIST_TYPE_DIRECT)
+    }
+
+    fn make_card_prelude_for(&self, kind: D3D12_COMMAND_LIST_TYPE) -> windows::core::Result<CardPrelude> {
         // SAFETY: plain object creation.
         unsafe {
             (|| {
                 let allocator: ID3D12CommandAllocator =
-                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    self.device.CreateCommandAllocator(kind)?;
                 let list: ID3D12GraphicsCommandList =
                     self.device
-                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                        .CreateCommandList(0, kind, &allocator, None)?;
                 list.Close()?;
                 Ok(CardPrelude { allocator, list })
             })()
@@ -658,13 +662,14 @@ impl Host {
     }
 }
 
-/// Source RelayFetch: an independent direct list, fence and event,
-/// reused only after the previous fetch fence has been checked. The
-/// existing shared CardFetch pool remains the bounded readback owner.
-/// Do not use a copy queue yet: the source's torn-read protection and
-/// independent title-flight state are not present in this branch.
+/// Source RelayFetch: an independent list, fence and event, optionally
+/// on a dedicated copy queue. Reused only after checked completion.
+/// The existing shared CardFetch pool remains the bounded readback owner.
+/// The copy queue is serial with title work until detached flights and
+/// persistent suspect tracking are available.
 pub(super) struct RelayFetch {
     work: Option<CardPrelude>,
+    queue: Option<ID3D12CommandQueue>,
     fence: ID3D12Fence,
     event: HANDLE,
     sent: u64,
@@ -683,6 +688,15 @@ fn independent_fetch_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_RELAY_FETCH").is_some_and(|v| v == "1"))
 }
 
+/// The source copy queue has no compute capability. Keep the direct
+/// path for mode-1 compare/deferred GPU rehash, and require CPU hash
+/// validation before enabling the independent queue.
+fn relay_copy_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
+        && super::torn::on() && !deferred_hashes()
+}
+
 impl RelayFetch {
     fn take_list(&mut self) -> CardPrelude {
         let work = self.work.take().expect("one private fetch list lease");
@@ -697,22 +711,31 @@ impl RelayFetch {
         work
     }
 
-    /// Source relay_card_back's direct-queue fetch. Return the fence in
-    /// this private domain, not a number to use in SentRuns.
-    /// All buffer owners remain live at the caller; submission lock
-    /// excludes other queue activity during the recording and wait.
-    fn run(&mut self, host: &Host, work: CardPrelude) -> (u64, u64) {
+    /// Source relay_card_back's copy/direct queue branches. Return the
+    /// private fence, not a number to use in SentRuns. The caller holds
+    /// the submission lock and owns the buffers until completion.
+    /// A copy queue fetch explicitly waits for the already checked main
+    /// fence, and the CPU waits for the copy fence before reuse.
+    fn run(&mut self, host: &Host, work: CardPrelude, after: u64) -> (u64, u64) {
         let sent = self.sent.checked_add(1).filter(|n| *n != u64::MAX)
             .expect("relay fetch fence exhausted");
         // SAFETY: exclusive open list, live referenced resources, and
-        // a private fence/event. Execute after title work on the same
-        // direct queue (including any compute-based fetched rehash).
+        // a private fence/event. Direct-queue buffers have decayed to
+        // COMMON after completion; copy lists contain only copies.
         let ran = unsafe {
             (|| -> windows::core::Result<()> {
                 work.list.Close()?;
                 let list: ID3D12CommandList = work.list.cast()?;
-                host.queue.ExecuteCommandLists(&[Some(list)]);
-                host.queue.Signal(&self.fence, sent)?;
+                let queue = self.queue.as_ref().unwrap_or(&host.queue);
+                if self.queue.is_some() {
+                    let completed = host.fence.GetCompletedValue();
+                    if completed < after || completed == u64::MAX {
+                        fail(format_args!("relay copy queue main fence incomplete"));
+                    }
+                    queue.Wait(&host.fence, after)?;
+                }
+                queue.ExecuteCommandLists(&[Some(list)]);
+                queue.Signal(&self.fence, sent)?;
                 self.fence.SetEventOnCompletion(sent, self.event)?;
                 Ok(())
             })()
@@ -741,15 +764,35 @@ impl RelayFetch {
 }
 
 impl Host {
-    /// Adapt the source make_relay_fetch's direct-queue branch. A failed
-    /// creation leaves the existing checked main-fence path available.
-    fn make_relay_fetch(&self) -> Option<RelayFetch> {
-        let work = self.make_card_prelude().ok()?;
+    /// Source make_relay_fetch: the copy allocator/list and high-priority
+    /// copy queue are distinct from the direct queue. If creation fails,
+    /// retain the private direct path, then the main-fence fallback.
+    fn make_relay_fetch(&self, copying: bool) -> Option<RelayFetch> {
+        let copying = copying.then(|| {
+            let work = self.make_card_prelude_for(D3D12_COMMAND_LIST_TYPE_COPY)?;
+            // SAFETY: plain object creation for the matching list type.
+            let queue: ID3D12CommandQueue = unsafe {
+                self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    Priority: D3D12_COMMAND_QUEUE_PRIORITY_HIGH.0,
+                    ..Default::default()
+                })?
+            };
+            Ok::<_, windows::core::Error>((work, queue))
+        });
+        let (work, queue) = match copying {
+            Some(Ok((work, queue))) => (work, Some(queue)),
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "no copy queue; retaining direct relay fetch");
+                (self.make_card_prelude().ok()?, None)
+            }
+            None => (self.make_card_prelude().ok()?, None),
+        };
         // SAFETY: independent objects owned by this state, no work yet.
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
-            Some(RelayFetch { work: Some(work), fence, event, sent: 0 })
+            Some(RelayFetch { work: Some(work), queue, fence, event, sent: 0 })
         }
     }
 
@@ -758,7 +801,7 @@ impl Host {
             return None;
         }
         self.relay_fetch.get_or_init(|| {
-            let fetch = self.make_relay_fetch().map(Mutex::new);
+            let fetch = self.make_relay_fetch(relay_copy_enabled()).map(Mutex::new);
             if fetch.is_none() {
                 tracing::warn!("could not create private relay fetch; retaining main-fence fetch");
             }
@@ -1414,7 +1457,10 @@ impl Host {
                 checks[&(piece.copy, piece.lo, piece.hi)].logical(piece)).collect::<Vec<_>>());
             let mut retry = false;
             let (fetch_fence, completed) = loop {
-                let list = match private.as_mut() {
+                // On a copy-queue mismatch, retry on the checked direct
+                // queue; its independent allocator/fence remain reusable.
+                let mut fetch = private.as_mut().filter(|f| !retry || f.queue.is_none());
+                let list = match fetch.as_mut() {
                     Some(fetch) => fetch.take_list(),
                     None => self.card_list(CardPhase::Fetch),
                 };
@@ -1428,6 +1474,7 @@ impl Host {
                     }
                 }
                 if deferred {
+                    debug_assert!(fetch.as_ref().is_none_or(|f| f.queue.is_none()));
                     for (copy, ranges) in fetched_hash_runs(logical.as_deref().unwrap_or(&batch)) {
                         let shadow = &copies[copy];
                         let card = shadow.card().expect("fetched card copy");
@@ -1456,8 +1503,8 @@ impl Host {
                 if let Some(receipt) = pending.take() {
                     COPY_BACK[1].fetch_add(receipt.finish(), Ordering::Relaxed);
                 }
-                let stamp = if let Some(fetch) = private.as_mut() {
-                    fetch.run(self, list)
+                let stamp = if let Some(fetch) = fetch {
+                    fetch.run(self, list, *submitted)
                 } else {
                     self.run_card_list(CardPhase::Fetch, list, submitted);
                     // SAFETY: a plain query of the checked queue fence.
@@ -1516,7 +1563,7 @@ fn private_relay_fetch_has_own_fence_and_reuses_list() {
     let submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
     host.settle_baked_uploads();
     let before = *submitted;
-    let mut fetch = host.make_relay_fetch().expect("private fetch state");
+    let mut fetch = host.make_relay_fetch(false).expect("private fetch state");
     let (upload, source) = host.upload_buffer(4).expect("upload");
     let (readback, target) = host.mapped_buffer(4, true).expect("readback");
     let mut handles = None;
@@ -1534,12 +1581,53 @@ fn private_relay_fetch_has_own_fence_and_reuses_list() {
         // open direct list, both buffers in their fixed heap states.
         unsafe { list.list.CopyBufferRegion(&readback, 0, &upload, 0, 4) };
         let previous = fetch.sent;
-        let (sent, completed) = fetch.run(host, list);
+        let (sent, completed) = fetch.run(host, list, *submitted);
         assert_eq!(sent, previous + 1);
         assert!(completed >= sent && completed != u64::MAX);
         assert_eq!(*submitted, before);
         // SAFETY: readback is mapped and the private fence completed.
         assert_eq!(unsafe { target.cast::<u32>().read_unaligned() }, value);
+    }
+    assert_eq!(fetch.sent, 2);
+}
+
+/// A real default-heap GPU write on the direct queue, followed by
+/// a read on the private copy queue. Both generations and resource
+/// ownership remain valid for repeated transfers.
+#[test]
+#[ignore = "requires D3D12 adapter with high-priority copy queue; run alone"]
+fn relay_copy_queue_reads_completed_direct_writes() {
+    let host = host().expect("D3D12 device");
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    host.settle_baked_uploads();
+    let mut fetch = host.make_relay_fetch(true).expect("relay fetch");
+    assert!(fetch.queue.is_some(), "copy queue creation fell back");
+    let (upload, source) = host.upload_buffer(16).expect("upload");
+    let gpu = host.uav_buffer(16).expect("device-local buffer");
+    let (readback, target) = host.mapped_buffer(16, true).expect("readback");
+    for value in [0x12345678u32, 0xabcdef01] {
+        // SAFETY: four mapped words; previous use has completed.
+        unsafe { source.cast::<[u32; 4]>().write_unaligned([value; 4]) };
+        let direct = host.card_list(CardPhase::Sync);
+        // SAFETY: valid distinct buffers, open direct list, COMMON GPU
+        // buffer promotes to COPY_DEST and decays after the checked fence.
+        unsafe { direct.list.CopyBufferRegion(&gpu, 0, &upload, 0, 16) };
+        host.run_card_list(CardPhase::Sync, direct, &mut submitted);
+        let before = *submitted;
+        let copy = fetch.take_list();
+        // SAFETY: the copy buffer is COMMON after the direct fence;
+        // it promotes to COPY_SOURCE on the copy queue.
+        unsafe { copy.list.CopyBufferRegion(&readback, 0, &gpu, 0, 16) };
+        let (sent, completed) = fetch.run(host, copy, before);
+        assert!(completed >= sent && completed != u64::MAX);
+        assert_eq!(*submitted, before);
+        // SAFETY: the private copy fence completed, readback live.
+        let got = unsafe { target.cast::<[u32; 4]>().read_unaligned() };
+        assert_eq!(got, [value; 4]);
+        // The source's folded hash sees the same completed bytes.
+        // SAFETY: same checked readback mapping and length.
+        let bytes = unsafe { std::slice::from_raw_parts(target, 16) };
+        assert_eq!(super::torn::hash(bytes), super::torn::hash(&[value.to_le_bytes(); 4].concat()));
     }
     assert_eq!(fetch.sent, 2);
 }

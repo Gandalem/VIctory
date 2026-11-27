@@ -401,10 +401,21 @@ shader hash extent, compare every flagged piece before landing any
 bytes of the batch, then use only the original logical intervals
 for merge and deferred rehash. A mismatch retries the batch on the
 direct queue once and fails closed if it remains inconsistent.
-This differs from the source's persistent suspect/refetch scheme,
-which lets later flights repair concurrent copy-queue reads; that
-scheme, the separate copy queue and detached title lists remain
-unported. The default is unchanged. The ignored
+Experimental `VICTORY_RELAY_COPY=1` additionally ports the source's
+dedicated high-priority copy queue and matching copy allocator/list.
+It requires the private relay-fetch worker path and
+`VICTORY_FETCH_CHECK=1`. Deferred compute rehash
+(`VICTORY_CARD_LOOK_ONLY=1`) retains the direct queue. The copy queue
+waits for the completed main fence; its own fence is checked before
+hash validation and landing. A hash mismatch is retried on the direct
+queue; a second mismatch fails closed. Queue creation failure falls
+back to the private direct fetch. Run the ignored
+`relay_copy_queue_reads_completed_direct_writes` test on an adapter
+with a high-priority copy queue.
+This is still a serialized queue handoff, not the source's concurrent
+copy-queue relay. Persistent suspect/refetch tracking, detached title
+lists and overlapping title submissions remain unported.
+The default is unchanged. The ignored
 `carded_shadow_refresh_compare_and_copy_back` and
 `picked_writes_land_only_after_discovery` adapter tests can also
 be run with `VICTORY_FETCH_CHECK=1`. Run the ignored
@@ -421,7 +432,8 @@ the card-buffer options and `VICTORY_PICKED_WRITES=2` on an adapter,
 including a separate run with `VICTORY_CARD_SEND_ORDER=1` and
 `VICTORY_CARD_RELAY_MERGE=1`, and another with
 `VICTORY_CARD_RELAY_WORKER=1` as well, including a separate run with
-`VICTORY_CARD_RELAY_FETCH=1`.
+`VICTORY_CARD_RELAY_FETCH=1` and a separate run with
+`VICTORY_RELAY_COPY=1`, `VICTORY_FETCH_CHECK=1`, look-only off.
 These optional paths need real-adapter verification.
 Loose windows and exact-view arenas stay on the existing path. Run the
 ignored `carded_shadow_refresh_compare_and_copy_back` test with
