@@ -514,9 +514,14 @@ The source map_aliases flat_map expands disjoint aligned
 multi-page alias/unmap ranges into the same independent page
 groups, preserving source order and resolving dependencies after
 the previous group is published. Retain at most 64 expanded
-pages at once. Larger existing mapped-view edits still use the
-serial change path; overlapping/self-alias or non-page-aligned
-ranges keep the legacy whole-range behavior.
+pages at once. The source change() large-view branch cuts
+affected pages and remaps surviving neighbors serially on the
+caller, then dispatches the independent prepared page maps.
+Re-read the existing view for each cut; do not dispatch a page
+whose cut/remap failed. Restore metadata for an unsuccessful
+unmap. Overlapping/self-alias or non-page-aligned ranges keep
+the legacy whole-range behavior. The cuts themselves and any
+failed direct-map retries remain serial.
 `VICTORY_MAP_THREADS=auto` ports
 the source Busy/asked_threads/side_by_side controller: sample
 mapping-call elapsed time over 250 ms windows; switch from 1

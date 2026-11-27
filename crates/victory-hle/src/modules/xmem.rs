@@ -1295,29 +1295,49 @@ impl Op {
 }
 
 /// Source change's prepare/run/publish phases under the existing
-/// physical and remapping locks. Large-view edits stay serial;
-/// only exact one-page views or empty destinations reach the workers.
+/// physical and remapping locks. Cut parts of larger views serially
+/// on the caller, then dispatch their independent page operations.
 fn change(physical: &mut Physical, mut ops: Vec<Op>, threads: usize) -> bool {
-    if threads <= 1 || ops.len() < 3 || ops.iter().any(|op| {
-        physical.views.range(..=op.at).next_back()
-            .is_some_and(|(&base, (size, _))| op.at < base + size && (base != op.at || *size != PAGE))
-    }) {
+    if threads <= 1 || ops.len() < 3 {
         for op in ops {
-            unmap(physical, op.at, PAGE);
+            if !unmap_with(physical, op.at, PAGE, lean()) {
+                return false;
+            }
             if let Some(slice) = op.slice && !map(physical, op.at, PAGE, slice) {
                 return false;
             }
         }
         return true;
     }
-    for op in &mut ops {
-        if let Some((size, slice)) = physical.views.remove(&op.at) {
-            debug_assert_eq!(size, PAGE);
-            forget_shown(physical, op.at, PAGE, &slice);
-            victory_gpu::title_memory_remapped(op.at, PAGE);
-            physical.holes.remove(&op.at);
-            op.prior = Some(slice);
-        } else {
+    let mut ok = true;
+    ops.retain_mut(|op| {
+        let there = physical
+            .views
+            .range(..=op.at)
+            .next_back()
+            .filter(|(base, view)| op.at < **base + view.0)
+            .map(|(base, view)| (*base, view.0));
+        match there {
+            Some((base, PAGE)) if base == op.at => {
+                let (size, slice) = physical.views.remove(&op.at).expect("live page view");
+                forget_shown(physical, op.at, size, &slice);
+                victory_gpu::title_memory_remapped(op.at, PAGE);
+                physical.holes.remove(&op.at);
+                op.prior = Some(slice);
+            }
+            // Part of a larger view.
+            Some(_) => {
+                // The source cuts the larger view here, on the caller.
+                // Unlike the reference's void unmap, do not schedule
+                // this page after a failed cut or surviving-view remap.
+                if !unmap_with(physical, op.at, PAGE, lean()) {
+                    ok = false;
+                    return false;
+                }
+            }
+            None => {}
+        }
+        if op.prior.is_none() {
             let own = physical.holes.remove(&op.at) == Some(PAGE) && lean();
             if op.slice.is_some() && !own {
                 // Source splits on the caller before dispatching
@@ -1325,8 +1345,13 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>, threads: usize) -> bool {
                 split(op.at, PAGE);
             }
         }
+        true
+    });
+    if ops.is_empty() {
+        return ok;
     }
-    let mut ok = true;
+    #[cfg(test)]
+    MAP_BATCH_OPS.with(|n| n.set(ops.len()));
     for (op, result) in mapping_pool::all(ops, threads) {
         match result {
             MapOutcome::Done => {
@@ -1482,6 +1507,7 @@ fn note_view(physical: &mut Physical, base: usize, len: usize, slice: Slice) {
 #[cfg(test)]
 thread_local! {
     static MAP_SPLITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MAP_BATCH_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Cuts `[base, base + len)` out of the placeholder it is in (which fails
@@ -1651,12 +1677,12 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     unmap_with(physical, base, len, lean());
 }
 
-fn unmap_with(physical: &mut Physical, base: usize, len: usize, lean: bool) {
+fn unmap_with(physical: &mut Physical, base: usize, len: usize, lean: bool) -> bool {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
     if len == 0 {
-        return;
+        return true;
     }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
@@ -1671,6 +1697,7 @@ fn unmap_with(physical: &mut Physical, base: usize, len: usize, lean: bool) {
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
+    let mut ok = true;
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
@@ -1687,17 +1714,25 @@ fn unmap_with(physical: &mut Physical, base: usize, len: usize, lean: bool) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
-        if lean && gone != 0 && at >= base && at + size <= end {
+        if gone == 0 {
+            // A failed unmap leaves the old view in place. Republish
+            // it exactly as the existing failed single-page Op does.
+            note_view(physical, at, size, slice);
+            ok = false;
+            continue;
+        }
+        if lean && at >= base && at + size <= end {
             physical.note_hole(at, size);
         }
         if at < base {
-            map_with(physical, at, base - at, slice.clone(), lean);
+            ok &= map_with(physical, at, base - at, slice.clone(), lean);
         }
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
-            map_with(physical, end, at + size - end, Slice { index, ..slice }, lean);
+            ok &= map_with(physical, end, at + size - end, Slice { index, ..slice }, lean);
         }
     }
+    ok
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
@@ -2213,9 +2248,11 @@ mod tests {
             (at(0) as *mut u8).write(0x42);
             (at(2) as *mut u8).write(0x61);
         }
-        // Editing the middle of a larger view falls back to the old
-        // serial remap path, even in an otherwise parallel group.
+        // Cut the larger view on the caller, then dispatch all three
+        // independent page maps as in the source's change().
+        MAP_BATCH_OPS.with(|n| n.set(0));
         assert!(scatter_with(&[(at(1), pages[3]), (at(3), pages[0]), (at(4), pages[2])], 3));
+        assert_eq!(MAP_BATCH_OPS.with(|n| n.get()), 3);
         // SAFETY: both old neighbors still show their original pages.
         unsafe {
             assert_eq!((at(0) as *const u8).read(), 0x42);
@@ -2224,6 +2261,37 @@ mod tests {
             assert_eq!((at(4) as *const u8).read(), 0x61);
         }
         assert_eq!(XMemMapPhysicalPages(a, 5, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    /// Multiple destinations in the same old view must re-read the
+    /// current view after each cut. Only the middle three pages are
+    /// replaced; both outer neighbors and new physical aliases survive.
+    #[test]
+    fn parallel_scatter_cuts_adjacent_pages_in_the_same_view() {
+        let pages = allocate(5);
+        for (i, &page) in pages.iter().enumerate() {
+            assert!(write_physical(&[page], 0, &[0x20 + i as u8]));
+        }
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 5 * PAGE,
+            MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let at = |i: usize| a as usize + i * PAGE;
+        assert_eq!(XMemMapPhysicalPages(a, 5, pages.as_ptr()), a);
+        MAP_BATCH_OPS.with(|n| n.set(0));
+        assert!(scatter_with(&[(at(1), pages[4]), (at(2), pages[0]), (at(3), pages[4])], 3));
+        assert_eq!(MAP_BATCH_OPS.with(|n| n.get()), 3);
+        // SAFETY: all five pages are live mappings of our allocation.
+        unsafe {
+            assert_eq!((0..5).map(|i| (at(i) as *const u8).read()).collect::<Vec<_>>(),
+                [0x20, 0x24, 0x20, 0x24, 0x24]);
+            (at(1) as *mut u8).write(0x61);
+            assert_eq!((at(3) as *const u8).read(), 0x61);
+            assert_eq!((at(4) as *const u8).read(), 0x61);
+            assert_eq!((at(0) as *const u8).read(), 0x20);
+        }
+        let clear: Vec<_> = (0..5).map(|i| (at(i), 0)).collect();
+        assert!(scatter_with(&clear, 3));
         assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
