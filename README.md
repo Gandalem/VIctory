@@ -364,10 +364,16 @@ Newer sent or unsent CPU ranges are excluded. Never re-upload the
 merged GPU bytes or repeat the old picked copy-back. Unknown marks,
 overlapping marks, withheld memory and other writes use the existing
 serial path. Undeclared parts of a fetched piece still only update
-the staging mirror. This does not enable background landing or
-overlapping submissions; these need a different retirement watermark
-and mapping/snapshot ownership. The default remains the existing
-serial landing path. Run the ignored
+the staging mirror. The same relay-merge option also enables the
+reference's `Flights` range ownership: one logical submission number
+is passed to regular and picked declarations; duplicate declarations
+count once, and a completion releases only one claim. Refresh observes
+the counted ranges and snapshot teardown waits for the last owner.
+The default keeps the existing serial range set. The source's flight
+lifetime tests are adapted to this pending owner. This does not enable
+background landing or overlapping submissions; copy-back, generation
+retirement and mapped-buffer access still rely on the submission lock.
+Run the ignored
 `owned_card_send_keeps_original_bytes_after_staging_changes` test with
 the card-buffer options and `VICTORY_SEND_OWN=1` on a real adapter.
 Run the ignored `card_check_tail_shares_title_fence` test on an adapter

@@ -1543,6 +1543,10 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         self.settle_baked_uploads();
+        // Source PREPARED's logical flight number, passed explicitly to
+        // every declaration in this submission instead of a global.
+        // Use the next queue number as a unique tag while serial.
+        let flight = (*submitted).checked_add(1).expect("submission number exhausted");
         crate::shadow::maintain_snapshot_pool();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -1652,7 +1656,7 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, flight);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1664,7 +1668,7 @@ impl Host {
         batch.flush();
         // Reference two-sided buffers: upload changed CPU ranges and hash
         // their GPU baseline before title work reaches the direct queue.
-        let picked = card_compare::prepare_picked(runs);
+        let picked = card_compare::prepare_picked(runs, flight);
         let carded = crate::shadow::carded();
         self.card_before(&carded, &mut submitted);
         // As in source CardPlan::check, pre-record the check for the
@@ -2807,7 +2811,7 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, flight: u64) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -2873,7 +2877,7 @@ impl HostList {
                         // Only this copy needs to be current for its snapshot.
                         batch.flush_one(shadow);
                     }
-                    shadow.writing(*address, *len, *marked);
+                    shadow.writing_for_flight(*address, *len, *marked, flight);
                     continue;
                 }
                 // Brought up to date before the submission's lists were made.

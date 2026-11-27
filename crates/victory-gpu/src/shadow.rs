@@ -63,6 +63,133 @@ fn writeback_merge_matches_bytewise_oracle() {
     }
 }
 
+type WriteRange = (usize, usize);
+
+/// Source shadow.rs Flights, adapted to a single pending-range owner.
+/// The submit lock guarantees monotonically prepared flight numbers;
+/// duplicate declarations inside one flight count only once.
+#[derive(Default)]
+struct Flights(std::collections::HashMap<WriteRange, (u32, u64)>);
+
+impl Flights {
+    /// Submission `number` declares `range`: counted once for it, however
+    /// often it declares it.
+    fn declare(&mut self, range: WriteRange, number: u64) {
+        let f = self.0.entry(range).or_insert((0, number));
+        if f.0 == 0 || f.1 != number {
+            *f = (f.0 + 1, number);
+        }
+    }
+
+    /// Source Flights::done, specialized to the existing single-range
+    /// copy-back API: no temporary vector for each completed range.
+    /// Called once for each distinct declaration in a completed flight.
+    fn done(&mut self, range: WriteRange) {
+        match self.0.get_mut(&range) {
+            Some(f) if f.0 > 1 => f.0 -= 1,
+            Some(_) => { self.0.remove(&range); }
+            None => {}
+        }
+    }
+}
+
+/// Preserve the current fast serial set unless the experimental relay
+/// merge was requested. The counted variant is the source's Flights
+/// map itself, so membership and reference counts cannot diverge.
+/// No overlapping GPU submissions are enabled by this change.
+enum PendingWrites {
+    Serial(std::collections::HashSet<WriteRange>),
+    Counted(Flights),
+}
+
+impl Default for PendingWrites {
+    fn default() -> Self {
+        if card_relay_merge_enabled() {
+            Self::Counted(Flights::default())
+        } else {
+            Self::Serial(Default::default())
+        }
+    }
+}
+
+impl PendingWrites {
+    fn declare(&mut self, range: WriteRange, number: u64) {
+        match self {
+            Self::Serial(ranges) => { ranges.insert(range); }
+            Self::Counted(flights) => flights.declare(range, number),
+        }
+    }
+
+    fn done(&mut self, range: WriteRange) {
+        match self {
+            Self::Serial(ranges) => { ranges.remove(&range); }
+            Self::Counted(flights) => flights.done(range),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Serial(ranges) => ranges.is_empty(),
+            Self::Counted(flights) => flights.0.is_empty(),
+        }
+    }
+
+    fn overlapping(&self, from: usize, to: usize) -> Vec<WriteRange> {
+        let intersects = |&&(a, b): &&WriteRange| a < to && b > from;
+        match self {
+            Self::Serial(ranges) => ranges.iter().filter(intersects).copied().collect(),
+            Self::Counted(flights) => flights.0.keys().filter(intersects).copied().collect(),
+        }
+    }
+}
+
+#[test]
+fn a_range_stays_closed_until_every_flight_that_declared_it_is_done() {
+    // Adapt the source relay_tests regression to the actual pending
+    // owner used by refresh and copy-back in this branch.
+    let (a, b) = ((0x1000, 0x2000), (0x1800, 0x3000));
+    let mut pending = PendingWrites::Counted(Flights::default());
+    for _ in 0..3 {
+        pending.declare(a, 7);
+    }
+    pending.declare(b, 7);
+    pending.declare(a, 8);
+    pending.done(a);
+    pending.done(b);
+    assert_eq!(pending.overlapping(0, 0x3000), [a]);
+    pending.declare(a, 9);
+    pending.done(a);
+    assert_eq!(pending.overlapping(0x1800, 0x2800), [a]);
+    assert!(!pending.is_empty(), "snapshot still held");
+    pending.done(a);
+    assert!(pending.is_empty());
+    // Complete the later flight first; still held after one completion.
+    pending.declare(a, 10);
+    pending.declare(a, 11);
+    pending.done(a);
+    assert_eq!(pending.overlapping(0, 0x3000), [a]);
+    pending.done(a);
+    assert!(pending.is_empty());
+    pending.done(b);
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn serial_pending_writes_keep_existing_membership_and_completion() {
+    let mut pending = PendingWrites::Serial(Default::default());
+    let a = (16, 32);
+    let b = (24, 48);
+    pending.declare(a, 1);
+    pending.declare(a, 1);
+    pending.declare(b, 1);
+    assert!(pending.overlapping(0, 16).is_empty());
+    assert_eq!(pending.overlapping(16, 24), [a]);
+    pending.done(a);
+    assert_eq!(pending.overlapping(24, 32), [b]);
+    pending.done(b);
+    assert!(pending.is_empty());
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -76,7 +203,7 @@ pub(crate) struct Shadow {
     tracked: Option<crate::watch::Tracked>,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<std::collections::HashSet<(usize, usize)>>,
+    pending: Mutex<PendingWrites>,
     /// The copy's bytes before the submission ran where its shaders write:
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
@@ -1085,11 +1212,11 @@ impl Shadow {
     /// With `marked`, nothing is kept: the pages are armed instead, so that
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
-    pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+    pub(crate) fn writing_for_flight(&self, address: usize, len: usize, marked: bool, flight: u64) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((address, address + len));
+            .declare((address, address + len), flight);
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
             return;
@@ -1130,6 +1257,12 @@ impl Shadow {
         }
         grown.extend_from_slice(host(at, end));
         segments.insert(first, (start, grown));
+    }
+
+    /// Tests that simulate one submission directly, without Host::execute.
+    #[cfg(test)]
+    fn writing(&self, address: usize, len: usize, marked: bool) {
+        self.writing_for_flight(address, len, marked, 0);
     }
 
     /// `[address, address + len)` expanded outward to 64 KiB page
@@ -1264,10 +1397,12 @@ impl Shadow {
                 t.taken(&whole);
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        // Host deduplicates exact declarations before copy-back. With
+        // source Flights accounting, a completion releases only one
+        // flight's claim. Snapshot/armed-page teardown is last-owner only.
+        // Copy-back itself still requires serial execution.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.remove(&(address, address + len));
+        pending.done((address, address + len));
         if pending.is_empty() {
             compared.clear();
             for (_, bytes) in segments.drain(..) {
@@ -1365,10 +1500,7 @@ impl Shadow {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+            .overlapping(from, to);
         if self.tracked.is_some() {
             return self.update_tracked(from, to, !busy.is_empty());
         }

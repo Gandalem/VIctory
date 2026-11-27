@@ -665,7 +665,7 @@ fn declared_scope(runs: &[&HostList]) -> Option<CardScope> {
 /// Reference picked::declare runs after the final CPU refresh and before
 /// the title lists. Keep the candidates separate from recorded GpuWrite
 /// steps: changing recorded lists would affect later replays.
-pub(super) fn prepare_picked(runs: &[&HostList]) -> Vec<crate::picked::Range> {
+pub(super) fn prepare_picked(runs: &[&HostList], flight: u64) -> Vec<crate::picked::Range> {
     if !crate::picked::lands() || crate::memory::withholding() {
         return Vec::new();
     }
@@ -692,7 +692,7 @@ pub(super) fn prepare_picked(runs: &[&HostList]) -> Vec<crate::picked::Range> {
     for (shadow, address, len) in &ranges {
         // Snapshot only after this submission's refreshes. Previously
         // discovered GPU bytes are part of the baseline, not new writes.
-        shadow.writing(*address, *len, false);
+        shadow.writing_for_flight(*address, *len, false, flight);
     }
     ranges
 }
