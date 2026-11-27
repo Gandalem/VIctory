@@ -837,14 +837,23 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
+        Self::new_with_size(texture, state, castable, None)
+    }
+
+    fn new_with_size(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+        castable: Vec<u32>,
+        tile_bytes: Option<u64>,
+    ) -> Self {
         // SAFETY: plain query on a live resource.
         let desc = unsafe { texture.GetDesc() };
         let sampled = desc.Flags.0 & USES as i32 == 0;
-        let bytes = crate::host::host().map_or(0, |h| {
+        let bytes = tile_bytes.unwrap_or_else(|| crate::host::host().map_or(0, |h| {
             // SAFETY: valid descriptor.
             let size = unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
             if size == u64::MAX { 0 } else { size }
-        });
+        }));
         texture_kind_bytes(sampled).fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
@@ -1458,14 +1467,10 @@ fn shared_texture(
         && takes(t, &d)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(host) = crate::host::host() {
-            // The live texture's own description: `d` may ask for uses its
-            // format does not take on this host (unordered access on
-            // B5G5R5A1 on NVIDIA), which the query rejects by removing the
-            // device. SAFETY: plain queries on a live resource.
-            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[t.texture.GetDesc()]) };
-            SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
-        }
+        // The actual allocation size was recorded at creation, including
+        // tile-backed textures. Do not query a reserved texture as though
+        // it were a committed allocation or ask about unsupported uses.
+        SAVED.fetch_add(t.bytes, std::sync::atomic::Ordering::Relaxed);
         return live;
     }
     let mut selected = if writable_alias { 0 } else { budgeted_drop(desc, baseline) };
@@ -1570,6 +1575,18 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
     let plain = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+    // Original optional reserved-texture path, ahead of ordinary placed
+    // and committed allocation. It publishes only fully initialized MIPs.
+    if clear_value.is_none() && crate::tiles::enabled() {
+        let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+        if let Some((texture, bytes)) = crate::tiles::make(host, &plain, &formats) {
+            tracing::debug!(bytes, "sampled texture backed by pooled D3D12 tiles");
+            crate::host::name(&texture, || {
+                format!("tiled texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
+            });
+            return Some(HostTexture::new_with_size(texture, 0, castable_formats, Some(bytes)));
+        }
+    }
     let mut placement = None;
     if clear_value.is_none()
         && crate::placement::fits(&host.device, &plain)

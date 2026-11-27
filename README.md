@@ -327,6 +327,36 @@ for untracked textures (up to 256 subresources), using content hashes.
 It still reads and hashes the whole source, but avoids unchanged
 detiling and GPU copies. The default untracked upload path is unchanged.
 
+## Experimental tiled sampled textures
+
+Experimental `VICTORY_TILED_TEXTURE_POOL=1` ports the physical tile
+allocator and MIP-group mapping mechanism of
+[cool_fox tiles.rs](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/tiles.rs).
+On tier-2 adapters, eligible single-slice RGBA8 sampled textures with
+multiple retained MIPs and 1–64 MiB of tile backing use reserved
+resources, 64 KiB tiles, and a pool of up to sixteen 64 MiB heaps.
+Standard MIPs are independent groups; a packed tail is indivisible.
+Free runs coalesce on return and completely free heaps are trimmed
+under memory pressure. A private COM owner retains the physical heap
+leases for the full lifetime of the resource, including descriptor
+slots, recorded lists, and retired descriptors. All allocated texels
+are initialized to zero after an aliasing barrier on a separate fenced
+queue, before the resource is published. Castable formats are
+preserved or the existing placed/committed allocation path is used. Reserved
+resources do not participate in committed-resource Evict/MakeResident.
+
+The production path maps **all retained MIPs** up front: without
+sparse MIP-aware descriptor remapping, exposing a view of an unmapped level
+would risk wrong sampling. The allocator's group selection is ready
+for sparse MIP mapping, but dynamic view remapping and selective live
+mapping remain unimplemented. Like the reference, mapped tiles are
+not returned while the resource lives. This option is disabled by
+default: the dedicated initialization fence and zero fill may outweigh
+pooling savings; validate both correctness and performance on Windows.
+The upstream first-use texture creation and whole-texture descriptor
+invalidation/eviction remain in use. The older committed-resource
+Evict/MakeResident state machine is not restored in this integration.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

@@ -1336,6 +1336,9 @@ impl Host {
         crate::resource::evict_unused();
         // Refresh pressure even on submissions without a new presented frame.
         video_memory_bytes();
+        if crate::tiles::enabled() {
+            crate::tiles::maintain();
+        }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
