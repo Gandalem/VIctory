@@ -46,6 +46,10 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// At most one descriptor upload batch can outlive a title submission.
+    /// Access only while holding submitted; keep the list and its owners
+    /// until the copy fence, before recycling staging or executing titles.
+    pending_bake: Mutex<Option<PendingBake>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -253,6 +257,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            pending_bake: Mutex::new(None),
             event,
             rtvs,
             rtv_size,
@@ -716,6 +721,25 @@ pub(crate) mod tests {
         for &object in &objects {
             assert_eq!(crate::texture::uploads(object), 1, "unchanged: not again");
         }
+    }
+
+    #[test]
+    fn async_bake_retains_list_until_fence_and_drains_once() {
+        let Some(host) = host() else { return };
+        let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.settle_baked_uploads();
+        let before = *submitted;
+        let list = host.new_list().unwrap();
+        list.set_ours();
+        host.enqueue_baked_uploads(list, &mut submitted, crate::descriptor::BakedSlots::new());
+        assert_eq!(*submitted, before + 1);
+        assert_eq!(host.pending_bake.lock().unwrap().as_ref().unwrap().fence, *submitted);
+        host.settle_baked_uploads();
+        assert!(host.pending_bake.lock().unwrap().is_none());
+        // SAFETY: querying this live fence under the submission lock.
+        assert!(unsafe { host.fence.GetCompletedValue() } >= *submitted);
+        host.settle_baked_uploads();
+        assert_eq!(*submitted, before + 1);
     }
 
     #[test]
@@ -1204,6 +1228,14 @@ type TileSources = std::collections::BTreeMap<
     usize, (std::sync::Arc<crate::resource::HostTexture>, u32)
 >;
 
+/// A reference-style deferred flip tied to the exact submitted fence.
+struct PendingBake {
+    fence: u64,
+    list: HostList,
+    sources: TileSources,
+    jobs: crate::descriptor::BakedSlots,
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1371,6 +1403,9 @@ impl Host {
     /// block a worker on the active GPU submission.
     pub(crate) fn prepare_heap_ahead(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
         let Ok(_submitted) = self.submitted.try_lock() else { return };
+        // Don't let ahead refreshes consume a pending upload's source
+        // state or allocate staging before its publication boundary.
+        if self.pending_bake.lock().unwrap_or_else(|e| e.into_inner()).is_some() { return; }
         crate::bindless::prepare_ahead(viewed);
     }
 
@@ -1413,10 +1448,10 @@ impl Host {
         reshown
     }
 
-    /// Run the bounded deferred-descriptor bake after preceding GPU work
-    /// has settled. The caller holds submitted; never recurse into execute
-    /// or recycle the current submission's upload allocations.
-    pub(crate) fn submit_baked_uploads(&self, list: &HostList, submitted: &mut u64) {
+    /// Enqueue the bounded descriptor bake after preceding GPU work.
+    /// The caller holds submitted; the list and staging must live until
+    /// finish_baked_uploads validates the fence and device state.
+    fn begin_baked_uploads(&self, list: &HostList, submitted: &mut u64) -> TileSources {
         let sources = self.prepare_tile_sources(&[list]);
         list.close();
         let mut lists = Vec::with_capacity(2);
@@ -1432,21 +1467,61 @@ impl Host {
         // through the checked fence. This is the same direct queue.
         unsafe {
             self.queue.ExecuteCommandLists(&lists);
-            if let Err(e) = self.queue.Signal(&self.fence, *submitted)
-                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event))
-            {
-                fail(format_args!("deferred texture upload fence setup failed: {e}"));
+            if let Err(e) = self.queue.Signal(&self.fence, *submitted) {
+                fail(format_args!("deferred texture upload fence signal failed: {e}"));
             }
-            if WaitForSingleObject(self.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0
-                || self.fence.GetCompletedValue() < *submitted
-            {
-                fail(format_args!("deferred texture upload fence wait failed"));
+        }
+        sources
+    }
+
+    fn finish_baked_uploads(&self, fence: u64, sources: &TileSources) {
+        // SAFETY: the submission lock serializes use of this fence/event;
+        // the caller keeps the command allocator, list and copies alive.
+        unsafe {
+            if self.fence.GetCompletedValue() < fence {
+                if let Err(e) = self.fence.SetEventOnCompletion(fence, self.event) {
+                    fail(format_args!("deferred texture upload fence setup failed: {e}"));
+                }
+                if WaitForSingleObject(self.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0
+                    || self.fence.GetCompletedValue() < fence
+                {
+                    fail(format_args!("deferred texture upload fence wait failed"));
+                }
             }
             if let Err(e) = self.device.GetDeviceRemovedReason() {
                 fail(format_args!("deferred texture upload device removed: {e}"));
             }
         }
-        crate::descriptor::remake_tiled_views(&Self::complete_tile_sources(&sources));
+        crate::descriptor::remake_tiled_views(&Self::complete_tile_sources(sources));
+    }
+
+    /// Synchronous bake: preserve the existing default.
+    pub(crate) fn submit_baked_uploads(&self, list: &HostList, submitted: &mut u64) {
+        let sources = self.begin_baked_uploads(list, submitted);
+        self.finish_baked_uploads(*submitted, &sources);
+    }
+
+    /// Reference texture_slot_flip: keep one in-flight batch. No further
+    /// GPU submissions or upload-pool recycling may pass its fence.
+    pub(crate) fn enqueue_baked_uploads(
+        &self, list: HostList, submitted: &mut u64, jobs: crate::descriptor::BakedSlots,
+    ) {
+        let mut pending = self.pending_bake.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(pending.is_none(), "previous descriptor bake must settle first");
+        let sources = self.begin_baked_uploads(&list, submitted);
+        *pending = Some(PendingBake { fence: *submitted, list, sources, jobs });
+    }
+
+    /// Complete and publish the preceding async batch before any next
+    /// title submission can reuse its staging or access its resources.
+    fn settle_baked_uploads(&self) {
+        let pending = self.pending_bake.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(pending) = pending {
+            self.finish_baked_uploads(pending.fence, &pending.sources);
+            crate::descriptor::publish_baked_slots(&pending.jobs);
+            // The allocator and upload owners are released only now.
+            drop(pending.list);
+        }
     }
 
     /// Runs closed lists and waits for them.
@@ -1454,6 +1529,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.settle_baked_uploads();
         crate::shadow::maintain_snapshot_pool();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -1737,12 +1813,9 @@ impl Host {
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
-        if !read.is_empty() {
-            if crate::descriptor::bake_enabled() {
-                crate::descriptor::make_read_baked(&read, self, &mut submitted);
-            } else {
-                crate::descriptor::make_read(&read);
-            }
+        let bake = crate::descriptor::bake_enabled() && !read.is_empty();
+        if !read.is_empty() && !bake {
+            crate::descriptor::make_read(&read);
         }
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
@@ -1759,6 +1832,12 @@ impl Host {
             for work in &list.deferred().after {
                 work();
             }
+        }
+        // A bake reads title bytes. Copy back completed GPU writes and
+        // run their completion callbacks before taking that source
+        // snapshot, but still before signalling title completion.
+        if bake {
+            crate::descriptor::make_read_baked(&read, self, &mut submitted);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]

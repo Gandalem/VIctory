@@ -1121,12 +1121,17 @@ impl HostHeap {
             return false;
         }
         let Some(view) = view_at(key as u32, (key >> 32) as u32) else { return false };
-        if !matches!(&view, View::Placed(false, resource, _) if resource[0] != 1)
-            || placed_texture(&view).as_ref() != Some(resolved)
+        let View::Placed(false, resource, desc) = &view else { return false };
+        if resource[0] == 1 { return false; }
+        let View::Shader(r, words) = resolved else { return false };
+        let address = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+        // Revalidate the already-existing placed object; never create
+        // another host texture while publishing an older upload.
+        if crate::resource::existing_placed_texture(address, resource).map(|r| r as usize) != Some(*r)
+            || words.as_ref().map(|w| w.as_slice()) != Some(&desc[..10])
         {
             return false;
         }
-        let View::Shader(r, _) = resolved else { return false };
         if copy.host_written.load(Relaxed)
             || !crate::resource::made_copy(*r as crate::object::This)
                 .is_some_and(|current| Arc::ptr_eq(&current, copy))
@@ -1136,7 +1141,8 @@ impl HostHeap {
         }
         // Use the checked resolved view, not another resolution of the
         // placed record. The submitted texture remains the slot's owner.
-        let (Some(Some(kept)), mark) = make_marked(resolved, self.cpu(index)) else {
+        let Some(gpu) = host() else { return false };
+        let Some(Some(kept)) = shader_texture_view(&gpu.device, *r as crate::object::This, copy, words.as_ref(), self.cpu(index)) else {
             null_for(&view, self.cpu(index));
             return false;
         };
@@ -1146,7 +1152,7 @@ impl HostHeap {
         }
         self.set_stride(index, Some(&view));
         self.note_address(index, Some(&view));
-        self.set_mark(index, mark);
+        self.set_mark(index, None);
         self.viewed.set(index, Some(resolved), true);
         self.keep(index, Some(kept));
         true
@@ -2191,6 +2197,44 @@ mod tests {
         a.collect(&mut out);
         b.collect(&mut out);
         assert!(!out.contains_key(&0x10000));
+    }
+
+    #[test]
+    fn baked_publication_rejects_rewritten_slot_and_uses_checked_owner() {
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let null = std::ptr::null();
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let resource = placed_tex_desc(4, 4, 28, 0);
+        let old = placed_tex_srv_desc(placed_memory(), 28);
+        crate::descriptor::create_placed_srv(null, &resource, &old, handle);
+        assert!(heap.mirror(0, handle, false).is_some());
+        assert!(!heap.kept(0));
+        let (view, key) = heap.prepare_bake_slot(0, handle).unwrap();
+        let resolved = placed_texture(&view).unwrap();
+        let View::Shader(r, _) = &resolved else { panic!("placed shader view") };
+        let copy = crate::resource::host_copy(*r as crate::object::This).unwrap();
+        copy.stamp();
+
+        // A title rewrite can occur while the earlier upload is queued.
+        // Even when it completes, it may not overwrite the new record.
+        let new = placed_tex_srv_desc(placed_memory(), 28);
+        crate::descriptor::create_placed_srv(null, &resource, &new, handle);
+        assert!(!heap.publish_uploaded_slot(0, handle, key, &resolved, &copy));
+        assert!(!heap.kept(0));
+        assert!(heap.mirror(0, handle, false).is_some());
+        let (view, new_key) = heap.prepare_bake_slot(0, handle).unwrap();
+        assert_ne!(key, new_key);
+        let resolved = placed_texture(&view).unwrap();
+        let View::Shader(r, _) = &resolved else { panic!("placed shader view") };
+        let new_copy = crate::resource::host_copy(*r as crate::object::This).unwrap();
+        new_copy.stamp();
+        // Simulate the new job's checked completion; this standalone
+        // heap never participates in actual GPU shader execution.
+        assert!(!heap.publish_uploaded_slot(0, handle, new_key, &resolved, &copy));
+        assert!(heap.publish_uploaded_slot(0, handle, new_key, &resolved, &new_copy));
+        assert!(heap.kept(0));
+        assert!(!heap.publish_uploaded_slot(0, handle, new_key, &resolved, &new_copy));
     }
 
     #[test]

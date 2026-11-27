@@ -523,9 +523,24 @@ does not publish the old descriptor; a later read retries it.
 Writable, alias-written, untracked, oversized, pressure-limited and
 other ineligible views retain the existing on-read path.
 
-This is a narrow synchronous bake port, not the reference renderer's
-general asynchronous flip queue. It can add an extra GPU fence per
-eligible batch and is disabled by default pending Windows validation.
+The default bake is synchronous. With both
+`VICTORY_DEFERRED_DESCRIPTOR_UPLOADS=1` and
+`VICTORY_ASYNC_DESCRIPTOR_UPLOADS=1`, the reference's fence-delayed
+`texture_slots_flip` is adapted to one outstanding direct-queue batch.
+The prior title submission's copy-backs and completion callbacks run
+before baking its source bytes. Eligible slots stay null until the
+bake fence completes. The next title submission settles that fence,
+then republishes only matching live heap identities, record generations
+and exact host copies, before eviction, heap sync or staging recycling.
+The pending list retains its command allocator, upload buffers and
+texture owners. Ahead workers skip preparation while a bake is pending;
+the idle batch remains bounded even if no further title submission runs.
+Ineligible views continue through the original on-read path. This
+allows the title CPU to proceed while the bounded bake executes; it
+does not allow general title command lists to execute asynchronously.
+Both options are disabled by default. Actual game behavior and
+performance still need hardware testing.
+
 Dynamic sparse MIP mapping is still not enabled: all retained tile
 groups are backed and initialized before a resource is published.
 
