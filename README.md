@@ -259,6 +259,15 @@ that a concurrent title write outside the landed ranges was mirrored.
 The option is off by default, and does not change marked-page copy-back
 or introduce a GPU comparison shader or asynchronous readback.
 
+The reference `CARD_COMPARE` shader, its 64 KiB piece range arithmetic
+and CPU hash oracle are ported in the isolated Windows test module
+`host/card_compare.rs`. The compiler and range tests run in normal CI;
+the ignored `card_compare_detects_and_fetches_changed_pieces` test
+executes hash initialization, comparison, compare-and-update and
+selective readback on a D3D12 adapter. It is not yet part of title
+submission or production Shadow buffer ownership. Run the ignored test
+alone on hardware before using the GPU results to drive copy-back.
+
 Diagnostics report the logical refresh gap and already-covered bytes
 avoided since the last report. These counters are not physical PCIe
 transfer measurements. No new GPU-local mirror, shared-heap mapping,
