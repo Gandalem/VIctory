@@ -975,6 +975,46 @@ fn shift_view_levels(drop: u32, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
     }
 }
 
+/// Convert an explicit 2D SRV into a mask of retained host MIPs.
+/// Default, malformed, array and unsupported views request all levels.
+pub(crate) fn srv_mip_mask(
+    resource: crate::object::This,
+    words: Option<&[u32; 10]>,
+    texture: &ID3D12Resource,
+) -> u32 {
+    if !crate::texture::srv_ranges_enabled() {
+        return u32::MAX;
+    }
+    let Some(words) = words else { return u32::MAX };
+    // SAFETY: the caller holds a live host resource.
+    let actual = unsafe { texture.GetDesc() };
+    if !crate::texture::srv_mip_eligible(&actual) {
+        return u32::MAX;
+    }
+    let mut view = srv_desc(words);
+    if view.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
+        return u32::MAX;
+    }
+    shift_view_levels(crate::resource::dropped(resource, texture), &mut view);
+    // SAFETY: checked Texture2D dimension.
+    let v = unsafe { view.Anonymous.Texture2D };
+    if v.PlaneSlice != 0 {
+        return u32::MAX;
+    }
+    mip_mask(v.MostDetailedMip, v.MipLevels, u32::from(actual.MipLevels))
+}
+
+fn mip_mask(first: u32, count: u32, levels: u32) -> u32 {
+    if levels == 0 || levels > 32 || first >= levels || count == 0 {
+        return u32::MAX;
+    }
+    let end = if count == u32::MAX { levels } else { first.saturating_add(count) };
+    if end > levels {
+        return u32::MAX;
+    }
+    (first..end).fold(0, |mask, i| mask | (1u32 << i))
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -1856,6 +1896,18 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn srv_mip_masks_handle_tail_full_and_invalid_ranges() {
+        assert_eq!(mip_mask(2, 2, 6), 0b001100);
+        assert_eq!(mip_mask(3, u32::MAX, 6), 0b111000);
+        assert_eq!(mip_mask(0, u32::MAX, 32), u32::MAX);
+        assert_eq!(mip_mask(31, 1, 32), 1 << 31);
+        assert_eq!(mip_mask(4, 3, 6), u32::MAX);
+        assert_eq!(mip_mask(6, 1, 6), u32::MAX);
+        assert_eq!(mip_mask(0, 0, 6), u32::MAX);
+        assert_eq!(mip_mask(0, 1, 33), u32::MAX);
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.

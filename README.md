@@ -327,6 +327,24 @@ for untracked textures (up to 256 subresources), using content hashes.
 It still reads and hashes the whole source, but avoids unchanged
 detiling and GPU copies. The default untracked upload path is unchanged.
 
+## Experimental SRV MIP upload selection
+
+`VICTORY_SRV_MIP_UPLOADS=1` reverse-ports the conservative SRV range
+selection in ff33360. For sampled single-slice RGBA8 2D textures, heap
+SRV masks use the same retained-MIP shift as the real host descriptors.
+Duplicates, rewrites, multiple heaps and aliases contribute to the union
+before the submission prepares a texture. Initial uploads cover all MIPs;
+default or unsupported SRVs, explicit table reads and texture copies keep
+the full-range request. Hidden dirty levels stay pending even after dirty
+pages are consumed or a clean content hash is observed. Since current
+upload buffers are submission-owned, their source bytes are read again
+when a pending MIP becomes visible rather than retaining stale staging.
+
+The existing bounded workers, packed source-span handling, full-size
+staging allocations, resource lifetime and submission fence remain.
+This is not sparse residency, nor asynchronous lookahead. It is disabled
+by default pending Windows GPU readback and mixed copy/write validation.
+
 ## Experimental tiled sampled textures
 
 Experimental `VICTORY_TILED_TEXTURE_POOL=1` ports the physical tile

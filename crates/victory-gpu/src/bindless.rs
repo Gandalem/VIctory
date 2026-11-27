@@ -24,7 +24,7 @@ enum Seen {
     /// `len` bytes at `address` of a buffer's host copy; unordered access.
     Buffer(Arc<Shadow>, u64, u64, bool),
     /// A title texture (resource object) whose contents the title writes.
-    Texture(usize),
+    Texture(usize, u32),
     /// A view left without a host view (textures the title placed itself),
     /// by kind (diagnostics: `KINDS`), with a placed texture's address and
     /// console bytes.
@@ -53,6 +53,9 @@ struct Inner {
     slots: HashMap<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
+    /// Reference counts of restricted SRV masks; full views are implicit
+    /// in the difference from the total texture count.
+    texture_masks: BTreeMap<usize, BTreeMap<u32, u32>>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
@@ -79,6 +82,14 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
+    fn requested_mips(&self, resource: usize) -> u32 {
+        let Some(masks) = self.texture_masks.get(&resource) else { return u32::MAX };
+        if masks.values().sum::<u32>() != self.textures.get(&resource).copied().unwrap_or(0) {
+            return u32::MAX;
+        }
+        masks.keys().fold(0, |mask, &m| mask | m)
+    }
+
     fn count(&mut self, seen: &Seen, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
@@ -114,11 +125,22 @@ impl Inner {
                     }
                 }
             }
-            Seen::Texture(r) => {
+            Seen::Texture(r, mask) => {
                 let n = self.textures.entry(*r).or_insert(0);
                 step(n);
                 if *n == 0 {
                     self.textures.remove(r);
+                    self.texture_masks.remove(r);
+                } else if *mask != u32::MAX {
+                    let masks = self.texture_masks.entry(*r).or_default();
+                    let count = masks.entry(*mask).or_insert(0);
+                    step(count);
+                    if *count == 0 {
+                        masks.remove(mask);
+                    }
+                    if masks.is_empty() {
+                        self.texture_masks.remove(r);
+                    }
                 }
             }
             Seen::Left(_) => {}
@@ -153,10 +175,11 @@ impl Viewed {
 fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
-    if let View::Shader(resource, _) = view
+    if let View::Shader(resource, desc) = view
         && let Some(texture) = crate::resource::made_copy(*resource as This)
     {
-        return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource));
+        let mask = crate::descriptor::host::srv_mip_mask(*resource as This, desc.as_ref(), &texture.texture);
+        return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource, mask));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {
@@ -219,23 +242,25 @@ pub(crate) fn uploads(
     // memory, detiling and making staging buffers took half the submitting
     // thread in a new shot, and title threads setting views waited on the
     // lock meanwhile (run evict5).
-    let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
-    let mut staged = std::collections::HashSet::new();
+    let mut work: Vec<crate::texture::RefreshWork> = Vec::new();
+    let mut staged = HashMap::new();
+    let range_mode = crate::texture::srv_ranges_enabled();
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded).
         if copy.host_written.load(Relaxed) {
             continue;
         }
-        if staged.insert(Arc::as_ptr(staging)) {
-            work.push((staging.clone(), copy.clone()));
+        if let std::collections::hash_map::Entry::Vacant(e) = staged.entry(Arc::as_ptr(staging)) {
+            e.insert(work.len());
+            work.push((staging.clone(), copy.clone(), u32::MAX));
         }
     }
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         for &r in inner.textures.keys() {
-            if !done.insert(r) {
+            if !range_mode && !done.insert(r) {
                 continue;
             }
             // Not made (given up, or never read): nothing to bring up.
@@ -257,17 +282,24 @@ pub(crate) fn uploads(
             if texture.host_written.load(Relaxed) {
                 continue;
             }
-            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
-                && staged.insert(Arc::as_ptr(&staging))
-            {
-                work.push((staging, texture));
+            if let Some(staging) = crate::texture::staging(r as This, &texture.texture) {
+                let mask = if range_mode { inner.requested_mips(r) } else { u32::MAX };
+                // Union across heaps and title aliases before reading once.
+                // Explicit table/copy requests were inserted as full masks.
+                match staged.entry(Arc::as_ptr(&staging)) {
+                    std::collections::hash_map::Entry::Occupied(e) => work[*e.get()].2 |= mask,
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(work.len());
+                        work.push((staging, texture, mask));
+                    }
+                }
             }
         }
     }
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
-    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
+    for ((staging, copy, _), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
         if let Some(upload) = upload {
             readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
             recorded = true;
@@ -358,7 +390,8 @@ pub(crate) fn forget(resource: usize) {
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.textures.remove(&resource).is_some() {
-            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
+            inner.texture_masks.remove(&resource);
+            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r, _) if *r == resource));
         }
     }
 }
@@ -379,7 +412,7 @@ pub(crate) fn log(frames: f64) {
         for seen in inner.slots.values() {
             match seen {
                 Seen::Buffer(..) => buffers += 1,
-                Seen::Texture(_) => textures += 1,
+                Seen::Texture(..) => textures += 1,
                 Seen::Left((k, address, bytes)) => {
                     left[*k] += 1;
                     if *k == 2 {
@@ -426,6 +459,29 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_srv_union_tracks_duplicate_rewrites_and_full_views() {
+        let mut inner = Inner::default();
+        let a = Seen::Texture(11, 0b0011);
+        let b = Seen::Texture(11, 0b1100);
+        let full = Seen::Texture(11, u32::MAX);
+        inner.count(&a, true);
+        inner.count(&a, true);
+        inner.count(&b, true);
+        assert_eq!(inner.requested_mips(11), 0b1111);
+        inner.count(&a, false);
+        assert_eq!(inner.requested_mips(11), 0b1111);
+        inner.count(&a, false);
+        assert_eq!(inner.requested_mips(11), 0b1100);
+        inner.count(&full, true);
+        assert_eq!(inner.requested_mips(11), u32::MAX);
+        inner.count(&full, false);
+        assert_eq!(inner.requested_mips(11), 0b1100);
+        inner.count(&b, false);
+        assert!(inner.textures.is_empty());
+        assert!(inner.texture_masks.is_empty());
+    }
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;

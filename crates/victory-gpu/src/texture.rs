@@ -50,6 +50,8 @@ pub(crate) struct Staging {
     mips: u32,
     /// Title mip corresponding to host level zero.
     first_mip: u32,
+    /// Single-slice RGBA8 sampled textures can defer invisible MIPs.
+    range_capable: bool,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -76,6 +78,55 @@ struct Last {
     span_hashes: SpanHashes,
     // A layout that rejected bounded detiling uses the full-source fallback.
     full_source: bool,
+    /// Dirty MIPs not yet uploaded. Submission-owned staging cannot
+    /// retain their bytes: read the current source when they become visible.
+    pending_mips: u32,
+    full_initialized: bool,
+}
+
+impl Last {
+    fn requested(&self, mips: u32) -> u32 {
+        if self.full_initialized { mips } else { u32::MAX }
+    }
+
+    fn select_mip(&mut self, i: usize, dirty: bool, mips: u32) -> bool {
+        debug_assert!(i < 32);
+        let bit = 1u32 << i;
+        if dirty {
+            self.pending_mips |= bit;
+        }
+        self.pending_mips & self.requested(mips) & bit != 0
+    }
+
+    fn select_uploads(&mut self, count: usize, mips: u32, dirty: &[u32]) -> Vec<u32> {
+        for &i in dirty {
+            debug_assert!((i as usize) < count);
+            self.pending_mips |= 1u32 << i;
+        }
+        let selected = self.pending_mips & self.requested(mips);
+        (0..count as u32).filter(|&i| selected & (1u32 << i) != 0).collect()
+    }
+
+    fn acknowledge(&mut self, copied: &[u32], count: usize) {
+        for &i in copied {
+            self.pending_mips &= !(1u32 << i);
+        }
+        self.full_initialized |= copied.len() == count;
+    }
+}
+
+pub(crate) fn srv_ranges_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SRV_MIP_UPLOADS").as_deref() == Ok("1"))
+}
+
+pub(crate) fn srv_mip_eligible(d: &D3D12_RESOURCE_DESC) -> bool {
+    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.DepthOrArraySize == 1
+        && matches!(d.Format.0, 27..=29)
+        && d.SampleDesc.Count == 1
+        && d.Flags.0 == 0
+        && (1..=32).contains(&d.MipLevels)
 }
 
 type SourceGroups = std::collections::BTreeMap<(usize, usize), Vec<usize>>;
@@ -600,12 +651,14 @@ fn parallel_untracked() -> bool {
 /// Prepare only changed textures; results remain in the original order.
 /// Apply the old fork's bounded worker and chunk policy to the upstream
 /// submission-owned upload buffers. No worker outlives this call.
-pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
+pub(crate) type RefreshWork = (Arc<Staging>, Arc<crate::resource::HostTexture>, u32);
+
+pub(crate) fn refresh_all(work: &[RefreshWork]) -> Vec<Option<Upload>> {
     use std::sync::atomic::Ordering::Relaxed;
-    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
+    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed(work[i].2)).collect();
     let mut out: Vec<Option<Upload>> = vec![None; work.len()];
     if let [i] = changed.as_slice() {
-        out[*i] = work[*i].0.refresh();
+        out[*i] = work[*i].0.refresh(work[*i].2);
         return out;
     }
     let started = std::time::Instant::now();
@@ -620,7 +673,7 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
         };
         let first = &work[changed[at]].0;
         if threads < 2 || (!allow_untracked && first.tracked.is_none()) {
-            let (bytes, upload) = first.refresh_now();
+            let (bytes, upload) = first.refresh_now(work[changed[at]].2);
             read = read.saturating_add(bytes);
             out[changed[at]] = upload;
             at += 1;
@@ -632,10 +685,10 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
             .map(|s| s.layout.size as u64), REFRESH_CHUNK_BYTES, REFRESH_CHUNK_COUNT);
         debug_assert!(n > 0);
         let results = if n == 1 {
-            vec![first.refresh_now()]
+            vec![first.refresh_now(work[changed[at]].2)]
         } else {
-            let jobs = changed[at..at + n].iter().map(|&i| work[i].0.clone()).collect();
-            crate::texture_workers::ordered_map(jobs, threads, |staging: Arc<Staging>| staging.refresh_now_with(true))
+            let jobs = changed[at..at + n].iter().map(|&i| (work[i].0.clone(), work[i].2)).collect();
+            crate::texture_workers::ordered_map(jobs, threads, |(staging, mips): (Arc<Staging>, u32)| staging.refresh_now_with(true, mips))
         };
         for (k, (bytes, upload)) in results.into_iter().enumerate() {
             read = read.saturating_add(bytes);
@@ -652,18 +705,22 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
 impl Staging {
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
-    pub(crate) fn maybe_changed(&self) -> bool {
+    pub(crate) fn maybe_changed(&self, mips: u32) -> bool {
         self.retry.load(std::sync::atomic::Ordering::Relaxed)
             || self.tracked.as_ref().is_none_or(|t| !t.clean())
+            || (self.range_capable && {
+                let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+                !last.full_initialized || last.pending_mips & last.requested(mips) != 0
+            })
     }
 
     /// A staging buffer with the texture memory detiled into it if it
     /// changed since the last time (and is mapped at all), and the
     /// subresources that changed (only those are detiled and to be copied).
-    pub(crate) fn refresh(&self) -> Option<Upload> {
+    pub(crate) fn refresh(&self, mips: u32) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, buffer) = self.refresh_now();
+        let (read, buffer) = self.refresh_now(mips);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -672,11 +729,11 @@ impl Staging {
 
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
-    fn refresh_now(&self) -> (usize, Option<Upload>) {
-        self.refresh_now_with(false)
+    fn refresh_now(&self, mips: u32) -> (usize, Option<Upload>) {
+        self.refresh_now_with(false, mips)
     }
 
-    fn refresh_now_with(&self, checked_untracked: bool) -> (usize, Option<Upload>) {
+    fn refresh_now_with(&self, checked_untracked: bool, mips: u32) -> (usize, Option<Upload>) {
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -685,12 +742,13 @@ impl Staging {
         if let Some(t) = &self.tracked {
             // Most tracked refreshes remain a single clean-bit check.
             use std::sync::atomic::Ordering::Relaxed;
-            let retry = self.retry.load(Relaxed);
-            if t.clean() && !retry {
+            let retry = self.retry.load(Relaxed) || (self.range_capable && !last.full_initialized);
+            let pending = if self.range_capable { last.pending_mips & last.requested(mips) } else { 0 };
+            if t.clean() && !retry && pending == 0 {
                 return (0, None);
             }
             let ranges = t.take(start, start + size);
-            if ranges.is_empty() && !retry {
+            if ranges.is_empty() && !retry && pending == 0 {
                 return (0, None);
             }
             let n = self.footprints.len();
@@ -708,7 +766,9 @@ impl Staging {
             last.hashes.resize(n, None);
             let page = crate::watch::PAGE;
             'groups: for ((a, b), indices) in groups {
-                if !retry && !span_dirty((a, b), start, &ranges) {
+                let dirty_span = span_dirty((a, b), start, &ranges);
+                let pending_span = pending != 0 && indices.iter().any(|&i| i < 32 && pending & (1u32 << i) != 0);
+                if !retry && !dirty_span && !pending_span {
                     continue;
                 }
                 // Only the selected span is read into CPU scratch. Packed
@@ -722,9 +782,11 @@ impl Staging {
                 let whole_page = ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0));
                 let digest = (!whole_page).then(|| blake3::hash(&scratch.0));
                 let changed: Vec<usize> = indices.into_iter().filter(|&i| {
-                    let changed = retry || whole_page || last.hashes[i] != digest;
-                    last.hashes[i] = digest;
-                    changed
+                    let changed = retry || (dirty_span && (whole_page || last.hashes[i] != digest));
+                    if retry || dirty_span || pending_span {
+                        last.hashes[i] = digest;
+                    }
+                    if self.range_capable { last.select_mip(i, changed, mips) } else { changed }
                 }).collect();
                 if changed.is_empty() {
                     continue;
@@ -758,6 +820,9 @@ impl Staging {
             }
             self.retry.store(false, Relaxed);
             fresh.sort_unstable();
+            if self.range_capable {
+                last.acknowledge(&fresh, n);
+            }
             return (bytes, staging.map(|(b, at, _)| (b, at, fresh)));
         }
         if !committed(self.memory, size) {
@@ -777,6 +842,9 @@ impl Staging {
             let every = all();
             let buffer = self.detile(&zeros, &every);
             last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
+            if self.range_capable && buffer.is_some() {
+                last.acknowledge(&every, self.footprints.len());
+            }
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
         if checked_untracked {
@@ -784,24 +852,34 @@ impl Staging {
             // reads, using this integration's bounded RAII scratch pool.
             let mut snapshot = Scratch::take(size);
             if crate::host::read_into(self.memory, &mut snapshot.0) {
-                return self.refresh_untracked(last, &snapshot.0);
+                return self.refresh_untracked(last, &snapshot.0, mips);
             }
             return (0, None);
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        self.refresh_untracked(last, tiled)
+        self.refresh_untracked(last, tiled, mips)
     }
 
-    fn refresh_untracked(&self, last: &mut Last, tiled: &[u8]) -> (usize, Option<Upload>) {
+    fn refresh_untracked(&self, last: &mut Last, tiled: &[u8], mips: u32) -> (usize, Option<Upload>) {
         static PARTIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let partial = *PARTIAL.get_or_init(|| std::env::var("VICTORY_PARTIAL_UNTRACKED_UPLOADS").as_deref() == Ok("1"));
         let size = tiled.len();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        let count = self.footprints.len();
         if last.hash == Some(hash) {
-            return (size, None);
+            if !self.range_capable || last.pending_mips & last.requested(mips) == 0 {
+                return (size, None);
+            }
+            // Clean source but a newly visible MIP is still pending.
+            let fresh = last.select_uploads(count, mips, &[]);
+            let buffer = self.detile(tiled, &fresh);
+            if buffer.is_some() {
+                last.acknowledge(&fresh, count);
+            }
+            return (size, buffer.map(|(b, at)| (b, at, fresh)));
         }
         // 2c9e2a13: retain the whole-image digest, but skip detiling and
         // GPU copies for source spans whose contents did not change.
@@ -809,6 +887,11 @@ impl Staging {
             && let Some(groups) = source_groups(&self.spans, self.footprints.len(), size)
         {
             let (next, fresh) = changed_source_spans(&groups, &last.span_hashes, tiled);
+            let fresh = if self.range_capable {
+                last.select_uploads(count, mips, &fresh)
+            } else {
+                fresh
+            };
             if fresh.is_empty() {
                 last.hash = Some(hash);
                 last.span_hashes = next;
@@ -818,6 +901,9 @@ impl Staging {
             if buffer.is_some() {
                 last.hash = Some(hash);
                 last.span_hashes = next;
+                if self.range_capable {
+                    last.acknowledge(&fresh, count);
+                }
             } else {
                 // The upstream staging allocation is per submission. On a
                 // failure retry all retained spans and publish no upload.
@@ -829,12 +915,20 @@ impl Staging {
             return (size, buffer.map(|(b, at)| (b, at, fresh)));
         }
         last.span_hashes.clear();
-        let every: Vec<u32> = (0..self.footprints.len() as u32).collect();
-        let buffer = self.detile(tiled, &every);
+        let every: Vec<u32> = (0..count as u32).collect();
+        let fresh = if self.range_capable { last.select_uploads(count, mips, &every) } else { every };
+        if fresh.is_empty() {
+            last.hash = Some(hash);
+            return (size, None);
+        }
+        let buffer = self.detile(tiled, &fresh);
         last.hash = buffer.is_some().then_some(hash);
+        if self.range_capable && buffer.is_some() {
+            last.acknowledge(&fresh, count);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, buffer.map(|(b, at)| (b, at, every)))
+        (size, buffer.map(|(b, at)| (b, at, fresh)))
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
@@ -1003,6 +1097,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         layout,
         mips: u32::from(d.MipLevels),
         first_mip,
+        range_capable: srv_ranges_enabled() && srv_mip_eligible(&d),
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         spans,
@@ -1018,6 +1113,29 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn srv_mip_uploads_initialize_all_then_preserve_unseen_pending_levels() {
+        let mut last = Last::default();
+        let initial = last.select_uploads(4, 1 << 3, &[0, 1, 2, 3]);
+        assert_eq!(initial, [0, 1, 2, 3]);
+        last.acknowledge(&initial, 4);
+        assert!(last.full_initialized);
+        assert!(!last.select_mip(0, true, 0b1100));
+        assert!(last.select_mip(2, true, 0b1100));
+        assert!(last.select_mip(3, true, 0b1100));
+        let tail = last.select_uploads(4, 0b1100, &[]);
+        assert_eq!(tail, [2, 3]);
+        // A failed preparation consumes no pending levels.
+        assert_eq!(last.select_uploads(4, 0b1100, &[]), tail);
+        last.acknowledge(&tail, 4);
+        assert_eq!(last.pending_mips, 1);
+        assert!(last.select_uploads(4, 0b1100, &[]).is_empty());
+        assert_eq!(last.select_uploads(4, 1, &[]), [0]);
+        assert_eq!(last.select_uploads(4, u32::MAX, &[]), [0]);
+        last.acknowledge(&[0], 4);
+        assert_eq!(last.pending_mips, 0);
+    }
 
     #[test]
     fn refresh_chunks_bound_temporary_reads_without_dropping_large_textures() {
