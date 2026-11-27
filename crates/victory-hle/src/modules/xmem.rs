@@ -1325,17 +1325,14 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>, threads: usize) -> bool {
                 physical.holes.remove(&op.at);
                 op.prior = Some(slice);
             }
-            // Part of a larger view.
-            Some(_) => {
-                // The source cuts the larger view here, on the caller.
-                // Unlike the reference's void unmap, do not schedule
-                // this page after a failed cut or surviving-view remap.
-                if !unmap_with(physical, op.at, PAGE, lean()) {
-                    ok = false;
-                    return false;
-                }
+            // Part of a larger view: cut it here, on the caller.
+            // The guard calls unmap_with only for the larger-view arm;
+            // a successful cut continues to prepare the page below.
+            Some(_) if !unmap_with(physical, op.at, PAGE, lean()) => {
+                ok = false;
+                return false;
             }
-            None => {}
+            Some(_) | None => {}
         }
         if op.prior.is_none() {
             let own = physical.holes.remove(&op.at) == Some(PAGE) && lean();
