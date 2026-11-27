@@ -936,6 +936,61 @@ fn relay_merge_does_not_copy_title_only_changes_into_held() {
     assert_eq!(held, [8, 1, 2, 3]);
 }
 
+/// Source land::for_pages: split the exact changed intervals where
+/// a guarded title block ends. The source walks kernel 4 KiB pages,
+/// but this branch protects/tracks the console's 64 KiB blocks.
+/// The input is in changed_runs order (offset, length); never include
+/// an equal or excluded byte in the actual write.
+fn landing_page_runs(title: usize, runs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for &(from, len) in runs {
+        let to = from.checked_add(len).expect("valid changed interval");
+        let mut at = from;
+        while at < to {
+            let address = title.checked_add(at).expect("valid title interval");
+            let n = (PAGE - address % PAGE).min(to - at);
+            out.push((at, n));
+            at += n;
+        }
+    }
+    out
+}
+
+/// Adapt source land::piece_at's direct (not beside) path: open only
+/// blocks with changed bytes, once per block. This branch's writing
+/// lease marks/saves every alias before opening its guards and keeps
+/// them dirty through the mapped writes. Keep the original order,
+/// and do not use an untracked alternate view or a journal clean-skip.
+fn write_landed_runs(title: usize, bytes: &[u8], runs: &[(usize, usize)]) -> usize {
+    assert!(title.checked_add(bytes.len()).is_some());
+    let runs = landing_page_runs(title, runs);
+    let mut written = 0;
+    for block in runs.chunk_by(|a, b| (title + a.0) / PAGE == (title + b.0) / PAGE) {
+        let first = block[0].0;
+        let (last, n) = block[block.len() - 1];
+        let end = last + n;
+        assert!(end <= bytes.len());
+        // Source opens the protection before a piece's changed runs.
+        // Keep one RAII write lease through ALL exact writes in this
+        // block. In particular, don't save an alias after our own
+        // first byte has already landed.
+        let _writing = crate::watch::writing(title + first, end - first);
+        for &(off, len) in block {
+            crate::host::write_mapped((title + off) as *mut u8, bytes[off..].as_ptr(), len);
+            written += len;
+        }
+    }
+    written
+}
+
+#[test]
+fn landing_runs_split_at_guard_boundaries_without_filling_holes() {
+    let runs = [(0, 1), (3, 5), (PAGE + 2, 0), (PAGE + 5, 2)];
+    let title = PAGE - 5;
+    assert_eq!(landing_page_runs(title, &runs),
+        [(0, 1), (3, 2), (5, 3), (PAGE + 5, 2)]);
+}
+
 /// Opt in to the reference's selective copy-back; the existing full-piece
 /// path remains the default until game/hardware regression tests pass.
 fn exact_back() -> bool {
@@ -1209,13 +1264,7 @@ impl Shadow {
         // API. Never use the full-piece fallback across excluded bytes.
         // Leave title-only changes dirty for a later refresh, as source
         // relay does; do not call card_changed or Tracked::taken here.
-        let mut written = 0;
-        for (off, len) in changed_runs(title, &was) {
-            let _writing = crate::watch::writing(address + off, len);
-            crate::host::write_mapped((address + off) as *mut u8, title[off..].as_ptr(), len);
-            written += len;
-        }
-        written
+        write_landed_runs(address, title, &changed_runs(title, &was))
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -1494,6 +1543,10 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+        self.copy_back_marked_with(page, exact_back())
+    }
+
+    fn copy_back_marked_with(&self, page: usize, exact: bool) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -1517,6 +1570,7 @@ impl Shadow {
         if !crate::host::read_into(from as *const u8, &mut title) {
             return 0;
         }
+        let original = exact.then(|| title.clone());
         let written = match &saved {
             // The title's bytes are the copy's from before: what differs is
             // the shaders'.
@@ -1528,15 +1582,31 @@ impl Shadow {
                 changed.then_some(title.as_ptr())
             }
         };
-        if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
-        }
-        // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
+        let written = if let Some(bytes) = written {
+            if let Some(original) = original {
+                // The source direct landing changes only bytes that
+                // differ. Keep the existing saved-page merge, but do
+                // not overwrite equal bytes with a stale CPU read.
+                // The pointer above names host (no saved page) or
+                // title (merged saved page); both slices still live.
+                // SAFETY: it points to one of those n-byte slices.
+                let merged = unsafe { std::slice::from_raw_parts(bytes, n) };
+                write_landed_runs(from, merged, &changed_runs(merged, &original))
+            } else {
+                let _writing = crate::watch::writing(from, n);
+                crate::host::write_mapped(from as *mut u8, bytes, n);
+                n
+            }
+        } else {
+            0
+        };
+        // A selective write can leave other bytes changed by the title
+        // while the guard was open. As in exact waited copy-back, don't
+        // claim that whole block current after a selective landing.
+        if from == page && to == page + PAGE && (!exact || written == 0) {
             t.taken(&[page / PAGE]);
         }
-        written.map_or(0, |_| n)
+        written
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -2899,6 +2969,59 @@ pub(crate) mod tests {
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// Source direct landing must preserve the guard snapshots of
+    /// physical aliases and leave a completely unchanged block clean.
+    /// This test does not require a GPU adapter.
+    #[test]
+    fn landed_runs_preserve_alias_snapshots_and_untouched_pages() {
+        let (a, b) = crate::watch::tests::twin_views(3);
+        let tracked = crate::watch::track(a, 3 * PAGE, true).expect("tracked physical views");
+        assert_eq!(tracked.take(a, a + 3 * PAGE), [(a, a + 3 * PAGE)]);
+        tracked.arm(a, a + 3 * PAGE);
+        let mut bytes = vec![0; 2 * PAGE];
+        bytes[3] = 0x11;
+        bytes[PAGE - 1] = 0x22;
+        bytes[PAGE] = 0x33;
+        bytes[PAGE + 19] = 0x44;
+        let original = vec![0; bytes.len()];
+        assert_eq!(write_landed_runs(b, &bytes, &changed_runs(&bytes, &original)), 4);
+        // SAFETY: both live mapped aliases show the same section.
+        let read = |off: usize| unsafe { ((a + off) as *const u8).read_volatile() };
+        assert_eq!([read(3), read(PAGE - 1), read(PAGE), read(PAGE + 19)],
+            [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(read(4), 0);
+        assert!(tracked.changed(a / PAGE));
+        assert!(tracked.changed(a / PAGE + 1));
+        assert!(!tracked.changed(a / PAGE + 2));
+        assert_eq!(tracked.saved(a / PAGE).expect("old alias page")[3], 0);
+        assert_eq!(tracked.saved(a / PAGE + 1).expect("old alias page")[19], 0);
+        assert!(tracked.saved(a / PAGE + 2).is_none());
+    }
+
+    /// A marked-page landing must keep CPU-only bytes, issue only the
+    /// GPU-changed runs, and not treat the whole page as clean afterward.
+    #[test]
+    #[ignore = "requires D3D12 adapter; run alone"]
+    fn exact_marked_landing_preserves_title_only_changes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).expect("registered copy");
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + 30) as u64, &[0xbb]);
+        // SAFETY: a byte of the test's live tracked pool.
+        unsafe { ((p + 20) as *mut u8).write_volatile(0x11) };
+        assert_eq!(copy.copy_back_marked_with(p, true), 2);
+        // SAFETY: bytes of the test's live tracked pool.
+        let read = |off: usize| unsafe { ((p + off) as *const u8).read_volatile() };
+        assert_eq!([read(10), read(20), read(30)], [0xaa, 0x11, 0xbb]);
+        assert!(copy.tracked.as_ref().unwrap().changed(p / PAGE));
+        copy.copy_back_done(p, len);
         unregister(p, p as u64);
     }
 

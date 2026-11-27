@@ -442,6 +442,18 @@ serial landing. Each call preserves the existing dirty/sent
 exclusions. Batches with any picked relay range still merge in
 the original order: title-memory writes may alias through the
 current guard tracker and are not safe to parallelize here.
+The source land::for_pages / piece_at direct path is also adapted
+for those serial landings: split exact changed runs at this branch's
+64 KiB guarded-block boundaries and retain one existing writing
+lease per changed block. Alias snapshots are saved before opening
+the guard; untouched blocks are not opened and no excluded bytes
+are written. The marked-page path uses the same exact writes with
+`VICTORY_EXACT_BACK=1`, preserving its saved-page merge and keeping
+changed blocks dirty for the next refresh instead of claiming they
+are fully synchronized. Run the ignored
+`exact_marked_landing_preserves_title_only_changes` adapter test.
+The reference's alternate-view journal path and concurrent title
+merges are still not enabled.
 Run the ignored `parallel_staging_landing_preserves_pending_cpu_bytes`
 test with the send-order and landing options. No GPU compare
 coverage or submission waits are removed.
