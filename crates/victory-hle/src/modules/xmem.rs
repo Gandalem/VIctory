@@ -1061,9 +1061,10 @@ thread_local! {
 /// Cuts `[base, base + len)` out of the placeholder it is in (which fails
 /// harmlessly when the range is the whole placeholder).
 fn split(base: usize, len: usize) {
-    // SAFETY: acts only on a placeholder.
     #[cfg(test)]
     MAP_SPLITS.with(|n| n.set(n.get() + 1));
+    // SAFETY: MEM_PRESERVE_PLACEHOLDER releases only the specified part
+    // of an existing placeholder; failure leaves the mapping path to retry.
     unsafe {
         VirtualFree(
             base as *mut c_void,
