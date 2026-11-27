@@ -617,6 +617,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn memory_pressure_caps_only_idle_command_scratch() {
+        assert_eq!(idle_scratch_budget(4 << 20, false), 4 << 20);
+        assert_eq!(idle_scratch_budget(4 << 20, true), 256 << 10);
+        assert_eq!(idle_scratch_budget(64 << 10, true), 64 << 10);
+        assert_eq!(idle_scratch_budget(0, true), 0);
+    }
+
+    #[test]
+    fn idle_scratch_retention_keeps_only_a_bounded_prefix() {
+        let sizes = [64 << 10, 128 << 10, 256 << 10, 4 << 20];
+        assert_eq!(scratch_prefix_to_keep(sizes, 0), 0);
+        assert_eq!(scratch_prefix_to_keep(sizes, 192 << 10), 2);
+        assert_eq!(scratch_prefix_to_keep(sizes, 4 << 20), 3);
+        assert_eq!(scratch_prefix_to_keep(sizes, 8 << 20), 4);
+    }
+
+    #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
         let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
@@ -958,6 +975,36 @@ unsafe impl Send for Scratch {}
 const SCRATCH_CHUNK: u64 = 4 << 20;
 const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
 
+/// Retain only this many bytes of scratch chunks per idle command list.
+fn scratch_keep_bytes() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let configured = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_SCRATCH_KEEP_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(4)
+            .min(64) << 20
+    });
+    idle_scratch_budget(configured, crate::shadow::memory_pressured())
+}
+
+fn idle_scratch_budget(configured: u64, pressure: bool) -> u64 {
+    if pressure { configured.min(256 << 10) } else { configured }
+}
+
+/// Keep a prefix so allocation order and the growth strategy are preserved.
+fn scratch_prefix_to_keep(sizes: impl IntoIterator<Item = u64>, mut remaining: u64) -> usize {
+    let mut count = 0;
+    for size in sizes {
+        if size > remaining {
+            break;
+        }
+        remaining -= size;
+        count += 1;
+    }
+    count
+}
+
 struct ScratchChunk {
     _buffer: ID3D12Resource,
     mapped: usize,
@@ -1157,6 +1204,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::shadow::maintain_snapshot_pool();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1801,6 +1849,15 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
+        } else {
+            // The preceding submission has finished and Reset released the
+            // previous recording. No in-flight upload is reclaimed here.
+            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            let keep = scratch_prefix_to_keep(
+                scratch.chunks.iter().map(|chunk| chunk.capacity),
+                scratch_keep_bytes(),
+            );
+            scratch.chunks.truncate(keep);
         }
     }
 
@@ -2398,12 +2455,85 @@ impl HostList {
 /// GPU).
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, RefreshRanges)>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Exact ranges brought up to date since the last title write, by
+    /// copy (held, so that its address names no other).
+    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges)>,
+}
+
+/// Sorted, disjoint, half-open byte intervals. Join only ranges that touch
+/// or overlap, not the unused bytes between two views of a large buffer.
+/// Adapted from the joined/outside range approach in cool_fox f4b48ad
+/// and victory-nvidia-8gb c09a44e. The tree bounds lookup cost even when
+/// a submission declares many unrelated ranges.
+#[derive(Default)]
+struct RefreshRanges(std::collections::BTreeMap<usize, usize>);
+
+impl RefreshRanges {
+    fn covers(&self, from: usize, to: usize) -> bool {
+        from >= to || self.0.range(..=from).next_back().is_some_and(|(_, &end)| end >= to)
+    }
+
+    fn insert(&mut self, mut from: usize, mut to: usize) {
+        if self.covers(from, to) {
+            return;
+        }
+        if let Some((&a, &b)) = self.0.range(..=from).next_back()
+            && b >= from
+        {
+            from = a;
+            to = to.max(b);
+            self.0.remove(&a);
+        }
+        while let Some((&a, &b)) = self.0.range(from..=to).next() {
+            to = to.max(b);
+            self.0.remove(&a);
+        }
+        self.0.insert(from, to);
+    }
+
+    fn missing(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        if self.covers(from, to) {
+            return Vec::new();
+        }
+        let mut at = from;
+        let mut out = Vec::new();
+        if let Some((_, &end)) = self.0.range(..=from).next_back() {
+            at = at.max(end.min(to));
+        }
+        for (&a, &b) in self.0.range(from..to) {
+            if a > at {
+                out.push((at, a));
+            }
+            at = at.max(b.min(to));
+            if at >= to {
+                break;
+            }
+        }
+        if at < to {
+            out.push((at, to));
+        }
+        out
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn gap_bytes(&self) -> u64 {
+        let Some((&first, _)) = self.0.first_key_value() else { return 0 };
+        let Some((_, &last)) = self.0.last_key_value() else { return 0 };
+        let covered: usize = self.0.iter().map(|(&a, &b)| b - a).sum();
+        (last - first - covered) as u64
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static REFRESH_SAVINGS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_refresh_savings() -> [u64; 2] {
+    REFRESH_SAVINGS.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
 }
 
 impl Batch {
@@ -2413,18 +2543,23 @@ impl Batch {
         if shadow.clean() {
             return;
         }
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        let Some(end) = address.checked_add(len) else { return };
+        if len == 0 {
+            return;
+        }
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if self.current.get(&key).is_some_and(|(_, ranges)| ranges.covers(address, end)) {
+            #[cfg(feature = "diagnostics")]
+            REFRESH_SAVINGS[1].fetch_add(len as u64, Ordering::Relaxed);
             return;
         }
         match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
+            Some(&i) => self.refreshes[i].1.insert(address, end),
             None => {
+                let mut ranges = RefreshRanges::default();
+                ranges.insert(address, end);
                 self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), ranges));
             }
         }
     }
@@ -2442,23 +2577,32 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
+        for (shadow, ranges) in self.refreshes.drain(..) {
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
+            REFRESH_SAVINGS[0].fetch_add(ranges.gap_bytes(), Ordering::Relaxed);
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+            let (_, current) = self.current.entry(key)
+                .or_insert_with(|| (shadow.clone(), RefreshRanges::default()));
+            for (from, to) in ranges.0 {
+                // A previous flush may already have copied part of this
+                // view. Never refresh that part again until title_written.
+                let missing = current.missing(from, to);
+                #[cfg(feature = "diagnostics")]
+                {
+                    let bytes: usize = missing.iter().map(|&(a, b)| b - a).sum();
+                    REFRESH_SAVINGS[1].fetch_add((to - from - bytes) as u64, Ordering::Relaxed);
+                }
+                for (a, b) in missing {
+                    let started = std::time::Instant::now();
+                    let copied = shadow.update(a, b - a);
+                    let us = started.elapsed().as_micros() as u64;
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::range(a, b - a, us, 0);
+                    PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                    total += copied;
+                    current.insert(a, b);
+                }
             }
         }
         total
@@ -3926,6 +4070,66 @@ fn pump() {
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
     use super::Batch;
+
+    #[test]
+    fn refresh_ranges_join_only_touching_and_subtract_covered_bytes() {
+        let mut ranges = super::RefreshRanges::default();
+        for (a, b) in [(100, 200), (300, 400), (50, 80), (150, 250), (250, 275), (300, 350), (80, 100), (500, 500)] {
+            ranges.insert(a, b);
+        }
+        assert_eq!(ranges.0.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(50, 275), (300, 400)]);
+        assert_eq!(ranges.missing(0, 500), vec![(0, 50), (275, 300), (400, 500)]);
+        assert_eq!(ranges.missing(200, 320), vec![(275, 300)]);
+        assert!(ranges.missing(70, 90).is_empty());
+        assert!(ranges.missing(5, 5).is_empty());
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(ranges.gap_bytes(), 25);
+        ranges.insert(275, 300);
+        assert!(ranges.covers(50, 400));
+    }
+
+    #[test]
+    fn disjoint_buffer_reads_leave_the_gap_unrefreshed_until_requested() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(8);
+        let len = 8 * PAGE;
+        // SAFETY: the test owns this mapped pool.
+        unsafe {
+            (p as *mut u32).write_volatile(11);
+            ((p + 3 * PAGE) as *mut u32).write_volatile(22);
+            ((p + 7 * PAGE) as *mut u32).write_volatile(33);
+        }
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return;
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE);
+        batch.add(&copy, p + 7 * PAGE, PAGE);
+        assert_eq!(batch.flush(), 2 * PAGE, "only the two declared pages");
+        assert_eq!(copy.read_host(p as u64, 1)[0], 11);
+        assert_eq!(copy.read_host((p + 7 * PAGE) as u64, 1)[0], 33);
+        batch.add(&copy, p, 4 * PAGE);
+        assert_eq!(batch.flush(), 3 * PAGE, "subtract the already refreshed first page");
+        assert_eq!(copy.read_host((p + 3 * PAGE) as u64, 1)[0], 22);
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), 3 * PAGE, "fill only the remaining gap");
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), 0);
+        // SAFETY: the test's tracked pool; the next title write invalidates
+        // the per-submission range cache.
+        unsafe { ((p + 3 * PAGE) as *mut u32).write_volatile(44) };
+        batch.title_written();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), PAGE);
+        assert_eq!(copy.read_host((p + 3 * PAGE) as u64, 1)[0], 44);
+        crate::shadow::unregister(p, p as u64);
+        drop(batch);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again

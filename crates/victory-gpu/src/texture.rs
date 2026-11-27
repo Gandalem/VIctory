@@ -705,33 +705,21 @@ impl Staging {
     }
 }
 
-/// A buffer for the title memory a refresh reads, kept by the thread for
-/// its next refresh: a fresh one for each texture cost a zero-fill and a
-/// page fault per 4 KiB (129,000 faults in a frame, run placed1).
+/// A temporary read buffer from the bounded shared CPU pool. The active
+/// read remains owned by this refresh until detiling finishes.
 struct Scratch(Vec<u8>);
 
-thread_local! {
-    static SCRATCH: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
-}
-
 impl Scratch {
-    /// The thread's buffer, at least `size` bytes.
     fn take(size: usize) -> Self {
-        let mut v = SCRATCH.take();
-        if v.len() < size {
-            v.resize(size, 0);
-        }
+        let mut v = crate::shadow::pooled(size);
+        v.resize(size, 0);
         Scratch(v)
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        // The largest textures' buffers are not kept.
-        const KEEP: usize = 32 << 20;
-        if self.0.len() <= KEEP {
-            SCRATCH.set(std::mem::take(&mut self.0));
-        }
+        crate::shadow::give_back(std::mem::take(&mut self.0));
     }
 }
 

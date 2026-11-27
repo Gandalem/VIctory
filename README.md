@@ -194,6 +194,65 @@ This follows the heap capacity and cache-key design in
 [DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox/tree/f4b48ad766ddbec1a1867022cd42f7645b0dd55e),
 adapted to the earlier runtime.
 
+## Memory retention (experimental)
+
+The idle CPU buffer cache (snapshots and temporary texture detiling reads)
+is bounded by installed RAM, available physical RAM, and available commit.
+It is checked at most once per second during submissions or cache use; the default ceiling is 2048 MiB and the normal budget on a 32 GiB
+system is at most 512 MiB. Below 1 GiB available physical RAM or commit, idle
+snapshots are released. `VICTORY_SNAPSHOT_POOL_MB` overrides the ceiling
+(0–2048 MiB, 0 disables idle retention). It does not limit live snapshots
+or active temporary reads.
+
+Under pressure (physical RAM available <= 3 GiB or available commit
+<= 4 GiB), idle CPU storage is capped at 64 MiB; normal retention resumes
+when physical RAM reaches 5 GiB and commit headroom reaches 6 GiB.
+Below 1 GiB of either reserve, the idle budget is still zero. Failed OS
+memory samples retain the last successful observation. This adapts
+[cool_fox residency](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/residency.rs).
+
+After a completed command list is reset, retained scratch chunks are capped
+at 4 MiB per list (`VICTORY_SCRATCH_KEEP_MB`, 0–64 MiB), further capped at
+256 KiB during pressure. Temporary tiled texture reads reuse the bounded
+CPU pool rather than retaining a full allocation per worker.
+Active uploads and resources referenced by GPU work are not reclaimed.
+No required texture uploads are intentionally skipped.
+
+Diagnostics report a `memory cache census` with working set, private commit,
+physical and commit headroom, pressure state, idle CPU buffer bytes/budget,
+and the count/logical size of loose shadows. The
+logical shadow sizes are not measurements of physical RAM or VRAM residency.
+This change does not yet reclaim loose shadows: they may be referenced by
+persistent descriptors and page tables. Validate on identical synthetic or
+legally supplied workloads before drawing performance conclusions.
+
+The pressure-aware retention policy is informed by the RAM cache pressure
+handling in [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)
+(commit `c09a44e97df4170ef0caa8cc236f7cb46fd1ce90`), with independent changes to
+this repository's older snapshot and scratch implementations.
+
+## Exact buffer refresh and completed-submission merge
+
+Within a submission, refreshes now maintain disjoint byte intervals per
+host buffer. Overlapping or adjacent views join; unrelated views do not
+cause the bytes between them to be refreshed. Subsequent flushes subtract
+the already refreshed intervals until a title-memory write invalidates
+them. This uses the joined/outside range approach of
+[cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/shadow.rs)
+and [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb/blob/c09a44e97df4170ef0caa8cc236f7cb46fd1ce90/crates/victory-gpu/src/shadow.rs),
+adapted to synchronous submissions.
+
+Copy-back still waits for GPU completion and preserves concurrent title
+writes using the original bytewise merge rule. Equal blocks are skipped,
+unmixed blocks copied in bulk, and mixed blocks merged byte by byte.
+Temporary CPU read buffers reuse the bounded pool and are allocated only
+when needed. The mapped-memory checks and write tracking are unchanged.
+
+Diagnostics report the logical refresh gap and already-covered bytes
+avoided since the last report. These counters are not physical PCIe
+transfer measurements. No new GPU-local mirror, shared-heap mapping,
+or asynchronous submission lifetime is introduced here.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
