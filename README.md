@@ -347,8 +347,16 @@ pairs. Every snapshot survives its checked sync fence, then returns to
 a bounded 128 MiB idle pool. A 512 MiB active allocation ceiling, memory
 pressure or allocation/pipeline failure falls back to existing synchronous
 staging copies. This separates ownership for future relay work; no
-concurrent title submissions, send-generation merging or BAR allocation
-are enabled. Run the ignored
+concurrent title submissions or BAR allocation are enabled.
+Experimental `VICTORY_CARD_SEND_ORDER=1` ports the source's SentRuns
+and outside-range logic: taking dirty intervals records them against
+the upcoming sync fence; readback landing excludes unsent intervals
+and sends newer than the fetch fence. Previous entries retire when
+the next serial submission has consumed all older fetches. This
+protects the CPU staging mirror, not an independent asynchronous
+title-memory merge. Concurrent relay needs a different retirement
+watermark and mapping/snapshot ownership before it can be enabled.
+The default remains the existing serial landing path. Run the ignored
 `owned_card_send_keeps_original_bytes_after_staging_changes` test with
 the card-buffer options and `VICTORY_SEND_OWN=1` on a real adapter.
 Run the ignored `card_check_tail_shares_title_fence` test on an adapter

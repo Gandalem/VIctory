@@ -998,9 +998,13 @@ impl Host {
     /// Adapt the source card_before: copy CPU-dirty ranges, then hash the
     /// joined pieces on the device before the title's lists execute.
     pub(super) fn card_before(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>], submitted: &mut u64) {
+        // The previous fence completed, and serial execution consumed
+        // every earlier readback. The next sync list signals sent_as.
+        let retired = *submitted;
+        let sent_as = retired.checked_add(1).expect("card send fence exhausted");
         let dirty: Vec<card_send::Dirty<'_>> = copies.iter().filter_map(|shadow| {
             let card = shadow.card()?;
-            let ranges = card.take_dirty();
+            let ranges = card.take_dirty(sent_as, retired);
             (!ranges.is_empty()).then_some((shadow, card, ranges))
         }).collect();
         if dirty.is_empty() {
@@ -1059,6 +1063,7 @@ impl Host {
             compare_barrier(&list.list);
         }
         self.run_card_list(CardPhase::Sync, list, submitted);
+        debug_assert_eq!(*submitted, sent_as);
         if let Some(own) = own {
             own.give_back();
         }
@@ -1172,13 +1177,17 @@ impl Host {
                 }
             }
             self.run_card_list(CardPhase::Fetch, list, submitted);
+            // The completed fetch fence orders these bytes relative to
+            // every send. No earlier in-flight fetch can land afterwards
+            // until the serial submission contract is deliberately changed.
+            let fetched_after = *submitted;
             for piece in batch {
                 // SAFETY: the checked readback fence completed; this
                 // owner pins its mapping and the submission lock keeps
                 // the pool contents stable until the next batch.
                 let bytes = unsafe { std::slice::from_raw_parts(
                     (pool.data as *const u8).add(piece.at as usize), piece.hi - piece.lo) };
-                copies[piece.copy].land_card(piece.lo, bytes);
+                copies[piece.copy].land_card(piece.lo, bytes, fetched_after);
             }
         }
     }

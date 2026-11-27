@@ -172,7 +172,7 @@ pub(crate) struct Card {
     pub(crate) staging: ID3D12Resource,
     pub(crate) work: crate::host::card_compare::CardWork,
     pub(crate) size: u64,
-    dirty: Mutex<Vec<(usize, usize)>>,
+    dirty: Mutex<CardDirty>,
     _lease: CardLease,
 }
 
@@ -190,6 +190,153 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     out
 }
 
+/// Reference send generation accounting. Dirty and sent ranges share a
+/// lock in this branch so draining dirty ranges and recording the queue
+/// generation cannot become separate operations. Still requires the
+/// enclosing submission lock for access to the CPU-side mapping.
+#[derive(Default)]
+struct CardDirty {
+    ranges: Vec<(usize, usize)>,
+    sent: SentRuns,
+}
+
+fn card_send_order() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SEND_ORDER").is_some_and(|v| v == "1"))
+}
+
+/// What went up, by send: its number, and the offsets, in order and joined
+/// (a refresh sends thousands of runs of a few words).
+#[derive(Default)]
+struct SentRuns(Vec<(u64, Vec<(usize, usize)>)>);
+
+impl SentRuns {
+    #[cfg(test)]
+    fn note(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
+        self.note_joined(number, joined(ranges));
+    }
+
+    /// `ranges` are in order and joined.
+    fn note_joined(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
+        if ranges.is_empty() {
+            return;
+        }
+        match self.0.iter_mut().find(|s| s.0 == number) {
+            Some((_, all)) => *all = joined([std::mem::take(all), ranges].concat()),
+            None => self.0.push((number, ranges)),
+        }
+    }
+
+    /// Sends up to `number` are of no use any more.
+    fn forget(&mut self, number: u64) {
+        self.0.retain(|s| s.0 > number);
+    }
+
+    /// Adds to `out` what sends after `number` took of `[from, to)`.
+    fn near(&self, number: u64, from: usize, to: usize, out: &mut Vec<(usize, usize)>) {
+        for (_, ranges) in self.0.iter().filter(|s| s.0 > number) {
+            let first = ranges.partition_point(|r| r.1 <= from);
+            out.extend(ranges[first..].iter().take_while(|r| r.0 < to).copied());
+        }
+    }
+
+    #[cfg(test)]
+    fn of(all: &[(usize, usize, u64)]) -> SentRuns {
+        let mut sent = SentRuns::default();
+        for &(a, b, number) in all {
+            sent.note(number, vec![(a, b)]);
+        }
+        sent
+    }
+}
+
+
+/// `[from, to)` without the ranges of `skip`, in order.
+fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    skip.sort_unstable();
+    let mut out = Vec::new();
+    let mut at = from;
+    for (a, b) in skip {
+        if b <= at {
+            continue;
+        }
+        if a >= to {
+            break;
+        }
+        if a > at {
+            out.push((at, a));
+        }
+        at = at.max(b);
+    }
+    if at < to {
+        out.push((at, to));
+    }
+    out
+}
+
+impl CardDirty {
+    fn take(&mut self, number: u64, retired: u64, track: bool) -> Vec<(usize, usize)> {
+        let ranges = joined(std::mem::take(&mut self.ranges));
+        if track {
+            // Every fetch using retired or older generations has been
+            // consumed under the current serial submission contract.
+            self.sent.forget(retired);
+            self.sent.note_joined(number, ranges.clone());
+        }
+        ranges
+    }
+
+    /// As in the source's land_card, exclude unsent CPU bytes and bytes
+    /// sent after the captured readback. Endpoints are copy-relative.
+    fn landing_parts(&self, fetched_after: u64, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut skip: Vec<_> = self.ranges.iter().copied()
+            .filter(|&(a, b)| a < to && b > from).collect();
+        self.sent.near(fetched_after, from, to, &mut skip);
+        outside(from, to, skip)
+    }
+}
+
+#[test]
+fn sent_runs_preserve_newer_and_unsent_bytes() {
+    let mut dirty = CardDirty {
+        ranges: vec![(14, 18), (23, 25), (0, 2)],
+        sent: SentRuns::of(&[(4, 9, 3), (6, 12, 5), (11, 16, 6), (20, 22, 5)]),
+    };
+    // A fetch after send 4 must not overwrite a later send or unsent
+    // bytes, but earlier sends do not block it.
+    assert_eq!(dirty.landing_parts(4, 0, 24), [(2, 6), (18, 20), (22, 23)]);
+    let mut staging = [7u8; 24];
+    let old_gpu = [1u8; 24];
+    for (lo, hi) in dirty.landing_parts(4, 0, 24) {
+        staging[lo..hi].copy_from_slice(&old_gpu[lo..hi]);
+    }
+    for (i, &byte) in staging.iter().enumerate() {
+        assert_eq!(byte, if (2..6).contains(&i) || (18..20).contains(&i) || i == 22 { 1 } else { 7 });
+    }
+    assert_eq!(dirty.take(7, 4, true), [(0, 2), (14, 18), (23, 25)]);
+    assert!(dirty.ranges.is_empty());
+    assert_eq!(dirty.landing_parts(4, 0, 24), [(2, 6), (18, 20), (22, 23)]);
+    assert_eq!(dirty.landing_parts(7, 0, 24), [(0, 24)]);
+    assert!(dirty.take(8, 7, true).is_empty());
+    assert!(dirty.sent.0.is_empty());
+}
+
+#[test]
+fn sent_runs_join_same_generation_and_clip_overlap() {
+    let mut sent = SentRuns::default();
+    sent.note(5, vec![(5, 8), (0, 2)]);
+    sent.note(5, vec![(2, 5), (12, 18)]);
+    sent.note(4, vec![(8, 12)]);
+    let mut skip = Vec::new();
+    sent.near(4, 3, 15, &mut skip);
+    assert_eq!(outside(3, 15, skip), [(8, 12)]);
+    sent.forget(5);
+    assert!(sent.0.is_empty());
+    let mut dirty = CardDirty { ranges: vec![(2, 4)], ..Default::default() };
+    assert_eq!(dirty.take(6, 5, false), [(2, 4)]);
+    assert!(dirty.sent.0.is_empty());
+}
+
 impl Card {
     fn changed(&self, from: usize, to: usize) {
         if from >= to {
@@ -197,14 +344,17 @@ impl Card {
         }
         let mut dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
         // Reference card_changed_runs: combine a touching last range.
-        match dirty.last_mut() {
+        match dirty.ranges.last_mut() {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-            _ => dirty.push((from, to)),
+            _ => dirty.ranges.push((from, to)),
         }
     }
 
-    pub(crate) fn take_dirty(&self) -> Vec<(usize, usize)> {
-        joined(std::mem::take(&mut *self.dirty.lock().unwrap_or_else(|e| e.into_inner())))
+    /// Under submitted, associate this drain with its upcoming sync fence.
+    /// The previous completed fence is a safe retirement watermark only
+    /// because the current branch has no in-flight card landings.
+    pub(crate) fn take_dirty(&self, sent_as: u64, retired: u64) -> Vec<(usize, usize)> {
+        self.dirty.lock().unwrap_or_else(|e| e.into_inner()).take(sent_as, retired, card_send_order())
     }
 }
 
@@ -232,7 +382,7 @@ fn card_for(staging: &ID3D12Resource, data: *mut u8, size: u64) -> Option<(ID3D1
     unsafe { data.write_bytes(0, size as usize) };
     Some((buffer, Card {
         staging: staging.clone(), work, size,
-        dirty: Mutex::new(vec![(0, size as usize)]), _lease: lease,
+        dirty: Mutex::new(CardDirty { ranges: vec![(0, size as usize)], ..Default::default() }), _lease: lease,
     }))
 }
 
@@ -737,12 +887,21 @@ impl Shadow {
 
     /// Land the reference's flagged GPU pieces before existing CPU merge.
     /// Called only under the submission lock, after the readback fence.
-    pub(crate) fn land_card(&self, from: usize, bytes: &[u8]) {
+    pub(crate) fn land_card(&self, from: usize, bytes: &[u8], fetched_after: u64) {
         let card = self.card.as_ref().expect("a device-local copy");
         assert!(from <= card.size as usize && bytes.len() <= card.size as usize - from);
-        // SAFETY: bounds checked; source is a disjoint completed readback
-        // and the staging mapping is writable under the submission lock.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
+        if card_send_order() {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            for (lo, hi) in dirty.landing_parts(fetched_after, from, from + bytes.len()) {
+                // SAFETY: parts lie in the checked readback span and
+                // staging allocation. The submitting thread owns staging.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(lo - from), self.data.add(lo), hi - lo) };
+            }
+        } else {
+            // SAFETY: bounds checked; source is a disjoint completed readback
+            // and the staging mapping is writable under the submission lock.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
+        }
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
