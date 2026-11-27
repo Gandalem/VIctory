@@ -463,6 +463,21 @@ preparation, memory or fence observation, signal, or pump return.
 Unlike the source, disjoint ranges still wait because shared marks,
 compare flags and physical aliases are not flight-independent.
 No second flight or speculative wait satisfaction is enabled.
+Experimental `VICTORY_CARD_FLAGS_OWN=1` ports the reference's 1 MiB
+`CardWork::taken/out` result-area ownership. Each compare plan
+reserves a packed range of dwords, and keeps that range until its
+checked results have been consumed. Only when the last lease is
+released does the arena rewind. Unlike the source's CPU-visible
+UAV, the current per-copy GPU differs scratch is retained; the
+check list copies each span into its plan's readback interval.
+Both pre-recorded tails and post-fence checks use the same ownership.
+Oversized plans, exhaustion or creation failure retain the original
+serial per-copy flag path. This fallback is not safe for future
+overlapping flights and must be preceded by settlement then.
+Run the ignored `packed_card_flags_survive_a_later_check` adapter
+test. This ports compare-result ownership only: this branch's global
+write/read bitmaps, hash updates and copy-back still require serial
+settlement. The default flag path is unchanged.
 Run the ignored
 `late_title_flight_retains_recording_and_publishes_on_settle` test.
 The default remains synchronous. Run the ignored

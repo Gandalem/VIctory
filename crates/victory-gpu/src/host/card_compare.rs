@@ -1197,13 +1197,140 @@ fn deferred_hashes_commit_only_fetched_pieces() {
 
 type CardPlans = Vec<(usize, Vec<CardSpan>)>;
 
-/// Source CardPlan::check and lists ownership, adapted to the serial
-/// submission lock. The owning carded snapshot remains live until
-/// card_back has consumed the flags; only the allocator/list is recycled.
+/// Source CardWork::taken/out: one bounded area, append results of a
+/// plan behind all outstanding plans, and rewind only when none is out.
+/// Unlike the source's CPU-visible UAV, this branch retains per-copy
+/// device-local differs scratch and copies into a packed readback arena.
+const RESULT_BYTES: u64 = 1 << 20;
+const RESULT_WORDS: u32 = (RESULT_BYTES / 4) as u32;
+
+#[derive(Default)]
+struct FlagCursor {
+    taken: u32,
+    out: u32,
+}
+
+impl FlagCursor {
+    fn take(&mut self, words: u32) -> Option<u32> {
+        if words == 0 {
+            return None;
+        }
+        let at = self.taken;
+        let end = at.checked_add(words).filter(|&end| end <= RESULT_WORDS)?;
+        self.out = self.out.checked_add(1)?;
+        self.taken = end;
+        Some(at)
+    }
+
+    fn done(&mut self) {
+        self.out = self.out.checked_sub(1).expect("unmatched card flag lease");
+        if self.out == 0 {
+            self.taken = 0;
+        }
+    }
+}
+
+pub(super) struct FlagArena {
+    buffer: ID3D12Resource,
+    data: usize,
+    cursor: Mutex<FlagCursor>,
+}
+
+impl FlagArena {
+    fn make(host: &Host) -> Option<std::sync::Arc<Self>> {
+        let (buffer, data) = host.mapped_buffer(RESULT_BYTES, true)?;
+        crate::host::name(&buffer, || "card compare flight results".into());
+        Some(std::sync::Arc::new(Self {
+            buffer, data: data as usize, cursor: Mutex::new(FlagCursor::default()),
+        }))
+    }
+
+    fn take(self: &std::sync::Arc<Self>, words: u32) -> Option<FlagLease> {
+        let at = self.cursor.lock().unwrap_or_else(|e| e.into_inner()).take(words)?;
+        Some(FlagLease { arena: self.clone(), at, words })
+    }
+}
+
+/// A plan's private dwords in the mapped arena, retained until the
+/// check fence has completed and every result has been read. Offsets
+/// are relative to the plan, not the shadow's piece number.
+struct FlagLease {
+    arena: std::sync::Arc<FlagArena>,
+    at: u32,
+    words: u32,
+}
+
+impl FlagLease {
+    fn offset(&self, at: u32, words: u32) -> u64 {
+        assert!(at.checked_add(words).is_some_and(|end| end <= self.words));
+        u64::from(self.at + at) * 4
+    }
+
+    /// # Safety
+    /// This plan's fence completed; this lease owns the requested
+    /// interval exclusively and no GPU writes it again before drop.
+    unsafe fn read(&self, at: u32, words: u32) -> &[u32] {
+        let offset = self.offset(at, words);
+        // SAFETY: the caller checked completion and the span is inside
+        // the live, persistently mapped readback arena.
+        unsafe { std::slice::from_raw_parts(
+            (self.arena.data as *const u32).add((offset / 4) as usize), words as usize) }
+    }
+}
+
+impl Drop for FlagLease {
+    fn drop(&mut self) {
+        self.arena.cursor.lock().unwrap_or_else(|e| e.into_inner()).done();
+    }
+}
+
+fn packed_flags_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FLAGS_OWN").is_some_and(|v| v == "1"))
+}
+
+fn plan_words(plans: &CardPlans) -> Option<u32> {
+    plans.iter().flat_map(|(_, spans)| spans).try_fold(0u32, |n, span| n.checked_add(span.pieces))
+}
+
+#[test]
+fn flag_cursor_rewinds_only_after_last_plan() {
+    let mut cursor = FlagCursor::default();
+    assert_eq!(cursor.take(0), None);
+    assert_eq!(cursor.take(16), Some(0));
+    assert_eq!(cursor.take(24), Some(16));
+    // Even if the first plan finished, the later plan still owns
+    // results. Do not rewind or allocate over its range.
+    cursor.done();
+    assert_eq!(cursor.take(RESULT_WORDS), None);
+    assert_eq!(cursor.take(RESULT_WORDS - 40), Some(40));
+    assert_eq!(cursor.take(1), None);
+    cursor.done();
+    assert_eq!(cursor.take(1), None);
+    cursor.done();
+    assert_eq!(cursor.take(RESULT_WORDS), Some(0));
+    cursor.done();
+    assert_eq!(cursor.taken, 0);
+    assert_eq!(cursor.out, 0);
+}
+
+#[test]
+fn packed_result_words_count_spans_not_piece_indices() {
+    let plans = vec![
+        (3, vec![card_span_of(0, 8 * PIECE, 10 * PIECE)]),
+        (9, vec![card_span_of(0, 0, PIECE), card_span_of(0, 7 * PIECE, 8 * PIECE)]),
+    ];
+    assert_eq!(plan_words(&plans), Some(4));
+}
+
+
+/// Source CardPlan::check and result ownership. Keep the carded
+/// snapshot and optional packed result lease until consumption.
 pub(super) struct CardCheck {
     work: CardPrelude,
     commands: [Option<ID3D12CommandList>; 1],
     plans: CardPlans,
+    flags: Option<FlagLease>,
 }
 
 fn check_tail_enabled() -> bool {
@@ -1223,10 +1350,32 @@ fn card_plans(copies: &[std::sync::Arc<crate::shadow::Shadow>], scope: Option<&C
 }
 
 impl Host {
+    fn reserve_card_flags(&self, plans: &CardPlans) -> Option<FlagLease> {
+        if !packed_flags_enabled() {
+            return None;
+        }
+        let words = plan_words(plans)?;
+        if words == 0 || words > RESULT_WORDS {
+            return None;
+        }
+        let arena = self.card_flags.get_or_init(|| {
+            let arena = FlagArena::make(self);
+            if arena.is_none() {
+                tracing::warn!("no packed card compare arena; retaining serial per-copy flags");
+            }
+            arena
+        }).as_ref()?;
+        // A full arena is allowed to fall back only under the current
+        // one-flight contract. A future multi-flight path must settle
+        // before this fallback or reserve space before sending.
+        arena.take(words)
+    }
+
     fn record_card_check(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>],
-        plans: &CardPlans, deferred: bool) -> CardPrelude
+        plans: &CardPlans, deferred: bool, flags: Option<&FlagLease>) -> CardPrelude
     {
         let list = self.card_list(CardPhase::Check);
+        let mut out_at = 0u32;
         // Source CardPlan::check begins with a global UAV barrier.
         // The separate ExecuteCommandLists call preserves buffer decay
         // between the title command group and this check.
@@ -1248,10 +1397,20 @@ impl Host {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                 for span in spans {
                     let at = u64::from(span.first) * 4;
-                    list.list.CopyBufferRegion(&card.work.flags, at, &card.work.differs, at,
+                    let (buffer, dst) = if let Some(flags) = flags {
+                        let dst = flags.offset(out_at, span.pieces);
+                        out_at += span.pieces;
+                        (&flags.arena.buffer, dst)
+                    } else {
+                        (&card.work.flags, at)
+                    };
+                    list.list.CopyBufferRegion(buffer, dst, &card.work.differs, at,
                         u64::from(span.pieces) * 4);
                 }
             }
+        }
+        if let Some(flags) = flags {
+            assert_eq!(out_at, flags.words);
         }
         list
     }
@@ -1267,12 +1426,13 @@ impl Host {
         if plans.is_empty() {
             return None;
         }
-        let work = self.record_card_check(copies, &plans, deferred_hashes());
+        let flags = self.reserve_card_flags(&plans);
+        let work = self.record_card_check(copies, &plans, deferred_hashes(), flags.as_ref());
         // SAFETY: a freshly recorded open list; all owners live in the
         // caller's carded snapshot for the entire submission.
         let command = unsafe { work.list.Close() }.and_then(|()| work.list.cast())
             .unwrap_or_else(|e| fail(format_args!("could not close card check tail: {e}")));
-        Some(CardCheck { work, commands: [Some(command)], plans })
+        Some(CardCheck { work, commands: [Some(command)], plans, flags })
     }
 
     /// # Safety
@@ -1372,7 +1532,7 @@ impl Host {
         }
         let deferred = deferred_hashes();
         let mut picked = picked_observation(runs);
-        let plans = if let Some(check) = tail {
+        let (plans, flag_lease) = if let Some(check) = tail {
             // Host::execute checked the title fence and device status,
             // and its tail was queued before that fence. Assert the
             // completed value here too before recycling the allocator.
@@ -1380,23 +1540,25 @@ impl Host {
             if unsafe { self.fence.GetCompletedValue() } < *submitted {
                 fail(format_args!("card check tail fence incomplete"));
             }
-            let CardCheck { work, commands: _, plans } = check;
+            let CardCheck { work, commands: _, plans, flags } = check;
             self.recycle_card_list(CardPhase::Check, work);
-            plans
+            (plans, flags)
         } else {
             let scope = declared_scope(runs);
             let plans = card_plans(copies, scope.as_ref());
             if plans.is_empty() {
                 return;
             }
-            let list = self.record_card_check(copies, &plans, deferred);
+            let flags = self.reserve_card_flags(&plans);
+            let list = self.record_card_check(copies, &plans, deferred, flags.as_ref());
             self.run_card_list(CardPhase::Check, list, submitted);
-            plans
+            (plans, flags)
         };
         let checking = super::torn::on();
         let mut checks = CheckedRuns::new();
         let mut fetches = Vec::new();
         let mut total = 0u64;
+        let mut out_at = 0u32;
         for (copy, spans) in plans {
             let shadow = &copies[copy];
             let card = shadow.card().expect("planned card copy");
@@ -1404,10 +1566,19 @@ impl Host {
             let mut ranges: Vec<(usize, usize)> = Vec::new();
             let mut expected = std::collections::BTreeMap::new();
             for span in spans {
-                // SAFETY: only read the flags copied for this span, from
-                // the live persistent mapping after its checked fence.
-                let flags = unsafe { std::slice::from_raw_parts(
-                    (card.work.flags_data as *const u32).add(span.first as usize), span.pieces as usize) };
+                // SAFETY: this check's fence completed. A packed lease
+                // excludes overlapping output ranges until consumption;
+                // the fallback mapping is used only by the serial path.
+                let flags = unsafe {
+                    if let Some(lease) = &flag_lease {
+                        let result = lease.read(out_at, span.pieces);
+                        out_at += span.pieces;
+                        result
+                    } else {
+                        std::slice::from_raw_parts(
+                            (card.work.flags_data as *const u32).add(span.first as usize), span.pieces as usize)
+                    }
+                };
                 for (i, flag) in flags.iter().enumerate() {
                     if super::torn::flagged(*flag) {
                         if checking {
@@ -1436,6 +1607,12 @@ impl Host {
                 fetches.push((copy, lo, hi));
                 total += (hi - lo) as u64;
             }
+        }
+        if let Some(lease) = flag_lease {
+            assert_eq!(out_at, lease.words);
+            // Every flag/hash is now copied into the CPU plan. Reclaim
+            // the result interval only after this consumption.
+            drop(lease);
         }
         if let Some(picked) = picked {
             picked.finish_observation(copies);
@@ -1725,6 +1902,61 @@ fn card_check_tail_shares_title_fence() {
     // SAFETY: the next check's flags have completed too.
     assert_eq!(unsafe { (card.work.flags_data as *const u32).read() } & 1, 0);
     assert_eq!(shadow.read_host(p as u64, 1), [value]);
+    crate::shadow::unregister(p, p as u64);
+}
+
+/// Two checked plans over the same copy retain distinct GPU results.
+/// Keep the first result lease live through a second check, even
+/// though the per-copy differs scratch is reused by the direct queue.
+#[test]
+#[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 and D3D12; run alone"]
+fn packed_card_flags_survive_a_later_check() {
+    let host = host().expect("D3D12 device");
+    let p = crate::watch::tests::pool(2);
+    let len = 2 * PIECE;
+    crate::shadow::register(p, p as u64, len as u64);
+    let shadow = crate::shadow::find(p as u64, len as u64).expect("registered copy");
+    assert!(shadow.card().is_some());
+    // SAFETY: this test owns the mapped title range.
+    unsafe { (p as *mut u32).write_unaligned(0) };
+    let warm = host.new_list().unwrap();
+    shadow.refresh(&warm, p as u64, len as u64);
+    warm.close();
+    host.execute(&[&warm]);
+
+    let arena = FlagArena::make(host).expect("packed flags");
+    let copies = [shadow.clone()];
+    let plans = card_plans(&copies, None);
+    let words = plan_words(&plans).unwrap();
+    let first = arena.take(words).unwrap();
+    let second = arena.take(words).unwrap();
+    assert_eq!(first.at + words, second.at);
+    let (upload, data) = host.upload_buffer(4).unwrap();
+    // SAFETY: this mapped upload contains four bytes.
+    unsafe { data.cast::<u32>().write_unaligned(0x10203040) };
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    host.settle_baked_uploads();
+    let write = host.card_list(CardPhase::Sync);
+    // SAFETY: live buffers and valid range; the copy promotes from COMMON.
+    unsafe { write.list.CopyBufferRegion(&shadow.buffer, 0, &upload, 0, 4) };
+    host.run_card_list(CardPhase::Sync, write, &mut submitted);
+    let check = host.record_card_check(&copies, &plans, false, Some(&first));
+    host.run_card_list(CardPhase::Check, check, &mut submitted);
+    // SAFETY: the first checked fence has completed.
+    let changed = unsafe { first.read(0, words) }.to_vec();
+    assert_eq!(changed[0] & 1, 1);
+    let check = host.record_card_check(&copies, &plans, false, Some(&second));
+    host.run_card_list(CardPhase::Check, check, &mut submitted);
+    // SAFETY: both checks completed, and the leases are disjoint.
+    unsafe {
+        assert_eq!(first.read(0, words), changed.as_slice());
+        assert!(second.read(0, words).iter().all(|&flag| flag & 1 == 0));
+    }
+    drop(first);
+    assert_eq!(arena.cursor.lock().unwrap().taken, 2 * words);
+    drop(second);
+    assert_eq!(arena.cursor.lock().unwrap().taken, 0);
+    drop(submitted);
     crate::shadow::unregister(p, p as u64);
 }
 
