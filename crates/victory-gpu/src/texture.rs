@@ -228,6 +228,10 @@ pub(crate) fn recycle() {
     // Follow the former upload_pool idle-limit policy on RAM or DXGI pressure.
     let pressure = crate::shadow::memory_pressured() || crate::host::video_memory_pressured();
     let (kept_bytes, chunks_kept) = if pressure { (0, 0) } else { (KEPT_BYTES, CHUNKS_KEPT) };
+    if owned_staging_enabled() {
+        trim_owned_staging(kept_bytes);
+        return;
+    }
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
         (c.current, c.used) = (0, 0);
@@ -317,13 +321,203 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
     }
 }
 
+/// The reference pool.rs Ranges allocator: free intervals are joined
+/// when returned, and allocations respect D3D12's 512-byte alignment.
+struct Ranges(std::collections::BTreeMap<u64, u64>);
+
+impl Ranges {
+    fn new(size: u64) -> Ranges {
+        Ranges(std::collections::BTreeMap::from([(0, size)]))
+    }
+
+    /// The lowest place for `len` bytes at a multiple of `align`.
+    fn take(&mut self, len: u64, align: u64) -> Option<u64> {
+        let (start, size, at) = self.0.iter().find_map(|(&start, &size)| {
+            let at = start.next_multiple_of(align);
+            (at + len <= start + size).then_some((start, size, at))
+        })?;
+        self.0.remove(&start);
+        if at > start {
+            self.0.insert(start, at - start);
+        }
+        if at + len < start + size {
+            self.0.insert(at + len, start + size - at - len);
+        }
+        Some(at)
+    }
+
+    fn give(&mut self, mut start: u64, mut len: u64) {
+        if let Some((&before, &size)) = self.0.range(..start).next_back()
+            && before + size == start
+        {
+            self.0.remove(&before);
+            (start, len) = (before, len + size);
+        }
+        if let Some(size) = self.0.remove(&(start + len)) {
+            len += size;
+        }
+        self.0.insert(start, len);
+    }
+
+    fn whole(&self, size: u64) -> bool {
+        self.0.get(&0) == Some(&size)
+    }
+}
+
+struct OwnedState {
+    free: Ranges,
+    used_to: u64,
+}
+
+struct OwnedBlock {
+    buffer: ID3D12Resource,
+    data: usize,
+    bytes: u64,
+    state: Mutex<OwnedState>,
+}
+
+impl OwnedBlock {
+    fn make(bytes: u64) -> Option<Arc<Self>> {
+        let (buffer, data) = host()?.upload_buffer(bytes)?;
+        crate::host::name(&buffer, || "owned texture staging block".into());
+        Some(Arc::new(Self { buffer, data: data as usize, bytes,
+            state: Mutex::new(OwnedState { free: Ranges::new(bytes), used_to: 0 }) }))
+    }
+
+    fn take(self: &Arc<Self>, len: u64) -> Option<(Arc<StagingPiece>, bool)> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let start = state.free.take(len, 512)?;
+        let again = start < state.used_to;
+        state.used_to = state.used_to.max(start + len);
+        Some((Arc::new(StagingPiece { block: self.clone(), start, len }), again))
+    }
+
+    fn empty(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).free.whole(self.bytes)
+    }
+}
+
+/// Source pool::StagingPiece, adapted to the existing 32 MiB chunk
+/// and large-buffer size classes. Both the detile result and every
+/// recorded list that names its bytes share the lease. The block
+/// remains mapped and no overlapping interval is issued until the
+/// last owner releases it, after a checked fence or unsubmitted drop.
+pub(crate) struct StagingPiece {
+    block: Arc<OwnedBlock>,
+    start: u64,
+    len: u64,
+}
+
+impl Drop for StagingPiece {
+    fn drop(&mut self) {
+        self.block.state.lock().unwrap_or_else(|e| e.into_inner())
+            .free.give(self.start, self.len);
+    }
+}
+
+static OWNED_BLOCKS: Mutex<Vec<Arc<OwnedBlock>>> = Mutex::new(Vec::new());
+
+fn owned_staging_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_OWN").is_some_and(|v| v == "1"))
+}
+
+/// Retain the existing free-byte budget; active pieces are never
+/// reclaimed under memory pressure. Lock order is pool -> block.
+/// Piece::drop only acquires its own block lock.
+fn trim_owned_staging(kept: u64) {
+    let mut spare = 0u64;
+    OWNED_BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|block| {
+        if !block.empty() {
+            return true;
+        }
+        spare = spare.saturating_add(block.bytes);
+        spare <= kept
+    });
+}
+
+type StagingSpace = (ID3D12Resource, u64, *mut u8, Option<Arc<StagingPiece>>);
+type DetiledSpace = (ID3D12Resource, u64, Option<Arc<StagingPiece>>);
+
+fn owned_staging_space(size: u64) -> Option<StagingSpace> {
+    let len = size.checked_next_multiple_of(512)?;
+    if len == 0 {
+        return None;
+    }
+    let (piece, again) = {
+        let mut blocks = OWNED_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        match blocks.iter().find_map(|block| block.take(len)) {
+            Some(found) => found,
+            None => {
+                let bytes = if len <= CHUNK { CHUNK } else { len.checked_next_power_of_two()? };
+                let block = OwnedBlock::make(bytes)?;
+                let found = block.take(len)?;
+                blocks.push(block);
+                found
+            }
+        }
+    };
+    let data = (piece.block.data + piece.start as usize) as *mut u8;
+    if again {
+        // Source pool::staging clears reused pieces. Unmapped parts of
+        // a texture must not inherit bytes from a previous owner.
+        // SAFETY: this lease exclusively owns the aligned mapped range.
+        unsafe { std::ptr::write_bytes(data, 0, piece.len as usize) };
+    }
+    Some((piece.block.buffer.clone(), piece.start, data, Some(piece)))
+}
+
+#[test]
+fn owned_staging_ranges_align_and_coalesce_after_release() {
+    let mut free = Ranges::new(4096);
+    assert_eq!(free.take(600, 512), Some(0));
+    assert_eq!(free.take(1024, 512), Some(1024));
+    assert_eq!(free.take(2048, 512), Some(2048));
+    assert_eq!(free.take(512, 512), None);
+    free.give(1024, 1024);
+    free.give(0, 600);
+    assert!(!free.whole(4096));
+    assert_eq!(free.take(2048, 512), Some(0));
+    free.give(2048, 2048);
+    free.give(0, 2048);
+    assert!(free.whole(4096));
+}
+
+/// The allocation is still live after its local detile result is
+/// dropped, because the recorded host list retains the piece.
+#[test]
+#[ignore = "requires D3D12 adapter; run alone"]
+fn owned_texture_piece_survives_recording_until_reset() {
+    let gpu = host().expect("D3D12 device");
+    let block = OwnedBlock::make(65536).expect("staging block");
+    let (first, again) = block.take(512).unwrap();
+    assert_eq!(first.start, 0);
+    assert!(!again);
+    let list = gpu.new_list().unwrap();
+    list.keep_texture_piece(first.clone());
+    drop(first);
+    let (second, _) = block.take(512).unwrap();
+    assert_eq!(second.start, 512);
+    drop(second);
+    assert!(!block.empty());
+    list.close();
+    // Unsubmitted closed recording: Reset is safe and releases lease.
+    list.reset();
+    assert!(block.empty());
+    let (returned, again) = block.take(512).unwrap();
+    assert_eq!(returned.start, 0);
+    assert!(again);
+}
+
 /// Ahead allocations are private: the submission pool may rewind while
 /// a ready entry lives, but these buffers are owned through the fence.
-fn refresh_space(size: u64, ahead: bool) -> Option<(ID3D12Resource, u64, *mut u8)> {
+fn refresh_space(size: u64, ahead: bool) -> Option<StagingSpace> {
     if ahead {
-        host()?.upload_buffer(size).map(|(buffer, data)| (buffer, 0, data))
+        host()?.upload_buffer(size).map(|(buffer, data)| (buffer, 0, data, None))
+    } else if owned_staging_enabled() {
+        owned_staging_space(size)
     } else {
-        staging_space(size)
+        staging_space(size).map(|(buffer, at, data)| (buffer, at, data, None))
     }
 }
 
@@ -569,7 +763,7 @@ fn record_upload_inner(
     upload: &Upload,
     count: bool,
 ) -> Option<D3D12_RESOURCE_BARRIER> {
-    let (buffer, at, subresources) = upload;
+    let (buffer, at, subresources, piece) = upload;
     if copy.tiled.is_some() {
         // The common recording path covers ordinary, ahead and baked
         // uploads. Only actual copied MIPs need backing; packed groups
@@ -585,6 +779,9 @@ fn record_upload_inner(
     }
     copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
     list.keep(buffer);
+    if let Some(piece) = piece {
+        list.keep_texture_piece(piece.clone());
+    }
     if count {
         count_upload(staging, upload);
     }
@@ -676,7 +873,7 @@ fn copies(
 
 /// What a refresh gives: a staging buffer, where its space starts in it,
 /// and the subresources detiled into it.
-pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
+pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>, Option<Arc<StagingPiece>>);
 
 /// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
 /// at most: the title's own threads need the rest), here when that is
@@ -810,7 +1007,7 @@ impl AheadUpload {
         let selected;
         let upload = if self.staging.range_capable {
             debug_assert!(list.is_some());
-            selected = (self.upload.0.clone(), self.upload.1, prepared_mips(&last, mips, &self.upload.2));
+            selected = (self.upload.0.clone(), self.upload.1, prepared_mips(&last, mips, &self.upload.2), self.upload.3.clone());
             &selected
         } else {
             &self.upload
@@ -1155,7 +1352,7 @@ impl Staging {
                 if staging.is_none() {
                     staging = refresh_space(self.size, ahead);
                 }
-                let Some((_, _, data)) = &staging else {
+                let Some((_, _, data, _)) = &staging else {
                     failed = true;
                     break;
                 };
@@ -1184,7 +1381,7 @@ impl Staging {
             if self.range_capable && !ahead {
                 last.acknowledge(&fresh, n);
             }
-            return (bytes, staging.map(|(b, at, _)| (b, at, fresh)));
+            return (bytes, staging.map(|(b, at, _, piece)| (b, at, fresh, piece)));
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -1206,7 +1403,7 @@ impl Staging {
             if self.range_capable && buffer.is_some() {
                 last.acknowledge(&every, self.footprints.len());
             }
-            return (0, buffer.map(|(b, at)| (b, at, every)));
+            return (0, buffer.map(|(b, at, piece)| (b, at, every, piece)));
         }
         if checked_untracked {
             // The old fork's checked kernel snapshot for untracked worker
@@ -1240,7 +1437,7 @@ impl Staging {
             if buffer.is_some() && !ahead {
                 last.acknowledge(&fresh, count);
             }
-            return (size, buffer.map(|(b, at)| (b, at, fresh)));
+            return (size, buffer.map(|(b, at, piece)| (b, at, fresh, piece)));
         }
         // 2c9e2a13: retain the whole-image digest, but skip detiling and
         // GPU copies for source spans whose contents did not change.
@@ -1273,7 +1470,7 @@ impl Staging {
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-            return (size, buffer.map(|(b, at)| (b, at, fresh)));
+            return (size, buffer.map(|(b, at, piece)| (b, at, fresh, piece)));
         }
         last.span_hashes.clear();
         let every: Vec<u32> = (0..count as u32).collect();
@@ -1289,14 +1486,14 @@ impl Staging {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, buffer.map(|(b, at)| (b, at, fresh)))
+        (size, buffer.map(|(b, at, piece)| (b, at, fresh, piece)))
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32], ahead: bool) -> Option<(ID3D12Resource, u64)> {
-        let (buffer, at, data) = refresh_space(self.size, ahead)?;
+    fn detile(&self, tiled: &[u8], subresources: &[u32], ahead: bool) -> Option<DetiledSpace> {
+        let (buffer, at, data, piece) = refresh_space(self.size, ahead)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -1316,7 +1513,7 @@ impl Staging {
                 return None;
             }
         }
-        Some((buffer, at))
+        Some((buffer, at, piece))
     }
 
     /// Port the original fork's one-subresource format walk, targeting a

@@ -1278,10 +1278,10 @@ struct PendingBake {
 /// title work, but its writes, flags and texture levels are not published
 /// until settlement. Keep every preparation owner through that boundary.
 ///
-/// This is intentionally still a same-thread state: Uploads owns the
-/// bindless upload-pool MutexGuard and the current mark/compare buffers
-/// are shared. Moving SentTitle to a worker or admitting another title
-/// flight would be unsound until those ownership paths are split.
+/// Uploads now owns its list rather than a pool MutexGuard, and the
+/// optional texture pieces are individually leased. Mark/compare flags,
+/// legacy staging and descriptor publication remain serialized; this
+/// still cannot admit another title flight before settlement.
 struct SentTitle {
     fence: u64,
     waited: bool,
@@ -1309,6 +1309,9 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Exact leased texture staging intervals; the resource reference
+    /// alone does not prevent its bytes from being reused by the pool.
+    texture_pieces: Vec<std::sync::Arc<crate::texture::StagingPiece>>,
     /// Actual destinations of tiled copies, retained until list reset.
     tile_writes: Vec<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
     /// Title-source uploads, including speculative recorded lists. No
@@ -2868,6 +2871,16 @@ impl HostList {
             self.keep(&old);
         }
         Some(made)
+    }
+
+    /// Source list-owned staging piece. Hold until reset/drop, or
+    /// explicit return of a completed internal upload list to its pool.
+    pub(crate) fn keep_texture_piece(&self, piece: std::sync::Arc<crate::texture::StagingPiece>) {
+        self.deferred().texture_pieces.push(piece);
+    }
+
+    pub(crate) fn release_texture_pieces(&self) {
+        self.deferred().texture_pieces.clear();
     }
 
     /// Keeps `object` alive until the list is reset.

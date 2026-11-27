@@ -435,10 +435,24 @@ command lists, upload lease, texture work, refresh batch, picked
 ranges and card compare tail. Settlement waits that exact fence,
 checks removal, then publishes the existing copy-backs, callbacks
 and bottom-of-pipe writes. Per-list timing still waits each group.
-Both phases run on the same thread under the existing submission
-guard; the texture upload lease contains a non-Send MutexGuard,
-and write marks and compare flags are still shared. No second
-in-flight title submission is enabled. Run the ignored
+Both phases still run under the same submission guard; write marks,
+compare flags and descriptor publication remain shared. No second
+in-flight title submission is enabled.
+Experimental `VICTORY_TEXTURE_OWN=1` ports the reference's
+`pool::Ranges` and `StagingPiece` ownership to the existing staging
+size classes. Each detile result and every recorded upload list
+retain the aligned piece, returning its free interval only when
+the last owner is released. Reused pieces are zeroed; idle blocks
+remain subject to the existing 64 MiB budget and pressure trim.
+Ahead uploads retain their private allocations. With the option
+off the existing serial staging rewind stays in use.
+The fallback upload list is now owned by `Uploads` rather than a
+long-lived pool MutexGuard; the single cached closed list is leased
+and returned after settlement, and each recorded piece is released
+at that boundary. The pool mutex protects only the idle slot. This
+does not yet permit overlapping title submissions. Run the ignored
+`owned_texture_piece_survives_recording_until_reset` adapter test.
+Run the ignored
 `sent_title_publishes_pipe_writes_only_after_settlement` adapter test.
 The default keeps the existing Arc/leave path. The ignored
 `carded_shadow_refresh_compare_and_copy_back` and

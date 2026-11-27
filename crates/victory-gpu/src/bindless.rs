@@ -405,20 +405,11 @@ pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[crate::texture::RefreshWork],
 ) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
+    // The submission lock, not the pool mutex, serializes the current
+    // renderer. Take ownership of the list and release the pool lock.
     crate::texture::recycle();
-    match &guard.0 {
-        // Closed by the last submission, which has run.
-        Some(list) => list.reset(),
-        // Made open.
-        None => {
-            let list = crate::host::host()?.new_list().ok()?;
-            list.set_ours();
-            guard.0 = Some(list);
-        }
-    }
-    let list = guard.0.as_ref()?;
+    let owned = take_upload_list()?;
+    let list = &owned;
     // What to bring up: the textures lists read through tables, and those
     // the heaps view that shaders read lately. Collected under the heaps'
     // locks and brought up without them, several at a time: reading title
@@ -569,31 +560,73 @@ pub(crate) fn uploads(
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
     if recorded || !accepted.is_empty() {
-        Some(Uploads { ready: accepted, fallback: recorded, guard })
+        Some(Uploads { ready: accepted, fallback: recorded, list: Some(owned) })
     } else {
+        return_upload_list(owned);
         None
     }
 }
 
-/// The upload list, used under its lock only.
-pub(crate) struct Holder(Option<HostList>);
-// SAFETY: D3D12 objects are free-threaded; the list is used by one
-// submission at a time, under the lock.
-unsafe impl Send for Holder {}
+/// Adapt the reference's fresh/recycled-list ownership rather than
+/// borrow a MutexGuard for the entire lifetime of the submission.
+/// This cache stores only closed, unsubmitted or completed lists.
+static UPLOAD_LIST: Mutex<Option<HostList>> = Mutex::new(None);
 
-/// All private ahead buffers and accepted lists remain owned through
-/// the submission fence. State preludes run in actual execution order.
+fn take_upload_list() -> Option<HostList> {
+    let idle = UPLOAD_LIST.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match idle {
+        Some(list) => {
+            list.reset();
+            Some(list)
+        }
+        None => {
+            let list = crate::host::host()?.new_list().ok()?;
+            list.set_ours();
+            Some(list)
+        }
+    }
+}
+
+fn return_upload_list(list: HostList) {
+    // No submitted list is returned before the checked fence and
+    // settlement. A prepared-but-unused list may also be returned.
+    // Never execute the cached list before its next Reset.
+    list.release_texture_pieces();
+    let mut idle = UPLOAD_LIST.lock().unwrap_or_else(|e| e.into_inner());
+    if idle.is_none() {
+        *idle = Some(list);
+    }
+}
+
+/// Own the fallback list, accepted ahead lists and private upload
+/// buffers through the checked submission fence. No pool guard is
+/// carried across the send/settle boundary. Callers must retain this
+/// until settlement (or drop an unsubmitted recording).
 pub(crate) struct Uploads {
     ready: Vec<Ready>,
     fallback: bool,
-    guard: std::sync::MutexGuard<'static, Holder>,
+    list: Option<HostList>,
 }
 
 impl Uploads {
     pub(crate) fn lists(&self) -> impl Iterator<Item = &HostList> {
         self.ready.iter().filter_map(|r| r.list.as_ref())
-            .chain(self.guard.0.as_ref().filter(|_| self.fallback))
+            .chain(self.list.as_ref().filter(|_| self.fallback))
     }
+}
+
+impl Drop for Uploads {
+    fn drop(&mut self) {
+        if let Some(list) = self.list.take() {
+            return_upload_list(list);
+        }
+    }
+}
+
+#[test]
+fn upload_owners_do_not_carry_a_pool_guard() {
+    fn needs_send<T: Send>() {}
+    needs_send::<Uploads>();
 }
 
 /// Per submission: brings the buffer ranges a heap's views reach up to date
