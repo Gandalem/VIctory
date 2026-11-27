@@ -140,7 +140,6 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 /// The offsets hashed for a card's buffer of `size`
 /// bytes for title memory from `start` on.
-#[cfg(test)]
 fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
     let (lo, hi) = piece_at(start, size, piece);
     (lo & !15, hi.next_multiple_of(16))
@@ -181,50 +180,6 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &CardSpan, size: u32
         }
         done += n;
     }
-}
-
-#[cfg(test)]
-const MUL: [u32; 4] = [0x0100_0193, 0x9E37_79B1, 0x85EB_CA77, 0xC2B2_AE3D];
-#[cfg(test)]
-const SEED: [u32; 4] = [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
-
-#[cfg(test)]
-fn step(h: &mut [u32; 4], with: [u32; 4]) {
-    let x: [u32; 4] = std::array::from_fn(|i| (h[i] ^ with[i]).wrapping_mul(MUL[i]));
-    *h = std::array::from_fn(|i| x[(i + 1) % 4] ^ (x[i] >> 15));
-}
-
-/// The 64 threads' hashes as one, folded to 31 bits.
-#[cfg(test)]
-fn finish(parts: &[[u32; 4]; 64]) -> u32 {
-    let mut h = parts[0];
-    for part in &parts[1..] {
-        step(&mut h, *part);
-    }
-    let f = h[0] ^ h[1].wrapping_mul(3) ^ h[2].wrapping_mul(5) ^ h[3].wrapping_mul(7);
-    f & 0x7FFF_FFFF
-}
-
-#[cfg(test)]
-fn seeds() -> [[u32; 4]; 64] {
-    std::array::from_fn(|thread| SEED.map(|s| s.wrapping_add(thread as u32)))
-}
-
-#[cfg(test)]
-fn tail(parts: &mut [[u32; 4]; 64], bytes: &[u8]) {
-    for (thread, chunk) in bytes.as_chunks::<16>().0.iter().enumerate() {
-        let with = std::array::from_fn(|i| u32::from_le_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]));
-        step(&mut parts[thread], with);
-    }
-}
-
-#[cfg(test)]
-fn hash_plain(bytes: &[u8]) -> u32 {
-    let mut parts = seeds();
-    for row in bytes.chunks(1024) {
-        tail(&mut parts, row);
-    }
-    finish(&parts)
 }
 
 /// Compile the original compute shader, even when CI has no D3D12 adapter.
@@ -420,6 +375,109 @@ struct FetchPiece {
     lo: usize,
     hi: usize,
     at: u64,
+}
+
+/// Source torn::Check, specialized to this branch's contiguous packed
+/// fetches and one completed flight. Widen reads to the exact shader
+/// hash extent, but keep landing/rehashing confined to the original
+/// logical flagged interval, including at skewed title-page boundaries.
+#[derive(Debug)]
+struct CheckedPiece {
+    from: usize,
+    to: usize,
+    hash: u32,
+}
+
+#[derive(Debug)]
+struct CheckedRun {
+    lo: usize,
+    hi: usize,
+    pieces: Vec<CheckedPiece>,
+}
+
+impl CheckedRun {
+    fn new(start: usize, size: usize, lo: usize, hi: usize,
+        expected: &std::collections::BTreeMap<usize, u32>) -> Self
+    {
+        let pieces = pieces_of(start, lo, hi).map(|number| {
+            let (from, to) = card_hashed_of(start, size, number);
+            CheckedPiece { from, to, hash: expected[&number] }
+        }).collect();
+        Self { lo, hi, pieces }
+    }
+
+    fn extent(&self) -> (usize, usize) {
+        (self.lo & !15, self.hi.next_multiple_of(16))
+    }
+
+    fn logical(&self, fetched: &FetchPiece) -> FetchPiece {
+        assert_eq!(self.extent(), (fetched.lo, fetched.hi));
+        FetchPiece { copy: fetched.copy, lo: self.lo, hi: self.hi,
+            at: fetched.at + (self.lo - fetched.lo) as u64 }
+    }
+
+    /// Return the first mismatching shader piece, if any. Never merge
+    /// bytes of even a partially verified batch.
+    fn mismatch(&self, bytes: &[u8]) -> Option<&CheckedPiece> {
+        let (from, to) = self.extent();
+        assert_eq!(bytes.len(), to - from);
+        self.pieces.iter().find(|p|
+            super::torn::hash(&bytes[p.from - from..p.to - from]) != p.hash)
+    }
+}
+
+type CheckedRuns = std::collections::BTreeMap<(usize, usize, usize), CheckedRun>;
+
+/// # Safety
+/// The batch is a completed fetch into this live, exclusive mapping.
+/// The caller keeps it stable until all checks and landing finish.
+unsafe fn check_fetch_batch(pool: &CardFetch, batch: &[FetchPiece], checks: &CheckedRuns) -> bool {
+    for piece in batch {
+        let check = &checks[&(piece.copy, piece.lo, piece.hi)];
+        // SAFETY: caller's checked fence and packed in-bounds offsets.
+        let bytes = unsafe { std::slice::from_raw_parts(
+            (pool.data as *const u8).add(piece.at as usize), piece.hi - piece.lo) };
+        if let Some(bad) = check.mismatch(bytes) {
+            tracing::warn!(copy = piece.copy, from = bad.from, to = bad.to,
+                "GPU readback hash mismatch");
+            return false;
+        }
+    }
+    true
+}
+
+#[test]
+fn checked_fetch_hashes_aligned_pieces_but_lands_only_logical_bytes() {
+    let (start, size) = (3usize, 2 * PIECE);
+    let (lo, hi) = piece_at(start, size, 1);
+    let (a, b) = card_hashed_of(start, size, 1);
+    let mut bytes: Vec<u8> = (0..b-a).map(|i| (i.wrapping_mul(19) >> 3) as u8).collect();
+    let expected = std::collections::BTreeMap::from([(1, super::torn::hash(&bytes))]);
+    let check = CheckedRun::new(start, size, lo, hi, &expected);
+    assert_eq!(check.extent(), (a, b));
+    assert!(a < lo && hi < b);
+    assert!(check.mismatch(&bytes).is_none());
+    let fetched = FetchPiece { copy: 2, lo: a, hi: b, at: 128 };
+    assert_eq!(check.logical(&fetched), FetchPiece { copy: 2, lo, hi, at: 128 + (lo - a) as u64 });
+    // Even bytes read only for the shader's aligned load are checked.
+    bytes[0] ^= 1;
+    assert!(check.mismatch(&bytes).is_some());
+    bytes[0] ^= 1;
+    assert!(check.mismatch(&bytes).is_none());
+}
+
+#[test]
+fn checked_fetch_validates_every_piece_in_a_joined_run() {
+    let size = 2 * PIECE;
+    let mut bytes = vec![0x55; size];
+    let hash = super::torn::hash(&bytes[..PIECE]);
+    let expected = std::collections::BTreeMap::from([(0, hash), (1, hash)]);
+    let check = CheckedRun::new(0, size, 0, size, &expected);
+    assert!(check.mismatch(&bytes).is_none());
+    bytes[PIECE + 17] ^= 1;
+    assert_eq!(check.mismatch(&bytes).unwrap().from, PIECE);
+    bytes[PIECE + 17] ^= 1;
+    assert!(check.mismatch(&bytes).is_none());
 }
 
 /// Usually all pieces fit in one batch. If growth fails, the already
@@ -1292,6 +1350,8 @@ impl Host {
             self.run_card_list(CardPhase::Check, list, submitted);
             plans
         };
+        let checking = super::torn::on();
+        let mut checks = CheckedRuns::new();
         let mut fetches = Vec::new();
         let mut total = 0u64;
         for (copy, spans) in plans {
@@ -1299,13 +1359,17 @@ impl Host {
             let card = shadow.card().expect("planned card copy");
             let (start, _) = shadow.range();
             let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let mut expected = std::collections::BTreeMap::new();
             for span in spans {
                 // SAFETY: only read the flags copied for this span, from
                 // the live persistent mapping after its checked fence.
                 let flags = unsafe { std::slice::from_raw_parts(
                     (card.work.flags_data as *const u32).add(span.first as usize), span.pieces as usize) };
                 for (i, flag) in flags.iter().enumerate() {
-                    if flag & 1 != 0 {
+                    if super::torn::flagged(*flag) {
+                        if checking {
+                            expected.insert(span.first as usize + i, super::torn::folded(*flag));
+                        }
                         let (from, to) = card_piece_of(start as usize, shadow.card_hash_size() as usize, &span, i as u32);
                         if let Some(picked) = &mut picked {
                             picked.flagged(shadow, from, to);
@@ -1318,6 +1382,14 @@ impl Host {
                 }
             }
             for (lo, hi) in ranges {
+                let (lo, hi) = if checking {
+                    let check = CheckedRun::new(start as usize, shadow.card_hash_size() as usize, lo, hi, &expected);
+                    let (lo, hi) = check.extent();
+                    checks.insert((copy, lo, hi), check);
+                    (lo, hi)
+                } else {
+                    (lo, hi)
+                };
                 fetches.push((copy, lo, hi));
                 total += (hi - lo) as u64;
             }
@@ -1338,55 +1410,73 @@ impl Host {
         let mut pending: Option<super::relay::Receipt> = None;
         let mut relay_title = Vec::new();
         for batch in pack_fetches(&fetches, pool.size) {
-            let list = match private.as_mut() {
-                Some(fetch) => fetch.take_list(),
-                None => self.card_list(CardPhase::Fetch),
-            };
-            for piece in &batch {
-                // SAFETY: checked source ranges and disjoint packed
-                // destination ranges, live resources, buffer COPY_SOURCE
-                // promotion from COMMON and readback stays COPY_DEST.
-                unsafe {
-                    list.list.CopyBufferRegion(&pool.buffer, piece.at,
-                        &copies[piece.copy].buffer, piece.lo as u64, (piece.hi - piece.lo) as u64);
-                }
-            }
-            if deferred {
-                for (copy, ranges) in fetched_hash_runs(&batch) {
-                    let shadow = &copies[copy];
-                    let card = shadow.card().expect("fetched card copy");
-                    let (start, _) = shadow.range();
-                    let spans = compare_spans(start as usize, shadow.card_hash_size() as usize, Some(&ranges));
-                    // SAFETY: all copies for this source have been
-                    // recorded first; transition its promoted COPY_SOURCE
-                    // state to SRV for mode 0. All owners survive the
-                    // checked fence. No further title GPU work can run
-                    // between fetching and updating the hash.
+            let logical = checking.then(|| batch.iter().map(|piece|
+                checks[&(piece.copy, piece.lo, piece.hi)].logical(piece)).collect::<Vec<_>>());
+            let mut retry = false;
+            let (fetch_fence, completed) = loop {
+                let list = match private.as_mut() {
+                    Some(fetch) => fetch.take_list(),
+                    None => self.card_list(CardPhase::Fetch),
+                };
+                for piece in &batch {
+                    // SAFETY: checked source ranges and disjoint packed
+                    // destination ranges, live resources, buffer COPY_SOURCE
+                    // promotion from COMMON and readback stays COPY_DEST.
                     unsafe {
-                        list.list.ResourceBarrier(&[transition(&shadow.buffer,
-                            D3D12_RESOURCE_STATE_COPY_SOURCE,
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
-                        card.work.bind(&list.list, &shadow.buffer);
-                        for span in &spans {
-                            card_pass(&list.list, span, shadow.card_hash_size() as u32, 0, 0);
-                        }
+                        list.list.CopyBufferRegion(&pool.buffer, piece.at,
+                            &copies[piece.copy].buffer, piece.lo as u64, (piece.hi - piece.lo) as u64);
                     }
-                    compare_barrier(&list.list);
                 }
-            }
-            // Recording this list does not read staging or write the pool.
-            // The preceding worker may land while we record, but it
-            // must finish before another fetch can overwrite the pool.
-            if let Some(receipt) = pending.take() {
-                COPY_BACK[1].fetch_add(receipt.finish(), Ordering::Relaxed);
-            }
-            let (fetch_fence, completed) = if let Some(fetch) = private.as_mut() {
-                fetch.run(self, list)
-            } else {
-                self.run_card_list(CardPhase::Fetch, list, submitted);
-                // SAFETY: a plain query of the checked queue fence.
-                (*submitted, unsafe { self.fence.GetCompletedValue() })
+                if deferred {
+                    for (copy, ranges) in fetched_hash_runs(logical.as_deref().unwrap_or(&batch)) {
+                        let shadow = &copies[copy];
+                        let card = shadow.card().expect("fetched card copy");
+                        let (start, _) = shadow.range();
+                        let spans = compare_spans(start as usize, shadow.card_hash_size() as usize, Some(&ranges));
+                        // SAFETY: all copies for this source have been
+                        // recorded first; transition its promoted COPY_SOURCE
+                        // state to SRV for mode 0. All owners survive the
+                        // checked fence. No further title GPU work can run
+                        // between fetching and updating the hash.
+                        unsafe {
+                            list.list.ResourceBarrier(&[transition(&shadow.buffer,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                            card.work.bind(&list.list, &shadow.buffer);
+                            for span in &spans {
+                                card_pass(&list.list, span, shadow.card_hash_size() as u32, 0, 0);
+                            }
+                        }
+                        compare_barrier(&list.list);
+                    }
+                }
+                // Recording this list does not read staging or write the pool.
+                // The preceding worker may land while we record, but it
+                // must finish before another fetch can overwrite the pool.
+                if let Some(receipt) = pending.take() {
+                    COPY_BACK[1].fetch_add(receipt.finish(), Ordering::Relaxed);
+                }
+                let stamp = if let Some(fetch) = private.as_mut() {
+                    fetch.run(self, list)
+                } else {
+                    self.run_card_list(CardPhase::Fetch, list, submitted);
+                    // SAFETY: a plain query of the checked queue fence.
+                    (*submitted, unsafe { self.fence.GetCompletedValue() })
+                };
+                // SAFETY: the fetch fence was checked, and the submission
+                // lock plus previous landing receipt exclude reuse.
+                if !checking || unsafe { check_fetch_batch(&pool, &batch, &checks) } {
+                    break stamp;
+                }
+                // Unlike the reference's concurrent queue, there is no
+                // later flight that can repair a torn piece in this branch.
+                // Retry on the same direct queue; never land a mismatch.
+                if retry {
+                    fail(format_args!("GPU readback failed hash validation after retry"));
+                }
+                retry = true;
             };
+            let batch = logical.unwrap_or(batch);
             // SentRuns uses the main queue's send order, not the
             // private fence domain. This fetch ran after every send
             // up to submitted (no other title work can enter the queue).
@@ -1715,7 +1805,7 @@ fn card_compare_detects_and_fetches_changed_pieces() {
     for i in 0..count {
         let (lo, hi) = card_hashed_of(start, size, i);
         let changed = before[lo..hi] != after[lo..hi];
-        let expected = hash_plain(&after[lo..hi]) << 1 | u32::from(changed);
+        let expected = super::torn::hash(&after[lo..hi]) << 1 | u32::from(changed);
         assert_eq!(flags[i], expected, "first compare, piece {i}");
         assert_eq!(flags[count + i], expected, "update compare, piece {i}");
         assert_eq!(flags[2 * count + i], expected & !1, "updated hash, piece {i}");

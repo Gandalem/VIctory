@@ -393,8 +393,21 @@ Run the ignored `private_relay_fetch_has_own_fence_and_reuses_list`
 test on a real adapter. This is a bounded, fenced worker port, not the
 source's full asynchronous submission pipeline: title submissions
 still do not overlap, and generation retirement and mapped-buffer
-access rely on the submission lock. The separate copy queue, torn-read
-protection and detached title lists remain unported. Run the ignored
+access rely on the submission lock.
+Experimental `VICTORY_FETCH_CHECK=1` ports the reference's CPU
+hash (scalar and AVX2) and folded GPU-flag validation into the fenced
+packed fetch path. Widen each readback to the exact 16-byte-aligned
+shader hash extent, compare every flagged piece before landing any
+bytes of the batch, then use only the original logical intervals
+for merge and deferred rehash. A mismatch retries the batch on the
+direct queue once and fails closed if it remains inconsistent.
+This differs from the source's persistent suspect/refetch scheme,
+which lets later flights repair concurrent copy-queue reads; that
+scheme, the separate copy queue and detached title lists remain
+unported. The default is unchanged. The ignored
+`carded_shadow_refresh_compare_and_copy_back` and
+`picked_writes_land_only_after_discovery` adapter tests can also
+be run with `VICTORY_FETCH_CHECK=1`. Run the ignored
 `owned_card_send_keeps_original_bytes_after_staging_changes` test with
 the card-buffer options and `VICTORY_SEND_OWN=1` on a real adapter.
 Run the ignored `card_check_tail_shares_title_fence` test on an adapter
