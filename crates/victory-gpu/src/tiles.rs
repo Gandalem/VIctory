@@ -216,6 +216,9 @@ pub(crate) struct Mapping {
     /// Advisory held-level discovery. Never used to remove backing or
     /// change the shown level until the sparse title path is validated.
     observed_held: Option<u32>,
+    /// Title-source bytes actually copied by a completed GPU upload.
+    /// Full-chain zero initialization alone does not set these bits.
+    source_uploaded: u32,
     card: u32,
     /// Packed-group claims are acquired at submission, never recording.
     /// Production initializes every group before a list records a write.
@@ -224,7 +227,7 @@ pub(crate) struct Mapping {
 
 impl Mapping {
     fn new(groups: Vec<Group>) -> Self {
-        Self { groups, mapped: 0, leases: Vec::new(), held: 0, observed_held: None, card: 0, claimed: 0 }
+        Self { groups, mapped: 0, leases: Vec::new(), held: 0, observed_held: None, source_uploaded: 0, card: 0, claimed: 0 }
     }
 
     fn every_level(&self) -> u32 {
@@ -252,6 +255,17 @@ impl Mapping {
         let previous = self.first_shown();
         self.card |= levels & self.mapped;
         self.unclaim(levels);
+        previous != self.first_shown()
+    }
+
+    /// Finish the reference held-level upload only after the actual
+    /// GPU copy has run. Mapping or preparing a staging buffer does not
+    /// publish newly backed MIPs. Preserve the separate GPU-write mask.
+    pub(crate) fn source_wrote(&mut self, levels: u32) -> bool {
+        let previous = self.first_shown();
+        let completed = levels & self.mapped;
+        self.source_uploaded |= completed;
+        self.held |= completed;
         previous != self.first_shown()
     }
 
@@ -321,13 +335,13 @@ impl Mapping {
     }
 }
 
-/// Adapt cool_fox card_wrote_on admission to the synchronous renderer:
+/// Adapt cool_fox uploaded_on/card_wrote_on admission to the synchronous renderer:
 /// initialize missing groups in a fenced mapper pass, not in each title
 /// list. Recording or resetting a list cannot clear another list's write.
 ///
 /// SAFETY: the submission lock is held before any upload or state
 /// prelude; all earlier GPU work has completed.
-pub(crate) unsafe fn prepare_card_write(
+pub(crate) unsafe fn prepare_backing(
     host: &crate::host::Host,
     copy: &crate::resource::HostTexture,
     levels: u32,
@@ -743,6 +757,21 @@ mod tests {
     }
 
     #[test]
+    fn source_completion_publishes_only_backed_mips_and_preserves_card_mask() {
+        let mut state = Mapping::new(groups(&[16, 4, 1], 4, 2, 23).unwrap());
+        assert!(!state.source_wrote(1 << 6));
+        assert_eq!(state.source_uploaded, 0);
+        assert_eq!(state.first_shown(), None);
+        state.mapped = 0b1111000;
+        assert!(state.card_wrote(1 << 6));
+        assert!(state.source_wrote((1 << 5) | 1));
+        assert_eq!(state.source_uploaded, 1 << 5);
+        assert_eq!(state.card, 1 << 6);
+        assert_eq!(state.first_shown(), Some(5));
+        assert!(!state.source_wrote(1 << 5));
+    }
+
+    #[test]
     fn shown_srv_preserves_reference_range_and_lod_clamp() {
         let mut view = D3D12_SHADER_RESOURCE_VIEW_DESC {
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -850,15 +879,15 @@ mod tests {
         let copy = Arc::new(crate::resource::HostTexture::new_with_size(
             texture.clone(), 0, Vec::new(), Some((full_bytes, mapping.clone())),
         ));
-        let abandoned = record_texel(host, &copy, &desc, 0, 0xdeadbeef);
+        let abandoned = record_texel(host, &copy, &desc, 0, 0xdeadbeef, false);
         abandoned.reset();
         drop(abandoned);
         assert_eq!(mapping.lock().unwrap().mapped, 0);
         assert_eq!(usage().0, before);
         // Same new group, reverse recording order: initialize exactly once.
         let marker = 0x11223344;
-        let first = record_texel(host, &copy, &desc, 7, marker);
-        let second = record_texel(host, &copy, &desc, 7, 0xaabbccdd);
+        let first = record_texel(host, &copy, &desc, 7, marker, false);
+        let second = record_texel(host, &copy, &desc, 7, 0xaabbccdd, false);
         host.execute(&[&second, &first]);
         drop(first);
         drop(second);
@@ -872,7 +901,7 @@ mod tests {
             map.given_bytes()
         };
         let fine = 0x55667788;
-        let list = record_texel(host, &copy, &desc, 0, fine);
+        let list = record_texel(host, &copy, &desc, 0, fine, false);
         host.execute(&[&list]);
         drop(list);
         {
@@ -950,15 +979,73 @@ mod tests {
         assert_eq!(usage().0, before);
     }
 
+    #[test]
+    #[ignore = "requires a tiled-resource tier-2 D3D12 adapter; run alone"]
+    fn sparse_source_upload_is_published_only_after_the_copy_fence() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        let host = crate::host::host().expect("D3D12 device");
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024, Height: 1024, DepthOrArraySize: 1, MipLevels: 8,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let before = usage().0;
+        let (texture, desc, mapping) = reserve(host, &desc, &[]).expect("reserved texture");
+        let full_bytes = mapping.lock().unwrap().groups.iter()
+            .map(|g| u64::from(g.tiles) * TILE).sum();
+        let copy = Arc::new(crate::resource::HostTexture::new_with_size(
+            texture.clone(), 0, Vec::new(), Some((full_bytes, mapping.clone())),
+        ));
+        let abandoned = record_texel(host, &copy, &desc, 0, 0xdeadbeef, true);
+        abandoned.reset();
+        drop(abandoned);
+        let coarse = record_texel(host, &copy, &desc, 7, 0x11223344, true);
+        {
+            let state = mapping.lock().unwrap();
+            assert_eq!(state.first_shown(), None);
+            assert_eq!(state.source_uploaded, 0);
+            assert_eq!(state.mapped, 0);
+        }
+        host.execute(&[&coarse]);
+        drop(coarse);
+        {
+            let state = mapping.lock().unwrap();
+            assert_eq!(state.source_uploaded, 1 << 7);
+            assert_eq!(state.card, 0);
+            assert_eq!(state.first_shown(), Some(7));
+        }
+        let fine = record_texel(host, &copy, &desc, 0, 0x55667788, true);
+        host.execute(&[&fine]);
+        drop(fine);
+        {
+            let state = mapping.lock().unwrap();
+            assert_eq!(state.source_uploaded, (1 << 7) | 1);
+            assert_eq!(state.card, 0);
+            assert_eq!(state.first_shown(), Some(0));
+            assert_eq!(usage().0, before + state.given_bytes());
+        }
+        assert_eq!(read_texels(host, &texture, &desc, [0, 7]), [0x55667788, 0x11223344]);
+        drop(copy);
+        drop(mapping);
+        drop(texture);
+        assert_eq!(usage().0, before);
+    }
+
     fn record_texel(host: &crate::host::Host, copy: &Arc<crate::resource::HostTexture>,
-        desc: &D3D12_RESOURCE_DESC, level: u32, value: u32) -> crate::host::HostList {
+        desc: &D3D12_RESOURCE_DESC, level: u32, value: u32, source: bool) -> crate::host::HostList {
         let texture = &copy.texture;
         let (upload, data) = host.upload_buffer(512).unwrap();
         // SAFETY: mapped upload contains at least one RGBA8 texel.
         unsafe { data.cast::<u32>().write_unaligned(value) };
         let list = host.new_list().unwrap();
         list.keep(&upload);
-        list.defer_tile_write(copy, 1 << level);
+        if source {
+            list.defer_tile_source(copy, 1 << level);
+        } else {
+            list.defer_tile_write(copy, 1 << level);
+        }
         // SAFETY: the list retains its destination and upload; submission
         // admits missing backing before either command runs.
         unsafe {

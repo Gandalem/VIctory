@@ -1200,6 +1200,10 @@ enum Step {
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
+type TileSources = std::collections::BTreeMap<
+    usize, (std::sync::Arc<crate::resource::HostTexture>, u32)
+>;
+
 #[derive(Default)]
 struct Deferred {
     /// Destination, source, bytes.
@@ -1207,6 +1211,9 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// Actual destinations of tiled copies, retained until list reset.
     tile_writes: Vec<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
+    /// Title-source uploads, including speculative recorded lists. No
+    /// backing or published mask changes until the list is submitted.
+    tile_sources: Vec<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1364,10 +1371,50 @@ impl Host {
         crate::bindless::prepare_ahead(viewed);
     }
 
+    /// Merge exact copied subresources of the accepted upload lists.
+    /// Called under the submission lock before resource-state preludes.
+    fn prepare_tile_sources(&self, runs: &[&HostList]) -> TileSources {
+        let mut sources = TileSources::new();
+        for list in runs {
+            for (copy, levels) in &list.deferred().tile_sources {
+                let entry = sources.entry(std::sync::Arc::as_ptr(copy) as usize)
+                    .or_insert_with(|| (copy.clone(), 0));
+                entry.1 |= *levels;
+            }
+        }
+        for (copy, levels) in sources.values() {
+            // SAFETY: the submission lock excludes GPU execution and
+            // earlier work is fenced. Current preludes have not run.
+            if !unsafe { crate::tiles::prepare_backing(self, copy, *levels) } {
+                // A mandatory recorded copy cannot be skipped after its
+                // staging dirty state was acknowledged.
+                fail(format_args!("could not back tiled source upload levels {levels:#x}"));
+            }
+        }
+        sources
+    }
+
+    /// Publish source bytes only after a successful fence. Keep them
+    /// separate from card_wrote so CPU uploads do not suppress refreshes.
+    fn complete_tile_sources(sources: &TileSources) -> std::collections::BTreeMap<
+        usize, std::sync::Arc<crate::resource::HostTexture>
+    > {
+        let mut reshown = std::collections::BTreeMap::new();
+        for (copy, levels) in sources.values() {
+            if let Some(mapping) = &copy.tiled
+                && mapping.lock().unwrap_or_else(|e| e.into_inner()).source_wrote(*levels)
+            {
+                reshown.insert(copy.texture.as_raw() as usize, copy.clone());
+            }
+        }
+        reshown
+    }
+
     /// Run the bounded deferred-descriptor bake after preceding GPU work
     /// has settled. The caller holds submitted; never recurse into execute
     /// or recycle the current submission's upload allocations.
     pub(crate) fn submit_baked_uploads(&self, list: &HostList, submitted: &mut u64) {
+        let sources = self.prepare_tile_sources(&[list]);
         list.close();
         let mut lists = Vec::with_capacity(2);
         if let Some(prelude) = list.prelude() {
@@ -1387,13 +1434,16 @@ impl Host {
             {
                 fail(format_args!("deferred texture upload fence setup failed: {e}"));
             }
-            if WaitForSingleObject(self.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+            if WaitForSingleObject(self.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0
+                || self.fence.GetCompletedValue() < *submitted
+            {
                 fail(format_args!("deferred texture upload fence wait failed"));
             }
             if let Err(e) = self.device.GetDeviceRemovedReason() {
                 fail(format_args!("deferred texture upload device removed: {e}"));
             }
         }
+        crate::descriptor::remake_tiled_views(&Self::complete_tile_sources(&sources));
     }
 
     /// Runs closed lists and waits for them.
@@ -1431,7 +1481,7 @@ impl Host {
         for (copy, levels) in tile_writes.values() {
             // SAFETY: submission lock held, all prior work completed,
             // no current state prelude has run.
-            if !unsafe { crate::tiles::prepare_card_write(self, copy, *levels) } {
+            if !unsafe { crate::tiles::prepare_backing(self, copy, *levels) } {
                 fail(format_args!("could not back tiled texture write levels {levels:#x}"));
             }
         }
@@ -1485,6 +1535,7 @@ impl Host {
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];
+        let tile_sources = self.prepare_tile_sources(runs);
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -1609,7 +1660,7 @@ impl Host {
         }
         // Publish GPU-authored levels only after successful completion,
         // before read-driven descriptor creation.
-        let mut reshown = std::collections::BTreeMap::new();
+        let mut reshown = Self::complete_tile_sources(&tile_sources);
         for (copy, levels) in tile_writes.values() {
             if let Some(mapping) = &copy.tiled
                 && mapping.lock().unwrap_or_else(|e| e.into_inner()).card_wrote(*levels)
@@ -2433,6 +2484,14 @@ impl HostList {
         }
     }
 
+    /// Record title-source MIPs without allocating or publishing them.
+    /// Speculative lists that are discarded never reach preparation.
+    pub(crate) fn defer_tile_source(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, levels: u32) {
+        if copy.tiled.is_some() && levels != 0 {
+            self.deferred().tile_sources.push((copy.clone(), levels));
+        }
+    }
+
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
@@ -2460,7 +2519,7 @@ impl HostList {
     /// over).
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
-        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.tile_writes.is_empty()
+        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.tile_writes.is_empty() && d.tile_sources.is_empty()
             && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
         drop(d);
         deferred_empty

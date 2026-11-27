@@ -457,9 +457,28 @@ card-authored levels cannot, and existing tile leases are retained.
 Production creation uses this policy with the full mask. The ignored
 `held_mip_admission_waits_for_room_and_keeps_existing_backing` GPU test
 exercises sparse admission and expansion with simulated room changes.
-Live partial source admission and coordination with the actual upload
-fence are not enabled; other view forms and in-submission changes
-remain unvalidated and need Windows GPU readback verification. Like the reference, mapped tiles are not returned while
+The common upload recorder now retains the exact destination owner
+and MIP mask for ordinary, ahead and baked texture uploads. Only lists
+actually submitted request missing tile groups; newly mapped backing
+is initialized before state preludes and GPU execution. After the
+checked copy fence, the source-completed mask is updated separately
+from GPU-authored levels and existing placed SRVs are republished if
+their first shown level changed. The baked-upload path uses the same
+admission/completion helpers. Mandatory recorded copies fail closed if
+backing cannot be obtained rather than acknowledge missing writes.
+The isolated ignored GPU test
+`sparse_source_upload_is_published_only_after_the_copy_fence` submits
+test texel copies tagged as source uploads, checking abandoned recording,
+partial expansion, completion masks and readback.
+
+This connects recorded source uploads to the sparse mapper; it does
+not activate live partial allocation. Initial title resources are still
+fully mapped and the advisory held judgement does not narrow source
+uploads. The reference's pressure-driven waiting/retry of unbacked
+source MIPs, safe visibility of non-contiguous MIPs and in-submission
+descriptor changes remain unported or unvalidated. Windows build and
+GPU readback verification are required before enabling partial title
+maps. Like the reference, mapped tiles are not returned while
 the resource lives. This option is disabled by
 default: the dedicated initialization fence and zero fill may outweigh
 pooling savings; validate both correctness and performance on Windows.

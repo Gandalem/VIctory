@@ -559,6 +559,13 @@ fn record_upload_inner(
     count: bool,
 ) -> Option<D3D12_RESOURCE_BARRIER> {
     let (buffer, at, subresources) = upload;
+    if copy.tiled.is_some() {
+        // The common recording path covers ordinary, ahead and baked
+        // uploads. Only actual copied MIPs need backing; packed groups
+        // are expanded by the fenced mapper at submission.
+        let levels = subresources.iter().fold(0, |mask, &i| mask | host_mip_bit(i));
+        list.defer_tile_source(copy, levels);
+    }
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     if let Some(b) = list.move_texture(copy, COPY_DEST) {
