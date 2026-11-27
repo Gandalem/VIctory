@@ -773,12 +773,10 @@ pub(crate) fn clamp_visible(
     show_from(desc, first, levels);
     match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
-            // SAFETY: the dimension selects this union member.
-            unsafe { desc.Anonymous.Texture2D.MipLevels = count };
+            desc.Anonymous.Texture2D.MipLevels = count;
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
-            // SAFETY: the dimension selects this union member.
-            unsafe { desc.Anonymous.Texture2DArray.MipLevels = count };
+            desc.Anonymous.Texture2DArray.MipLevels = count;
         }
         _ => unreachable!(),
     }
@@ -1246,6 +1244,7 @@ mod tests {
 
     fn read_texels(host: &crate::host::Host, texture: &ID3D12Resource,
         desc: &D3D12_RESOURCE_DESC, levels: [u32; 2]) -> [u32; 2] {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
         let mut back: Option<ID3D12Resource> = None;
         let properties = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
         let buffer = D3D12_RESOURCE_DESC {

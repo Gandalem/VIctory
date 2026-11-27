@@ -418,7 +418,7 @@ pub(crate) fn uploads(
     // thread in a new shot, and title threads setting views waited on the
     // lock meanwhile (run evict5).
     let mut work: Vec<crate::texture::RefreshWork> = Vec::new();
-    let mut staged = HashMap::new();
+    let mut staged: HashMap<*const crate::texture::Staging, usize> = HashMap::new();
     let range_mode = crate::texture::srv_ranges_enabled();
     for (staging, copy, requested) in textures {
         // A host copy wrote it in a submission made before this one (it
