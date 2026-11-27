@@ -1336,6 +1336,7 @@ impl Host {
         crate::resource::evict_unused();
         // Refresh pressure even on submissions without a new presented frame.
         video_memory_bytes();
+        crate::resource::maintain_residency_priority(self);
         if crate::tiles::enabled() {
             crate::tiles::maintain();
         }

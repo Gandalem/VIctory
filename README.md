@@ -357,6 +357,24 @@ The upstream first-use texture creation and whole-texture descriptor
 invalidation/eviction remain in use. The older committed-resource
 Evict/MakeResident state machine is not restored in this integration.
 
+## Experimental committed texture residency priorities
+
+`VICTORY_TEXTURE_RESIDENCY=1` restores the paging-priority portion of
+the earlier 0d427fb4 port: under the current local or sampled allocation
+pressure policy, committed, title-memory-fed sampled textures of at
+least 1 MiB receive a LOW priority hint after five seconds of inactivity.
+Active textures and textures which became host-written return to NORMAL
+on a subsequent sweep, as do cold textures when pressure clears.
+At most 128 priority changes are attempted per second. Placed resources,
+reserved tile-backed resources, writable textures and twins are excluded.
+Unsupported drivers leave the normal allocation and eviction path intact.
+
+This is a driver paging hint, not explicit eviction, a measured VRAM
+saving, or a change to resource lifetime. Current upstream whole-texture
+eviction and descriptor rebuilding are unchanged; the earlier
+Evict/MakeResident and deferred nonresident creation paths are not
+restored. The option is off by default pending Windows and GPU validation.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

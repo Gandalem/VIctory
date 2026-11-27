@@ -815,6 +815,9 @@ pub(crate) struct HostTexture {
     /// Logical allocation size, not resident bytes.
     bytes: u64,
     sampled: bool,
+    /// Paging priority state, only for sufficiently large non-tiled sampled textures.
+    /// Placed resources are excluded at registration.
+    residency_low: Option<std::sync::atomic::AtomicBool>,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
     /// A shader-visible heap slot viewed it (diagnostics: [`texture_census`]).
@@ -866,6 +869,8 @@ impl HostTexture {
             twin: std::sync::OnceLock::new(),
             bytes,
             sampled,
+            residency_low: priority_candidate(sampled, bytes, tile_bytes.is_some())
+                .then(|| false.into()),
             used: false.into(),
             viewed: false.into(),
             key: None,
@@ -1501,6 +1506,7 @@ fn shared_texture(
     let mut t = make_texture(&d, state, clear)?;
     t.key = key;
     let t = std::sync::Arc::new(t);
+    register_residency_priority(&t);
     if let Some(k) = key {
         remade(&k);
         if live.is_some() {
@@ -1914,6 +1920,124 @@ fn remade(k: &MemoryKey) {
 #[cfg(windows)]
 fn evictable(t: &HostTexture) -> bool {
     t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Opt-in priority hints ported from 0d427fb4. The current renderer
+/// already recreates evicted textures and keeps recorded resources alive;
+/// do not restore the older unpublished Evict/MakeResident state machine.
+#[cfg(windows)]
+fn residency_priority_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_RESIDENCY").as_deref() == Ok("1"))
+}
+
+#[cfg(windows)]
+fn priority_candidate(sampled: bool, bytes: u64, tiled: bool) -> bool {
+    sampled && bytes >= (1 << 20) && !tiled
+}
+
+#[cfg(windows)]
+fn cold_priority(age: u64, pressure: bool) -> bool {
+    pressure && age >= 5000
+}
+
+#[cfg(windows)]
+static PRIORITY_COPIES: std::sync::Mutex<
+    std::collections::BTreeMap<usize, std::sync::Weak<HostTexture>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Register committed sampled allocations only. A placed resource shares
+/// its heap's residency; reserved textures use independent pooled heaps.
+#[cfg(windows)]
+fn register_residency_priority(copy: &std::sync::Arc<HostTexture>) {
+    if !residency_priority_enabled()
+        || copy.residency_low.is_none()
+        || copy.placement.is_some()
+        || !evictable(copy)
+    {
+        return;
+    }
+    PRIORITY_COPIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(std::sync::Arc::as_ptr(copy) as usize, std::sync::Arc::downgrade(copy));
+}
+
+/// Called under the synchronous submission lock, after the existing
+/// eviction pass has stamped recently read textures. Priority is a hint:
+/// no resource is manually evicted, invalidated, or made nonresident.
+#[cfg(windows)]
+pub(crate) fn maintain_residency_priority(host: &crate::host::Host) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    if !residency_priority_enabled() {
+        return;
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let now = now_ms();
+    if now < NEXT.load(Relaxed) {
+        return;
+    }
+    NEXT.store(now.saturating_add(1000), Relaxed);
+    let Ok(device) = host.device.cast::<ID3D12Device1>() else {
+        return;
+    };
+    // Match the current renderer's local/sampled allocation policy.
+    // Non-local-only pressure does not lower local resource priorities.
+    let pressure = budget_reclaim(
+        crate::host::video_memory_for_eviction(),
+        crate::placement::free_bytes(),
+    ) != 0;
+    let owners: Vec<_> = {
+        let mut registry = PRIORITY_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+        registry.retain(|_, owner| owner.strong_count() != 0);
+        registry.values().cloned().collect()
+    };
+    let (mut changes, mut lowered, mut raised) = (0, 0, 0);
+    for owner in owners {
+        if changes == 128 {
+            break;
+        }
+        let Some(copy) = owner.upgrade() else { continue };
+        let Some(low) = &copy.residency_low else { continue };
+        let age = now.saturating_sub(copy.last[1].load(Relaxed));
+        // A host-written copy no longer qualifies; restore its priority
+        // even if it left the upstream whole-texture eviction candidates.
+        let cold = !copy.host_written.load(Relaxed)
+            && !copy.used_recently()
+            && cold_priority(age, pressure);
+        if cold == low.load(Relaxed) {
+            continue;
+        }
+        let Ok(pageable) = copy.texture.cast::<ID3D12Pageable>() else { continue };
+        let objects = [Some(pageable)];
+        let priorities = [if cold { D3D12_RESIDENCY_PRIORITY_LOW } else { D3D12_RESIDENCY_PRIORITY_NORMAL }];
+        // SAFETY: arrays contain exactly one live committed pageable and
+        // its priority. This does not evict or change its GPU address.
+        if unsafe { device.SetResidencyPriority(1, objects.as_ptr(), priorities.as_ptr()) }.is_ok() {
+            low.store(cold, Relaxed);
+            if cold { lowered += 1 } else { raised += 1 }
+        }
+        changes += 1;
+    }
+    if lowered != 0 || raised != 0 {
+        tracing::info!(lowered, raised, pressure, "sampled texture residency priority sweep");
+    }
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn committed_sampled_residency_priority_policy() {
+    let mib = 1 << 20;
+    assert!(!priority_candidate(false, mib, false));
+    assert!(!priority_candidate(true, mib - 1, false));
+    assert!(!priority_candidate(true, mib, true));
+    assert!(priority_candidate(true, mib, false));
+    assert!(!cold_priority(4999, true));
+    assert!(cold_priority(5000, true));
+    assert!(!cold_priority(5000, false));
 }
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a
