@@ -408,6 +408,29 @@ The upstream first-use texture creation and whole-texture descriptor
 invalidation/eviction remain in use. Placed and reserved resources are
 excluded from the committed-resource residency state machine below.
 
+## Experimental deferred descriptor upload
+
+`VICTORY_DEFERRED_DESCRIPTOR_UPLOADS=1` adapts the synchronous
+`prepare_bake_slot` / `publish_uploaded_slot` path of
+[DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/descriptor/host.rs).
+After a shader first reads an unmade placed sampled SRV, eligible fully
+tracked textures are prepared and their full retained chain uploaded
+before publishing the descriptor. Batches are limited to 32 slots and
+16 MiB of combined source and staging bytes, deduplicated by host copy.
+The existing direct queue and an explicitly checked fence settle the
+upload without recursively submitting or recycling active staging.
+The slot's heap identity, generation and actual host copy are checked
+again before publication. Failed preparation or stale generation
+does not publish the old descriptor; a later read retries it.
+Writable, alias-written, untracked, oversized, pressure-limited and
+other ineligible views retain the existing on-read path.
+
+This is a narrow synchronous bake port, not the reference renderer's
+general asynchronous flip queue. It can add an extra GPU fence per
+eligible batch and is disabled by default pending Windows validation.
+Dynamic sparse MIP mapping is still not enabled: all retained tile
+groups are backed and initialized before a resource is published.
+
 ## Experimental committed texture residency
 
 `VICTORY_TEXTURE_RESIDENCY=1` restores the conservative state machine

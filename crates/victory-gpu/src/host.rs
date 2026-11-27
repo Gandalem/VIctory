@@ -1327,6 +1327,38 @@ impl Host {
         crate::bindless::prepare_ahead(viewed);
     }
 
+    /// Run the bounded deferred-descriptor bake after preceding GPU work
+    /// has settled. The caller holds submitted; never recurse into execute
+    /// or recycle the current submission's upload allocations.
+    pub(crate) fn submit_baked_uploads(&self, list: &HostList, submitted: &mut u64) {
+        list.close();
+        let mut lists = Vec::with_capacity(2);
+        if let Some(prelude) = list.prelude() {
+            lists.push(Some(prelude));
+        }
+        let command: ID3D12CommandList = list.list.cast().unwrap_or_else(|e| {
+            fail(format_args!("could not cast deferred texture upload list: {e}"))
+        });
+        lists.push(Some(command));
+        *submitted += 1;
+        // SAFETY: both lists are closed; all referenced owners live
+        // through the checked fence. This is the same direct queue.
+        unsafe {
+            self.queue.ExecuteCommandLists(&lists);
+            if let Err(e) = self.queue.Signal(&self.fence, *submitted)
+                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event))
+            {
+                fail(format_args!("deferred texture upload fence setup failed: {e}"));
+            }
+            if WaitForSingleObject(self.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                fail(format_args!("deferred texture upload fence wait failed"));
+            }
+            if let Err(e) = self.device.GetDeviceRemovedReason() {
+                fail(format_args!("deferred texture upload device removed: {e}"));
+            }
+        }
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -1584,7 +1616,11 @@ impl Host {
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
-            crate::descriptor::make_read(&read);
+            if crate::descriptor::bake_enabled() {
+                crate::descriptor::make_read_baked(&read, self, &mut *submitted);
+            } else {
+                crate::descriptor::make_read(&read);
+            }
         }
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);

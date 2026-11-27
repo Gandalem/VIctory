@@ -897,6 +897,32 @@ pub(crate) fn refresh_all(work: &[RefreshWork]) -> Vec<Option<Upload>> {
 }
 
 impl Staging {
+    /// A bake must be bounded and fully tracked. Untracked and partially
+    /// tracked sources retain the existing mandatory upload path.
+    pub(crate) fn bake_cost(&self) -> Option<u64> {
+        self.tracked.as_ref()?.bit()?;
+        let total = self.layout.size.checked_add(self.size)?;
+        (total != 0 && self.size != 0).then_some(total)
+    }
+
+    /// Distinguish a clean, previously prepared texture from a failed
+    /// refresh. Request the full retained chain before publishing a view.
+    pub(crate) fn bake_refresh(&self) -> Result<Option<Upload>, ()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let upload = self.refresh(u32::MAX);
+        if self.retry.load(Relaxed) {
+            return Err(());
+        }
+        if self.range_capable {
+            let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+            if !last.full_initialized || last.pending_mips != 0 {
+                self.retry.store(true, Relaxed);
+                return Err(());
+            }
+        }
+        Ok(upload)
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self, mips: u32) -> bool {

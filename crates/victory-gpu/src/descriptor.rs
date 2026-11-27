@@ -205,6 +205,25 @@ pub(crate) fn sync_heaps() {
 /// they view as used (`crate::resource::evict`).
 #[cfg(windows)]
 pub(crate) fn make_read(slots: &[u32]) {
+    make_read_with(slots, None);
+}
+
+#[cfg(windows)]
+pub(crate) fn bake_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DEFERRED_DESCRIPTOR_UPLOADS").as_deref() == Ok("1"))
+}
+
+/// Called only with the host submission lock held, after the preceding
+/// GPU work has completed. The ordinary read-on-demand path remains the
+/// fallback for views that do not qualify for a bounded bake.
+#[cfg(windows)]
+pub(crate) fn make_read_baked(slots: &[u32], gpu: &crate::host::Host, submitted: &mut u64) {
+    make_read_with(slots, Some((gpu, submitted)));
+}
+
+#[cfg(windows)]
+fn make_read_with(slots: &[u32], bake: Option<(&crate::host::Host, &mut u64)>) {
     // The placed textures those slots view are made first, without the
     // heaps' lock, which every title thread writing a view waits on (making
     // a texture takes up to milliseconds; title threads waited 1-6 s a frame,
@@ -228,6 +247,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
+    let baked = bake.map_or_else(Default::default, |(gpu, submitted)| bake_read(slots, gpu, submitted));
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -239,10 +259,120 @@ pub(crate) fn make_read(slots: &[u32]) {
             continue;
         }
         for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
-            host.mirror(i, start + u64::from(i) * u64::from(step), true);
+            let handle = start + u64::from(i) * u64::from(step);
+            let identity = (std::sync::Arc::as_ptr(&host.viewed) as usize, i);
+            if let Some(job) = baked.get(&identity)
+                && std::sync::Arc::ptr_eq(&job.owner, &host.viewed)
+            {
+                if let Some((resolved, copy)) = &job.ready
+                    && host.publish_uploaded_slot(i, handle, job.key, resolved, copy)
+                {
+                    copy.stamp();
+                } else {
+                    // Failed upload or stale generation: don't publish a
+                    // replacement using the old upload. Retry on a read.
+                    crate::shadow::forget_read(i);
+                }
+                continue;
+            }
+            host.mirror(i, handle, true);
             host.stamp_read(i);
         }
     }
+}
+
+/// Reverse-port cool_fox's prepare_bake_slot/publish_uploaded_slot:
+/// retain the heap identity, not a raw heap pointer, across the GPU wait.
+#[cfg(windows)]
+struct BakedSlot {
+    owner: std::sync::Arc<crate::bindless::Viewed>,
+    key: u64,
+    ready: Option<(View, std::sync::Arc<crate::resource::HostTexture>)>,
+}
+
+#[cfg(windows)]
+fn bake_read(
+    slots: &[u32],
+    gpu: &crate::host::Host,
+    submitted: &mut u64,
+) -> std::collections::HashMap<(usize, u32), BakedSlot> {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
+    const COUNT: usize = 32;
+    const BYTES: u64 = 16 << 20;
+    let mut result = std::collections::HashMap::new();
+    if crate::shadow::memory_pressured() || crate::host::video_memory_pressured() {
+        return result;
+    }
+    let mut candidates = Vec::new();
+    {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        'heaps: for &(start, _, at) in heaps.iter() {
+            // SAFETY: registered heaps cannot be dropped under this lock.
+            let heap = unsafe { &*(at as *const Heap) };
+            if heap.desc.kind != VIEWS_KIND { continue; }
+            let (Some(Some(h)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else { continue };
+            for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
+                let handle = start + u64::from(i) * u64::from(step);
+                if let Some((view, key)) = h.prepare_bake_slot(i, handle) {
+                    candidates.push((h.viewed.clone(), i, view, key));
+                    if candidates.len() >= COUNT { break 'heaps; }
+                }
+            }
+        }
+    }
+    if candidates.is_empty() { return result; }
+    let Ok(list) = gpu.new_list() else { return result };
+    list.set_ours();
+    let mut left = BYTES;
+    let mut recorded = false;
+    let mut readable = Vec::new();
+    let mut completed = std::collections::HashMap::<usize, bool>::new();
+    for (owner, index, view, key) in candidates {
+        if crate::shadow::memory_pressured() || crate::host::video_memory_pressured() { break; }
+        // Placed title resources are permanent in the current renderer.
+        let Some(resolved) = host::placed_texture(&view) else { continue };
+        let View::Shader(r, _) = &resolved else { continue };
+        let resource = *r as This;
+        let Some(copy) = crate::resource::host_copy(resource) else { continue };
+        if !crate::texture::title_written(&copy.texture)
+            || copy.host_written.load(Relaxed)
+            || copy.twin.get().is_some_and(Option::is_some)
+            || crate::resource::alias_source(resource).is_some()
+        {
+            continue;
+        }
+        let identity = Arc::as_ptr(&copy) as usize;
+        let ok = if let Some(&ok) = completed.get(&identity) {
+            ok
+        } else {
+            let Some(staging) = crate::texture::staging(resource, &copy.texture) else { continue };
+            let Some(cost) = staging.bake_cost() else { continue };
+            if cost > left { continue; }
+            left -= cost;
+            let ok = match staging.bake_refresh() {
+                Ok(Some(upload)) => {
+                    readable.extend(crate::texture::record_upload(&list, &copy, &staging, &upload));
+                    recorded = true;
+                    true
+                }
+                Ok(None) => true,
+                Err(()) => false,
+            };
+            completed.insert(identity, ok);
+            ok
+        };
+        let identity = (Arc::as_ptr(&owner) as usize, index);
+        result.insert(identity, BakedSlot { owner, key, ready: ok.then_some((resolved, copy)) });
+    }
+    if !readable.is_empty() {
+        // SAFETY: an open upload list with live texture owners.
+        unsafe { list.list.ResourceBarrier(&readable) };
+    }
+    if recorded {
+        gpu.submit_baked_uploads(&list, submitted);
+    }
+    result
 }
 
 /// The host textures (raw pointers) that slots `slots` of the

@@ -60,6 +60,24 @@ pub(crate) struct HostHeap {
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
 }
 
+/// The key of the title record, not the GPU descriptor's contents.
+/// Port the original flip generation check; an unmapped record is stale.
+fn view_record_key([tag, index, generation]: [u32; 3]) -> u64 {
+    if tag == VIEW_TAG && generation != 0 {
+        u64::from(generation) << 32 | u64::from(index)
+    } else { 0 }
+}
+
+fn record_key(handle: u64) -> u64 {
+    let mut bytes = [0u8; 12];
+    if !crate::host::read_into(handle as *const u8, &mut bytes) {
+        return 0;
+    }
+    view_record_key(std::array::from_fn(|i| {
+        u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
+    }))
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -906,6 +924,71 @@ impl HostHeap {
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
         (is_placed_texture(&view) && !kept).then_some(view)
+    }
+
+    /// The original bake path is limited to already deferred, title-fed
+    /// placed SRVs. Do not change the eager buffer/UAV/table path.
+    pub(crate) fn prepare_bake_slot(&self, index: u32, handle: u64) -> Option<(View, u64)> {
+        if index >= self.count || self.sampler { return None; }
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let key = *made.get(index as usize)?;
+        if key == 0 || record_key(handle) != key { return None; }
+        let view = view_at(key as u32, (key >> 32) as u32)?;
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.get(index as usize)?.is_some()
+            || !matches!(&view, View::Placed(false, resource, _) if resource[0] != 1)
+        {
+            return None;
+        }
+        Some((view, key))
+    }
+
+    /// Publish only the same slot generation and resource whose upload
+    /// completed. The caller holds the submission lock and a live heap.
+    pub(crate) fn publish_uploaded_slot(
+        &self, index: u32, handle: u64, key: u64, resolved: &View,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::Arc;
+        use windows::core::Interface;
+        if index >= self.count || key == 0 || self.sampler { return false; }
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made[index as usize] != key || record_key(handle) != key
+            || self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
+        {
+            return false;
+        }
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else { return false };
+        if !matches!(&view, View::Placed(false, resource, _) if resource[0] != 1)
+            || placed_texture(&view).as_ref() != Some(resolved)
+        {
+            return false;
+        }
+        let View::Shader(r, _) = resolved else { return false };
+        if copy.host_written.load(Relaxed)
+            || !crate::resource::made_copy(*r as crate::object::This)
+                .is_some_and(|current| Arc::ptr_eq(&current, copy))
+            || record_key(handle) != key
+        {
+            return false;
+        }
+        // Use the checked resolved view, not another resolution of the
+        // placed record. The submitted texture remains the slot's owner.
+        let (Some(Some(kept)), mark) = make_marked(resolved, self.cpu(index)) else {
+            null_for(&view, self.cpu(index));
+            return false;
+        };
+        if kept.0.as_raw() != copy.texture.as_raw() || record_key(handle) != key {
+            null_for(&view, self.cpu(index));
+            return false;
+        }
+        self.set_stride(index, Some(&view));
+        self.note_address(index, Some(&view));
+        self.set_mark(index, mark);
+        self.viewed.set(index, Some(resolved), true);
+        self.keep(index, Some(kept));
+        true
     }
 
     /// A shader read slot `index` through the heap: the texture it views
@@ -1896,6 +1979,16 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baked_descriptor_record_keys_distinguish_rewrites() {
+        let old = view_record_key([VIEW_TAG, 7, 1]);
+        assert_eq!(old, (1u64 << 32) | 7);
+        assert_ne!(old, view_record_key([VIEW_TAG, 7, 2]));
+        assert_ne!(old, view_record_key([VIEW_TAG, 8, 1]));
+        assert_eq!(view_record_key([VIEW_TAG, 7, 0]), 0);
+        assert_eq!(view_record_key([VIEW_TAG ^ 1, 7, 1]), 0);
+    }
 
     #[test]
     fn srv_mip_masks_handle_tail_full_and_invalid_ranges() {
