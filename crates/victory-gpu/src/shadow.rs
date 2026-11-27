@@ -1851,22 +1851,24 @@ pub(crate) mod tests {
         assert!(shadow.card().is_some(), "device-local allocation refused");
         // SAFETY: the test owns the two mapped title pages.
         unsafe { (p as *mut u8).add(7).write_volatile(0x11) };
-        let (upload, data) = host.upload_buffer(4).unwrap();
-        // SAFETY: the upload has four mapped bytes.
-        unsafe { data.cast::<u32>().write_unaligned(0x78563412) };
-        let list = host.new_list().unwrap();
-        shadow.refresh(&list, p as u64, len as u64);
-        shadow.gpu_writes(&list, (p + PAGE) as u64, 4, false);
-        list.keep(&upload);
-        // SAFETY: live, non-overlapping buffers and valid four-byte range.
-        unsafe { list.list.CopyBufferRegion(&shadow.buffer, PAGE as u64, &upload, 0, 4) };
-        list.close();
-        host.execute(&[&list]);
-        assert_eq!(shadow.read_host((p + PAGE) as u64, 1), [0x78563412]);
-        // SAFETY: the owned title pages remain mapped after the checked fence.
-        unsafe {
-            assert_eq!(((p + PAGE) as *const u32).read_unaligned(), 0x78563412);
-            assert_eq!((p as *const u8).add(7).read_volatile(), 0x11);
+        for value in [0x78563412u32, 0xabcdef01] {
+            let (upload, data) = host.upload_buffer(4).unwrap();
+            // SAFETY: the upload has four mapped bytes.
+            unsafe { data.cast::<u32>().write_unaligned(value) };
+            let list = host.new_list().unwrap();
+            shadow.refresh(&list, p as u64, len as u64);
+            shadow.gpu_writes(&list, (p + PAGE) as u64, 4, false);
+            list.keep(&upload);
+            // SAFETY: live, non-overlapping buffers and valid four-byte range.
+            unsafe { list.list.CopyBufferRegion(&shadow.buffer, PAGE as u64, &upload, 0, 4) };
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(shadow.read_host((p + PAGE) as u64, 1), [value]);
+            // SAFETY: the owned title pages remain mapped after the checked fence.
+            unsafe {
+                assert_eq!(((p + PAGE) as *const u32).read_unaligned(), value);
+                assert_eq!((p as *const u8).add(7).read_volatile(), 0x11);
+            }
         }
         unregister(p, p as u64);
     }

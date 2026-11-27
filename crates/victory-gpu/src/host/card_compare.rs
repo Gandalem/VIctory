@@ -508,6 +508,91 @@ impl CardWork {
     }
 }
 
+/// Reference CardWork::sync/check/fetch lists and card_done ownership.
+/// A synchronous submission needs at most one allocator/list per phase,
+/// rather than a new HostList (and a second prelude) at every dispatch.
+pub(super) struct CardPrelude {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+}
+
+#[derive(Clone, Copy)]
+enum CardPhase {
+    Sync = 0,
+    Check = 1,
+    Fetch = 2,
+}
+
+impl Host {
+    /// Adapt cool_fox's make_prelude, initially closed so every lease,
+    /// including the first, uses the same Reset path.
+    fn make_card_prelude(&self) -> windows::core::Result<CardPrelude> {
+        // SAFETY: plain object creation.
+        unsafe {
+            (|| {
+                let allocator: ID3D12CommandAllocator =
+                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let list: ID3D12GraphicsCommandList =
+                    self.device
+                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                list.Close()?;
+                Ok(CardPrelude { allocator, list })
+            })()
+        }
+    }
+
+    /// Called with submitted held. Take the closed list out of the pool,
+    /// reset it only after its previous checked fence, then record into it.
+    fn card_list(&self, phase: CardPhase) -> CardPrelude {
+        let slot = self.card_lists.lock().unwrap_or_else(|e| e.into_inner())[phase as usize].take();
+        let work = slot.unwrap_or_else(|| self.make_card_prelude().unwrap_or_else(|e|
+            fail(format_args!("could not create card prelude: {e}"))));
+        // SAFETY: fresh closed list or a list returned after its checked
+        // completion fence. The submission lock excludes all other leases.
+        let reset = unsafe {
+            work.allocator.Reset().and_then(|()| work.list.Reset(&work.allocator, None))
+        };
+        if let Err(e) = reset {
+            fail(format_args!("could not reset card prelude: {e}"));
+        }
+        work
+    }
+
+    /// The source's card_done adapted to our existing synchronous fence.
+    /// The caller owns every referenced resource through this call.
+    fn run_card_list(&self, phase: CardPhase, work: CardPrelude, submitted: &mut u64) {
+        // SAFETY: this is our open direct list, its owners are live, and
+        // submitted serializes access to the queue, fence and event.
+        unsafe {
+            let ran = (|| -> windows::core::Result<()> {
+                work.list.Close()?;
+                let command: ID3D12CommandList = work.list.cast()?;
+                self.queue.ExecuteCommandLists(&[Some(command)]);
+                *submitted += 1;
+                self.queue.Signal(&self.fence, *submitted)?;
+                self.fence.SetEventOnCompletion(*submitted, self.event)?;
+                Ok(())
+            })();
+            if let Err(e) = ran {
+                fail(format_args!("card prelude submission failed: {e}"));
+            }
+            if WaitForSingleObject(self.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0
+                || self.fence.GetCompletedValue() < *submitted
+            {
+                fail(format_args!("card prelude fence wait failed"));
+            }
+            if let Err(e) = self.device.GetDeviceRemovedReason() {
+                fail(format_args!("card prelude device removed: {e}"));
+            }
+        }
+        // Only completed work is ever put back. Keep one per phase;
+        // it is impossible to overwrite another in-flight allocator.
+        let mut lists = self.card_lists.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(lists[phase as usize].is_none(), "card prelude slot already occupied");
+        lists[phase as usize] = Some(work);
+    }
+}
+
 impl Host {
     /// Adapt the source card_before: copy CPU-dirty ranges, then hash the
     /// joined pieces on the device before the title's lists execute.
@@ -520,7 +605,7 @@ impl Host {
         if dirty.is_empty() {
             return;
         }
-        let list = self.new_list().unwrap_or_else(|e| fail(format_args!("card sync list: {e}")));
+        let list = self.card_list(CardPhase::Sync);
         for (shadow, card, ranges) in dirty {
             let (start, _) = shadow.range();
             let spans = joined_piece_runs(ranges.iter().map(|&(from, to)|
@@ -542,9 +627,7 @@ impl Host {
             }
             compare_barrier(&list.list);
         }
-        // This helper uses the existing checked direct-queue fence. There
-        // are no title commands or tiled resources in this internal list.
-        self.submit_baked_uploads(&list, submitted);
+        self.run_card_list(CardPhase::Sync, list, submitted);
     }
 
     /// Adapt source card_back: compare on the device, read flags after the
@@ -555,7 +638,7 @@ impl Host {
         if copies.is_empty() {
             return;
         }
-        let list = self.new_list().unwrap_or_else(|e| fail(format_args!("card compare list: {e}")));
+        let list = self.card_list(CardPhase::Check);
         for shadow in copies {
             let Some(card) = shadow.card() else { continue };
             let (start, _) = shadow.range();
@@ -572,7 +655,7 @@ impl Host {
                     u64::from(span.pieces) * 4);
             }
         }
-        self.submit_baked_uploads(&list, submitted);
+        self.run_card_list(CardPhase::Check, list, submitted);
         let mut fetches = Vec::new();
         let mut total = 0u64;
         for (copy, shadow) in copies.iter().enumerate() {
@@ -606,7 +689,7 @@ impl Host {
         let pool = self.card_fetch_at_least(total).unwrap_or_else(||
             fail(format_args!("no admitted GPU readback pool")));
         for batch in pack_fetches(&fetches, pool.size) {
-            let list = self.new_list().unwrap_or_else(|e| fail(format_args!("card fetch list: {e}")));
+            let list = self.card_list(CardPhase::Fetch);
             for piece in &batch {
                 // SAFETY: checked source ranges and disjoint packed
                 // destination ranges, live resources, buffer COPY_SOURCE
@@ -616,7 +699,7 @@ impl Host {
                         &copies[piece.copy].buffer, piece.lo as u64, (piece.hi - piece.lo) as u64);
                 }
             }
-            self.submit_baked_uploads(&list, submitted);
+            self.run_card_list(CardPhase::Fetch, list, submitted);
             for piece in batch {
                 // SAFETY: the checked readback fence completed; this
                 // owner pins its mapping and the submission lock keeps
@@ -626,6 +709,31 @@ impl Host {
                 copies[piece.copy].land_card(piece.lo, bytes);
             }
         }
+    }
+}
+
+
+/// Reuse the exact three command allocators across two fenced submissions.
+/// Requires an actual adapter; the normal shader/range tests remain in CI.
+#[test]
+#[ignore = "requires D3D12; run alone"]
+fn card_preludes_reuse_only_completed_lists() {
+    let host = host().expect("D3D12 device");
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    host.settle_baked_uploads();
+    for phase in [CardPhase::Sync, CardPhase::Check, CardPhase::Fetch] {
+        let first = host.card_list(phase);
+        let allocator = first.allocator.as_raw();
+        let command = first.list.as_raw();
+        let before = *submitted;
+        host.run_card_list(phase, first, &mut submitted);
+        assert_eq!(*submitted, before + 1);
+        // SAFETY: a plain fence query; the completed work owns the list.
+        assert!(unsafe { host.fence.GetCompletedValue() } >= *submitted);
+        let again = host.card_list(phase);
+        assert_eq!(again.allocator.as_raw(), allocator);
+        assert_eq!(again.list.as_raw(), command);
+        host.run_card_list(phase, again, &mut submitted);
     }
 }
 

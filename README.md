@@ -279,7 +279,10 @@ local budget free. The source's shared fetch pool now packs changed
 ranges into one persistent readback, growing in 16 MiB increments and
 reusing it after each checked fence. Admission reserves space for the
 largest copy; if later growth fails, bounded batches reuse that space.
-This conservative port still compares all live card copies; the source's
+The source's sync/check/fetch command allocator and list reuse is also
+connected: one pair per phase, returned only after a checked fence.
+The internal lists bypass the unrelated tile-upload path. This
+conservative port still compares all live card copies; the source's
 picked-range planner and async relay are not imported.
 Loose windows and exact-view arenas stay on the existing path. Run the
 ignored `carded_shadow_refresh_compare_and_copy_back` test with
