@@ -412,9 +412,19 @@ queue; a second mismatch fails closed. Queue creation failure falls
 back to the private direct fetch. Run the ignored
 `relay_copy_queue_reads_completed_direct_writes` test on an adapter
 with a high-priority copy queue.
-This is still a serialized queue handoff, not the source's concurrent
-copy-queue relay. Persistent suspect/refetch tracking and overlapping
-title submissions remain unported.
+The original torn::Suspects selection/retirement rules are also
+ported with `VICTORY_FETCH_CHECK=1`: track mismatching pieces by
+monotonic Shadow ID and piece number, fetch suspects even with an
+unchanged compare flag, and retire only after verified landing.
+Released owners are pruned; a retained suspect forces a full compare
+rather than allowing a narrower declared scope to miss it.
+Suspect-only fetches do not create picked-write evidence. Run the
+ignored `suspect_piece_is_fetched_even_with_unchanged_gpu_hash` test.
+Unlike the reference, a bad fetch is never landed, and immediate
+checked direct-queue retry is mandatory; a second mismatch fails
+closed. Thus the source's cross-flight repair after concurrent
+landing is not enabled. Overlapping title submissions remain
+unported; this is still a serialized queue handoff.
 Experimental `VICTORY_LIST_DETACH=1` adapts the reference's Detached
 list/recording ownership to this branch's segmented Arc-based queues.
 All submitted segments share one owner for uploads and draw state,

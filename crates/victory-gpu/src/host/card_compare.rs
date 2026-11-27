@@ -383,6 +383,7 @@ struct FetchPiece {
 /// logical flagged interval, including at skewed title-page boundaries.
 #[derive(Debug)]
 struct CheckedPiece {
+    number: u32,
     from: usize,
     to: usize,
     hash: u32,
@@ -401,7 +402,7 @@ impl CheckedRun {
     {
         let pieces = pieces_of(start, lo, hi).map(|number| {
             let (from, to) = card_hashed_of(start, size, number);
-            CheckedPiece { from, to, hash: expected[&number] }
+            CheckedPiece { number: number as u32, from, to, hash: expected[&number] }
         }).collect();
         Self { lo, hi, pieces }
     }
@@ -416,13 +417,18 @@ impl CheckedRun {
             at: fetched.at + (self.lo - fetched.lo) as u64 }
     }
 
-    /// Return the first mismatching shader piece, if any. Never merge
-    /// bytes of even a partially verified batch.
-    fn mismatch(&self, bytes: &[u8]) -> Option<&CheckedPiece> {
+    /// Check each whole aligned piece, including when adjacent pieces
+    /// share a 16-byte load. Keep the actual piece number for Suspects.
+    fn results<'a>(&'a self, bytes: &'a [u8]) -> impl Iterator<Item = (&'a CheckedPiece, bool)> {
         let (from, to) = self.extent();
         assert_eq!(bytes.len(), to - from);
-        self.pieces.iter().find(|p|
-            super::torn::hash(&bytes[p.from - from..p.to - from]) != p.hash)
+        self.pieces.iter().map(move |p|
+            (p, super::torn::hash(&bytes[p.from - from..p.to - from]) == p.hash))
+    }
+
+    #[cfg(test)]
+    fn mismatch<'a>(&'a self, bytes: &'a [u8]) -> Option<&'a CheckedPiece> {
+        self.results(bytes).find_map(|(p, same)| (!same).then_some(p))
     }
 }
 
@@ -431,19 +437,33 @@ type CheckedRuns = std::collections::BTreeMap<(usize, usize, usize), CheckedRun>
 /// # Safety
 /// The batch is a completed fetch into this live, exclusive mapping.
 /// The caller keeps it stable until all checks and landing finish.
-unsafe fn check_fetch_batch(pool: &CardFetch, batch: &[FetchPiece], checks: &CheckedRuns) -> bool {
+unsafe fn check_fetch_batch(pool: &CardFetch, batch: &[FetchPiece], checks: &CheckedRuns,
+    copies: &[std::sync::Arc<crate::shadow::Shadow>], suspects: &mut super::torn::Suspects)
+    -> Option<Vec<super::torn::Piece>>
+{
+    let mut verified = Vec::new();
+    let mut all_same = true;
     for piece in batch {
         let check = &checks[&(piece.copy, piece.lo, piece.hi)];
+        let id = copies[piece.copy].id();
         // SAFETY: caller's checked fence and packed in-bounds offsets.
         let bytes = unsafe { std::slice::from_raw_parts(
             (pool.data as *const u8).add(piece.at as usize), piece.hi - piece.lo) };
-        if let Some(bad) = check.mismatch(bytes) {
-            tracing::warn!(copy = piece.copy, from = bad.from, to = bad.to,
-                "GPU readback hash mismatch");
-            return false;
+        for (p, same) in check.results(bytes) {
+            let key = (id, p.number);
+            if same {
+                verified.push(key);
+            } else {
+                suspects.fetched(key, false);
+                all_same = false;
+                tracing::warn!(copy = id, piece = p.number, from = p.from, to = p.to,
+                    "GPU readback hash mismatch");
+            }
         }
     }
-    true
+    // Unlike the source's concurrent landing, reject the whole batch
+    // on any mismatch. Retire suspects only after verified landing.
+    all_same.then_some(verified)
 }
 
 #[test]
@@ -1526,6 +1546,11 @@ impl Host {
         runs: &[&HostList], tail: Option<CardCheck>, relay: &RelayPicked,
         marks: Option<&[crate::shadow::MarkRange]>, submitted: &mut u64)
     {
+        let checking = super::torn::on();
+        let mut suspects = checking.then(|| self.card_suspects.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(suspects) = &mut suspects {
+            suspects.retain_live(copies.iter().map(|s| s.id()));
+        }
         if copies.is_empty() {
             return;
         }
@@ -1543,7 +1568,13 @@ impl Host {
             self.recycle_card_list(CardPhase::Check, work);
             (plans, flags)
         } else {
-            let scope = declared_scope(runs, marks);
+            // A surviving suspect may be outside the next declared
+            // ranges. Preserve full coverage in this serial renderer.
+            let scope = if suspects.as_ref().is_some_and(|s| !s.is_empty()) {
+                None
+            } else {
+                declared_scope(runs, marks)
+            };
             let plans = card_plans(copies, scope.as_ref());
             if plans.is_empty() {
                 return;
@@ -1553,7 +1584,6 @@ impl Host {
             self.run_card_list(CardPhase::Check, list, submitted);
             (plans, flags)
         };
-        let checking = super::torn::on();
         let mut checks = CheckedRuns::new();
         let mut fetches = Vec::new();
         let mut total = 0u64;
@@ -1579,12 +1609,16 @@ impl Host {
                     }
                 };
                 for (i, flag) in flags.iter().enumerate() {
-                    if super::torn::flagged(*flag) {
+                    let flagged = super::torn::flagged(*flag);
+                    let key = (shadow.id(), span.first + i as u32);
+                    let wanted = suspects.as_ref().map_or(flagged, |s| s.wanted(key, flagged));
+                    if wanted {
                         if checking {
                             expected.insert(span.first as usize + i, super::torn::folded(*flag));
                         }
                         let (from, to) = card_piece_of(start as usize, shadow.card_hash_size() as usize, &span, i as u32);
-                        if let Some(picked) = &mut picked {
+                        // Suspect-only repair is not new picked-write evidence.
+                        if flagged && let Some(picked) = &mut picked {
                             picked.flagged(shadow, from, to);
                         }
                         match ranges.last_mut() {
@@ -1628,6 +1662,7 @@ impl Host {
         let mut private = worker.and_then(|_| self.relay_fetch());
         let mut pending: Option<super::relay::Receipt> = None;
         let mut relay_title = Vec::new();
+        let mut landed_checks = Vec::new();
         for batch in pack_fetches(&fetches, pool.size) {
             let logical = checking.then(|| batch.iter().map(|piece|
                 checks[&(piece.copy, piece.lo, piece.hi)].logical(piece)).collect::<Vec<_>>());
@@ -1688,7 +1723,13 @@ impl Host {
                 };
                 // SAFETY: the fetch fence was checked, and the submission
                 // lock plus previous landing receipt exclude reuse.
-                if !checking || unsafe { check_fetch_batch(&pool, &batch, &checks) } {
+                if let Some(suspects) = &mut suspects {
+                    // SAFETY: the checked fetch mapping remains exclusive.
+                    if let Some(verified) = unsafe { check_fetch_batch(&pool, &batch, &checks, copies, suspects) } {
+                        landed_checks.extend(verified);
+                        break stamp;
+                    }
+                } else {
                     break stamp;
                 }
                 // Unlike the reference's concurrent queue, there is no
@@ -1725,9 +1766,47 @@ impl Host {
         if let Some(receipt) = pending.take() {
             COPY_BACK[1].fetch_add(receipt.finish(), Ordering::Relaxed);
         }
+        if let Some(suspects) = &mut suspects {
+            for key in landed_checks {
+                suspects.fetched(key, true);
+            }
+        }
     }
 }
 
+
+/// Source suspect/refetch rule in the real compare/fetch path:
+/// an unchanged GPU hash still forces a fetch for a suspect piece.
+/// Simulate a stale CPU mirror without changing its upload flags.
+#[test]
+#[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_FETCH_CHECK=1 and D3D12; run alone"]
+fn suspect_piece_is_fetched_even_with_unchanged_gpu_hash() {
+    assert!(super::torn::on());
+    let host = host().expect("D3D12 device");
+    let p = crate::watch::tests::pool(2);
+    let len = 2 * PIECE;
+    crate::shadow::register(p, p as u64, len as u64);
+    let shadow = crate::shadow::find(p as u64, len as u64).expect("registered copy");
+    assert!(shadow.card().is_some());
+    let value = 0x12345678u32;
+    // SAFETY: the test owns two mapped title pages.
+    unsafe { (p as *mut u32).write_unaligned(value) };
+    let warm = host.new_list().unwrap();
+    shadow.refresh(&warm, p as u64, len as u64);
+    warm.close();
+    host.execute(&[&warm]);
+    assert_eq!(shadow.read_host(p as u64, 1), [value]);
+    // No dirty upload is recorded by this test-only mirror write.
+    shadow.write_host(p as u64, &0u32.to_le_bytes());
+    let key = (shadow.id(), 0);
+    host.card_suspects.lock().unwrap().fetched(key, false);
+    let clean = host.new_list().unwrap();
+    clean.close();
+    host.execute(&[&clean]);
+    assert_eq!(shadow.read_host(p as u64, 1), [value]);
+    assert!(!host.card_suspects.lock().unwrap().wanted(key, false));
+    crate::shadow::unregister(p, p as u64);
+}
 
 /// Verify a real direct-queue private fence and allocator reuse without
 /// consuming a main queue generation. The private fence and the send

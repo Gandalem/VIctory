@@ -4,7 +4,9 @@
 //! path checks complete aligned pieces before any landing and retries a
 //! mismatched batch while no later title submission can run.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 
 /// `VICTORY_FETCH_CHECK=1`; off by default until a run has shown how often a
 /// piece is caught (the frame-rate line says so) and what the hashes cost
@@ -12,6 +14,51 @@ use std::sync::OnceLock;
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// A piece: its copy's number, and the piece.
+pub(super) type Piece = (u64, u32);
+
+/// Checked results: accepted pieces, mismatches, and repaired suspects.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The pieces whose last fetch was not what a flight ended with.
+#[derive(Default)]
+pub(super) struct Suspects(HashSet<Piece>);
+
+impl Suspects {
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// A released Shadow cannot be fetched again. Its monotonic ID is
+    /// never reused, even if its allocator or title address is reused.
+    pub(super) fn retain_live(&mut self, ids: impl IntoIterator<Item = u64>) {
+        if !self.0.is_empty() {
+            let live: HashSet<_> = ids.into_iter().collect();
+            self.0.retain(|(id, _)| live.contains(id));
+        }
+    }
+
+    /// Whether a flight that may write `piece` fetches it, its compare
+    /// having flagged it or not.
+    pub(super) fn wanted(&self, piece: Piece, flagged: bool) -> bool {
+        flagged || (!self.0.is_empty() && self.0.contains(&piece))
+    }
+
+    /// `piece` was fetched; `same`: it was what the last of the flights
+    /// landed ended with.
+    pub(super) fn fetched(&mut self, piece: Piece, same: bool) {
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+        if same {
+            if self.0.remove(&piece) {
+                STATS[2].fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            self.0.insert(piece);
+            STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Of a result of the compare: whether the piece differs.
@@ -104,6 +151,65 @@ fn hash_avx2(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model of one piece. The card runs flights in order; each writes the
+    /// piece several times and its compare flags it if it ends otherwise
+    /// than the flight before. Each landing fetches what is wanted, on a
+    /// queue beside the drawing one: the fetch sees the piece as it is while
+    /// a later flight is at some step. Returns what the CPU's side holds in
+    /// the end, and the fetches.
+    fn landed(flights: &[&[u32]], seen: &[(usize, usize)], check: bool) -> (u32, u32) {
+        let piece: Piece = (1, 0);
+        let mut suspects = Suspects::default();
+        let (mut held, mut ended, mut fetches) = (0, 0, 0);
+        for (f, steps) in flights.iter().enumerate() {
+            let before = ended;
+            ended = *steps.last().expect("a step");
+            let flagged = ended != before;
+            if if check { !suspects.wanted(piece, flagged) } else { !flagged } {
+                continue;
+            }
+            fetches += 1;
+            // While flight `at` is after its step `step`.
+            let (at, step) = seen[f];
+            assert!(at >= f);
+            held = flights[at][step];
+            suspects.fetched(piece, held == ended);
+        }
+        (held, fetches)
+    }
+
+    /// A counter that each flight clears and counts up to the same: the
+    /// first flight's fetch sees it cleared by the second, whose compare
+    /// flags nothing.
+    #[test]
+    fn a_piece_caught_in_between_is_fetched_again() {
+        let count: &[u32] = &[0, 3, 5];
+        // The first is fetched while the second has cleared it.
+        assert_eq!(landed(&[count, count], &[(1, 0), (1, 2)], false), (0, 1), "the CPU's side keeps what was in between");
+        assert_eq!(landed(&[count, count], &[(1, 0), (1, 2)], true), (5, 2));
+        // And again, while the third was at it; the fourth finds it whole.
+        let four = [count; 4];
+        assert_eq!(landed(&four, &[(1, 0), (2, 1), (3, 0), (3, 2)], true), (5, 4));
+        // Fetched whole: no more fetches than without the check.
+        assert_eq!(landed(&four, &[(0, 2), (1, 2), (2, 2), (3, 2)], true), (5, 1));
+        assert_eq!(landed(&four, &[(0, 2), (1, 2), (2, 2), (3, 2)], false), (5, 1));
+    }
+
+    #[test]
+    fn suspects_are_kept_per_copy_and_pruned_only_when_released_or_verified() {
+        let mut suspects = Suspects::default();
+        suspects.fetched((11, 2), false);
+        suspects.fetched((12, 2), false);
+        assert!(suspects.wanted((11, 2), false));
+        assert!(!suspects.wanted((11, 3), false));
+        suspects.retain_live([11, 13]);
+        assert!(suspects.wanted((11, 2), false));
+        assert!(!suspects.wanted((12, 2), false));
+        assert!(!suspects.wanted((13, 2), false));
+        suspects.fetched((11, 2), true);
+        assert!(suspects.is_empty());
+    }
 
     #[test]
     fn the_wide_hash_is_the_plain_one() {

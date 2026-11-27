@@ -195,6 +195,8 @@ pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
+    /// Source Shadow::id: stable across address reuse.
+    id: u64,
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
@@ -964,6 +966,11 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// Monotonic copy identity for the source suspect-piece registry.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -1089,6 +1096,11 @@ impl Shadow {
             buffer,
             data,
             gpu,
+            id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed,
+                    |id| id.checked_add(1)).expect("Shadow identity exhausted")
+            },
             start,
             len,
             tracked,
