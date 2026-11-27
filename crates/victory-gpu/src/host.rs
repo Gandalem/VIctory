@@ -53,6 +53,7 @@ pub(crate) struct Host {
     /// until the copy fence, before recycling staging or executing titles.
     pending_bake: Mutex<Option<PendingBake>>,
     card_pipeline: OnceLock<Option<(ID3D12RootSignature, ID3D12PipelineState)>>,
+    card_fetch: Mutex<Option<card_compare::CardFetch>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -262,6 +263,7 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             pending_bake: Mutex::new(None),
             card_pipeline: OnceLock::new(),
+            card_fetch: Mutex::new(None),
             event,
             rtvs,
             rtv_size,

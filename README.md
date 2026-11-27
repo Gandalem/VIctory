@@ -275,9 +275,12 @@ pipeline failures fall back before publication. Limits follow the source
 (16 MiB minimum and 512 MiB total for local budgets up to 12 GiB), with
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MIN_KB` and
 `VICTORY_CARD_BUFFERS_MB` overrides. Admission leaves 20% of the reported
-local budget free. This conservative port compares all live card copies
-and owns a full-size persistent CPU readback per copy; it does not yet
-import the source's picked-range planner, shared fetch pool or async relay.
+local budget free. The source's shared fetch pool now packs changed
+ranges into one persistent readback, growing in 16 MiB increments and
+reusing it after each checked fence. Admission reserves space for the
+largest copy; if later growth fails, bounded batches reuse that space.
+This conservative port still compares all live card copies; the source's
+picked-range planner and async relay are not imported.
 Loose windows and exact-view arenas stay on the existing path. Run the
 ignored `carded_shadow_refresh_compare_and_copy_back` test with
 `VICTORY_CARD_BUFFERS=1` and `VICTORY_CARD_BUFFERS_MIN_KB=64` on a real

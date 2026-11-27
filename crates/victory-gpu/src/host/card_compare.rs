@@ -382,10 +382,83 @@ fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 16
 }
 
-/// Per-copy ownership of the source CardWork's comparison resources. The
-/// existing submission lock replaces the reference's in-flight relay pool.
-/// Persistent readbacks allow allocation failures to fall back at creation,
-/// before a descriptor can refer to the device-local buffer.
+/// Reference CardWork::fetched: a shared growable readback, packed by
+/// changed range rather than sized for every live Shadow. Only the
+/// submission lock permits GPU/CPU access to its contents; a cloned owner
+/// keeps the mapping live if concurrent admission grows the pool.
+#[derive(Clone)]
+pub(super) struct CardFetch {
+    buffer: ID3D12Resource,
+    data: usize,
+    size: u64,
+}
+
+const FETCH_GRANULARITY: u64 = 16 << 20;
+
+impl Host {
+    /// Adapt the source's 16 MiB growth rule. Do not discard a working
+    /// allocation when growth fails. Release the pool lock before recording
+    /// or waiting for GPU work; the returned COM owner pins its mapping.
+    fn card_fetch_at_least(&self, bytes: u64) -> Option<CardFetch> {
+        let mut pool = self.card_fetch.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.as_ref().is_none_or(|f| f.size < bytes) {
+            let size = bytes.checked_next_multiple_of(FETCH_GRANULARITY)?;
+            if let Some((buffer, data)) = self.mapped_buffer(size, true) {
+                *pool = Some(CardFetch { buffer, data: data as usize, size });
+            }
+        }
+        pool.clone()
+    }
+}
+
+/// As in the reference card_back, a packed range names its source copy,
+/// its offsets within that copy and its offset in the shared readback.
+#[derive(Debug, PartialEq, Eq)]
+struct FetchPiece {
+    copy: usize,
+    lo: usize,
+    hi: usize,
+    at: u64,
+}
+
+/// Usually all pieces fit in one batch. If growth fails, the already
+/// admitted pool holds at least the largest single copy, so we can reuse
+/// it across fenced batches without dropping any flagged bytes.
+fn pack_fetches(ranges: &[(usize, usize, usize)], capacity: u64) -> Vec<Vec<FetchPiece>> {
+    let mut batches: Vec<Vec<FetchPiece>> = Vec::new();
+    let mut at = 0u64;
+    for &(copy, lo, hi) in ranges {
+        assert!(lo < hi);
+        let n = (hi - lo) as u64;
+        assert!(n <= capacity);
+        if batches.is_empty() || n > capacity - at {
+            batches.push(Vec::new());
+            at = 0;
+        }
+        batches.last_mut().unwrap().push(FetchPiece { copy, lo, hi, at });
+        at += n;
+    }
+    batches
+}
+
+#[test]
+fn shared_fetch_packs_ranges_and_preserves_all_bytes_across_batches() {
+    let ranges = [(0, 3, 9), (0, 16, 20), (2, 100, 108), (3, 0, 2)];
+    let batches = pack_fetches(&ranges, 10);
+    assert_eq!(batches, [
+        vec![FetchPiece { copy: 0, lo: 3, hi: 9, at: 0 },
+             FetchPiece { copy: 0, lo: 16, hi: 20, at: 6 }],
+        vec![FetchPiece { copy: 2, lo: 100, hi: 108, at: 0 },
+             FetchPiece { copy: 3, lo: 0, hi: 2, at: 8 }],
+    ]);
+    assert_eq!(pack_fetches(&ranges, 20).len(), 1);
+    assert!(pack_fetches(&[], 0).is_empty());
+    assert_eq!(pack_fetches(&[(0, 0, 10), (1, 0, 10)], 10).len(), 2);
+}
+
+/// Per-copy ownership of the source CardWork's comparison resources.
+/// The existing submission lock replaces the reference's in-flight relay
+/// pool. The large fetched-byte allocation is now shared by the host.
 pub(crate) struct CardWork {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -393,8 +466,6 @@ pub(crate) struct CardWork {
     differs: ID3D12Resource,
     flags: ID3D12Resource,
     flags_data: usize,
-    fetched: ID3D12Resource,
-    fetched_data: usize,
 }
 
 impl CardWork {
@@ -412,10 +483,14 @@ impl CardWork {
         let flag_bytes = card_hash_bytes(size) / 4;
         let differs = host.uav_buffer(flag_bytes)?;
         let (flags, flags_data) = host.mapped_buffer(flag_bytes, true)?;
-        let (fetched, fetched_data) = host.mapped_buffer(size, true)?;
+        // Reserve enough shared space before publishing the card buffer:
+        // failure still selects the original CPU-visible Shadow path.
+        if host.card_fetch_at_least(size)?.size < size {
+            return None;
+        }
         Some(Self {
             root: root.clone(), pso: pso.clone(), hashes, differs, flags,
-            flags_data: flags_data as usize, fetched, fetched_data: fetched_data as usize,
+            flags_data: flags_data as usize,
         })
     }
 
@@ -499,7 +574,8 @@ impl Host {
         }
         self.submit_baked_uploads(&list, submitted);
         let mut fetches = Vec::new();
-        for shadow in copies {
+        let mut total = 0u64;
+        for (copy, shadow) in copies.iter().enumerate() {
             let Some(card) = shadow.card() else { continue };
             let (start, _) = shadow.range();
             let span = card_span_of(start as usize, 0, card.size as usize);
@@ -516,32 +592,38 @@ impl Host {
                     }
                 }
             }
-            if !ranges.is_empty() {
-                fetches.push((shadow, card, ranges));
+            for (lo, hi) in ranges {
+                fetches.push((copy, lo, hi));
+                total += (hi - lo) as u64;
             }
         }
         if fetches.is_empty() {
             return;
         }
-        let list = self.new_list().unwrap_or_else(|e| fail(format_args!("card fetch list: {e}")));
-        for (shadow, card, ranges) in &fetches {
-            for &(from, to) in ranges {
-                // SAFETY: valid ranges in live buffers, source buffer has
-                // decayed to COMMON and readback stays COPY_DEST.
+        // Source card_back grows fetched to the total changed bytes,
+        // rounded to 16 MiB. A failed growth leaves the admission-time
+        // allocation intact and pack_fetches divides the work safely.
+        let pool = self.card_fetch_at_least(total).unwrap_or_else(||
+            fail(format_args!("no admitted GPU readback pool")));
+        for batch in pack_fetches(&fetches, pool.size) {
+            let list = self.new_list().unwrap_or_else(|e| fail(format_args!("card fetch list: {e}")));
+            for piece in &batch {
+                // SAFETY: checked source ranges and disjoint packed
+                // destination ranges, live resources, buffer COPY_SOURCE
+                // promotion from COMMON and readback stays COPY_DEST.
                 unsafe {
-                    list.list.CopyBufferRegion(&card.work.fetched, from as u64,
-                        &shadow.buffer, from as u64, (to - from) as u64);
+                    list.list.CopyBufferRegion(&pool.buffer, piece.at,
+                        &copies[piece.copy].buffer, piece.lo as u64, (piece.hi - piece.lo) as u64);
                 }
             }
-        }
-        self.submit_baked_uploads(&list, submitted);
-        for (shadow, card, ranges) in fetches {
-            for (from, to) in ranges {
-                // SAFETY: completed readback, valid mapped range, and the
-                // submission lock excludes CPU refresh and GPU work.
+            self.submit_baked_uploads(&list, submitted);
+            for piece in batch {
+                // SAFETY: the checked readback fence completed; this
+                // owner pins its mapping and the submission lock keeps
+                // the pool contents stable until the next batch.
                 let bytes = unsafe { std::slice::from_raw_parts(
-                    (card.work.fetched_data as *const u8).add(from), to - from) };
-                shadow.land_card(from, bytes);
+                    (pool.data as *const u8).add(piece.at as usize), piece.hi - piece.lo) };
+                copies[piece.copy].land_card(piece.lo, bytes);
             }
         }
     }
