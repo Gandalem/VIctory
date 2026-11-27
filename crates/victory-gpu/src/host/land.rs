@@ -1,8 +1,9 @@
 //! Parallel verification of completed card readbacks.
 //! Source: DoubleGhosty/cool_fox@f4b48ad766ddbec1a1867022cd42f7645b0dd55e, land.rs
 //! Pool/each, block ordering and jobs; torn.rs Check::look.
-//! This branch validates the whole batch before any landing. Keep title
-//! merges serial, since physical aliases and guard ownership differ.
+//! This branch validates the whole batch before any landing. Reuse the
+//! pool for independent CPU staging writes, but keep title merges serial
+//! since physical aliases and guard ownership differ.
 
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -167,6 +168,65 @@ fn jobs(pieces: &[(usize, usize)]) -> Vec<std::ops::Range<usize>> {
 }
 
 
+/// Source Pool::each, shared by hash and staging jobs. The submitting
+/// thread retains the exclusive mapping lease through every helper call.
+pub(super) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StagingRun {
+    pub(super) input: usize,
+    pub(super) offset: usize,
+    pub(super) len: usize,
+}
+
+/// Adapt source ordered/jobs to private mapped staging addresses
+/// rather than title addresses. The inputs name independent committed
+/// D3D12 allocations (or disjoint spans in one allocation).
+/// Check every destination before scheduling any writes. Overlap or
+/// arithmetic overflow retains the original ordered serial landing.
+/// Split long runs at the source's block boundaries, then coalesce
+/// adjacent chunks of the same fetch within one job. Do not coalesce
+/// different fetches: their readback offsets need not be adjacent.
+pub(super) fn staging_jobs(ranges: &[(usize, usize)]) -> Option<Vec<Vec<StagingRun>>> {
+    let mut order: Vec<_> = ranges.iter().enumerate().filter(|(_, r)| r.1 != 0)
+        .map(|(i, &(at, len))| Some((at, at.checked_add(len)?, i)))
+        .collect::<Option<_>>()?;
+    order.sort_by_key(|r| r.0);
+    if order.windows(2).any(|w| w[0].1 > w[1].0) {
+        return None;
+    }
+    let mut chunks = Vec::new();
+    let mut keys = Vec::new();
+    for (from, to, input) in order {
+        let mut at = from;
+        while at < to {
+            let len = (BLOCK - at % BLOCK).min(to - at);
+            chunks.push(StagingRun { input, offset: at - from, len });
+            keys.push((at, len));
+            at += len;
+        }
+    }
+    Some(jobs(&keys).into_iter().map(|job| {
+        let mut out: Vec<StagingRun> = Vec::new();
+        for &part in &chunks[job] {
+            match out.last_mut() {
+                Some(last) if last.input == part.input && last.offset + last.len == part.offset => {
+                    last.len += part.len;
+                }
+                _ => out.push(part),
+            }
+        }
+        out
+    }).collect())
+}
+
+pub(super) fn multiple_threads() -> bool {
+    threads() > 1
+}
+
 pub(super) struct HashInput<'a> {
     pub(super) block: usize,
     pub(super) bytes: &'a [u8],
@@ -185,8 +245,7 @@ pub(super) fn hash_many(inputs: &[HashInput<'_>]) -> Vec<bool> {
         return inputs.iter().map(|p| super::torn::hash(p.bytes) == p.expected).collect();
     }
     let results: Vec<_> = inputs.iter().map(|_| AtomicBool::new(false)).collect();
-    static POOL: OnceLock<&'static Pool> = OnceLock::new();
-    POOL.get_or_init(|| Pool::new("victory-land", threads())).each(jobs.len(), &|j| {
+    each(jobs.len(), &|j| {
         for &i in &order[jobs[j].clone()] {
             let input = &inputs[i];
             results[i].store(super::torn::hash(input.bytes) == input.expected, Ordering::Relaxed);
@@ -205,6 +264,34 @@ mod tests {
         let pieces = [(0, JOB), (BLOCK / 2, 16), (BLOCK, JOB), (2 * BLOCK, BLOCK)];
         assert_eq!(jobs(&pieces), [0..2, 2..3, 3..4]);
         assert!(jobs(&[]).is_empty());
+    }
+
+    #[test]
+    fn staging_jobs_split_long_runs_without_reordering_their_bytes() {
+        let ranges = [(8 * BLOCK + 17, 7 * BLOCK), (3, 2 * BLOCK), (20 * BLOCK, 16)];
+        let jobs = staging_jobs(&ranges).unwrap();
+        assert!(jobs.len() > 1);
+        let mut offsets = [0; 3];
+        let mut last = 0;
+        for job in &jobs {
+            for part in job {
+                assert_eq!(part.offset, offsets[part.input]);
+                let start = ranges[part.input].0 + part.offset;
+                assert!(start >= last);
+                offsets[part.input] += part.len;
+                last = start + part.len;
+            }
+        }
+        assert_eq!(offsets, [7 * BLOCK, 2 * BLOCK, 16]);
+        // Zero-length ranges do not create work.
+        assert_eq!(staging_jobs(&[(0, 0)]), Some(Vec::new()));
+    }
+
+    #[test]
+    fn staging_jobs_reject_overlaps_and_overflow_before_writing() {
+        assert!(staging_jobs(&[(BLOCK, 20), (BLOCK + 19, 5)]).is_none());
+        assert!(staging_jobs(&[(usize::MAX - 1, 4)]).is_none());
+        assert!(staging_jobs(&[(BLOCK, 20), (BLOCK + 20, 5)]).is_some());
     }
 
     #[test]

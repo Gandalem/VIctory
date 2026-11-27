@@ -1005,6 +1005,52 @@ fn relay_fetch_only_merges_the_declared_intersection() {
     assert_eq!(relay_overlap(0, 16, None), None);
 }
 
+/// Source relay_card_back's land::each path, restricted to private
+/// CPU staging. A card copy's staging is its own committed resource,
+/// not an arena slice or an alias of title memory. Keep relay title
+/// merges serial and preserve every dirty/sent exclusion in land_card.
+///
+/// The caller still owns the submission and checked readback lease,
+/// and no new GPU fetch may reuse it until each has joined.
+fn parallel_land_staging(pool: &CardFetch, copies: &[std::sync::Arc<crate::shadow::Shadow>],
+    batch: &[FetchPiece], fetched_after: u64) -> bool
+{
+    if !super::land::on() || !super::land::multiple_threads() || batch.is_empty() {
+        return false;
+    }
+    let mut ranges = Vec::with_capacity(batch.len());
+    for piece in batch {
+        let shadow = &copies[piece.copy];
+        let Some(card) = shadow.card() else { return false };
+        let Some(len) = piece.hi.checked_sub(piece.lo) else { return false };
+        if piece.hi > card.size as usize
+            || piece.at.checked_add(len as u64).is_none_or(|end| end > pool.size)
+        {
+            return false;
+        }
+        let Some(at) = (shadow.card_data() as usize).checked_add(piece.lo) else { return false };
+        ranges.push((at, len));
+    }
+    let Some(jobs) = super::land::staging_jobs(&ranges) else { return false };
+    if jobs.len() < 2 {
+        return false;
+    }
+    super::land::each(jobs.len(), &|j| {
+        for run in &jobs[j] {
+            let piece = &batch[run.input];
+            let shadow = &copies[piece.copy];
+            // SAFETY: checked readback bounds and the stable mapping;
+            // every helper only reads it. The jobs' destination spans
+            // were proved disjoint before any helper started, and
+            // each private committed staging allocation remains live.
+            let bytes = unsafe { std::slice::from_raw_parts(
+                (pool.data as *const u8).add(piece.at as usize + run.offset), run.len) };
+            shadow.land_card(piece.lo + run.offset, bytes, fetched_after);
+        }
+    });
+    true
+}
+
 /// Source relay_land's completed-piece landing, adapted to the exact
 /// declared picked ranges and existing staging path. Both inline and
 /// worker paths use the same merge and return its byte count.
@@ -1014,6 +1060,13 @@ fn land_fetch_batch(pool: &CardFetch, copies: &[std::sync::Arc<crate::shadow::Sh
     batch: Vec<FetchPiece>, relay: &RelayPicked, fetched_after: u64,
     relay_title: &mut Vec<u8>) -> u64
 {
+    // A relay batch may write title memory through picked ranges;
+    // never reorder such writes or let different helpers touch aliasing
+    // title pages. The independent staging path is safe only when
+    // the whole batch would otherwise update CPU mirrors alone.
+    if relay.is_empty() && parallel_land_staging(pool, copies, &batch, fetched_after) {
+        return 0;
+    }
     let mut written = 0;
     for piece in batch {
         // SAFETY: the checked readback fence completed; this
@@ -1815,6 +1868,58 @@ impl Host {
     }
 }
 
+
+/// A real completed fetch is spread over several private mirrors.
+/// Exact CPU dirty bytes must survive the source landing workers.
+#[test]
+#[ignore = "requires VICTORY_CARD_BUFFERS=1 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_SEND_ORDER=1 VICTORY_LAND=1 VICTORY_LAND_THREADS=2 and D3D12; run alone"]
+fn parallel_staging_landing_preserves_pending_cpu_bytes() {
+    let host = host().expect("D3D12 device");
+    let len = 8 * PIECE;
+    let p = crate::watch::tests::pool(8);
+    let q = crate::watch::tests::pool(8);
+    crate::shadow::register(p, p as u64, len as u64);
+    crate::shadow::register(q, q as u64, len as u64);
+    let a = crate::shadow::find(p as u64, len as u64).expect("first copy");
+    let b = crate::shadow::find(q as u64, len as u64).expect("second copy");
+    assert!(a.card().is_some() && b.card().is_some());
+    let warm = host.new_list().unwrap();
+    a.refresh(&warm, p as u64, len as u64);
+    b.refresh(&warm, q as u64, len as u64);
+    warm.close();
+    host.execute(&[&warm]);
+
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    host.settle_baked_uploads();
+    // SAFETY: this test owns the tracked title memory.
+    unsafe { (p as *mut u32).write_volatile(0xa1b2c3d4) };
+    a.update(p, PIECE);
+    assert_eq!(a.read_host(p as u64, 1), [0xa1b2c3d4]);
+    let pool = host.card_fetch_at_least((2 * len) as u64).expect("readback pool");
+    let (upload, data) = host.upload_buffer((2 * len) as u64).expect("upload");
+    // SAFETY: both halves are inside the live mapped upload allocation.
+    unsafe {
+        data.write_bytes(0x55, len);
+        data.add(len).write_bytes(0x66, len);
+    }
+    let list = host.card_list(CardPhase::Fetch);
+    // SAFETY: live disjoint resources, valid copy length and open list.
+    unsafe { list.list.CopyBufferRegion(&pool.buffer, 0, &upload, 0, (2 * len) as u64) };
+    host.run_card_list(CardPhase::Fetch, list, &mut submitted);
+    let batch = [
+        FetchPiece { copy: 0, lo: 0, hi: len, at: 0 },
+        FetchPiece { copy: 1, lo: 0, hi: len, at: len as u64 },
+    ];
+    assert!(parallel_land_staging(&pool, &[a.clone(), b.clone()], &batch, *submitted));
+    assert_eq!(a.read_host(p as u64, 1), [0xa1b2c3d4]);
+    assert_eq!(a.read_host((p + PIECE) as u64, 1), [0x55555555]);
+    assert_eq!(a.read_host((p + len - 4) as u64, 1), [0x55555555]);
+    assert_eq!(b.read_host(q as u64, 1), [0x66666666]);
+    assert_eq!(b.read_host((q + len - 4) as u64, 1), [0x66666666]);
+    drop(submitted);
+    crate::shadow::unregister(p, p as u64);
+    crate::shadow::unregister(q, q as u64);
+}
 
 /// Source suspect/refetch rule in the real compare/fetch path:
 /// an unchanged GPU hash still forces a fetch for a suspect piece.

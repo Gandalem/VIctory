@@ -1148,7 +1148,11 @@ impl Shadow {
     }
 
     /// Land the reference's flagged GPU pieces before existing CPU merge.
-    /// Called only under the submission lock, after the readback fence.
+    /// Called under the submission lock, after the readback fence. The
+    /// source landing pool may call this for disjoint staging ranges
+    /// while that same lock and checked readback lease remain held.
+    /// Card staging is a private committed resource; dirty/sent order
+    /// is still protected by the card's own mutex.
     pub(crate) fn land_card(&self, from: usize, bytes: &[u8], fetched_after: u64) {
         let card = self.card.as_ref().expect("a device-local copy");
         assert!(from <= card.size as usize && bytes.len() <= card.size as usize - from);
@@ -1156,12 +1160,13 @@ impl Shadow {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             for (lo, hi) in dirty.landing_parts(fetched_after, from, from + bytes.len()) {
                 // SAFETY: parts lie in the checked readback span and
-                // staging allocation. The serial submission owns staging.
+                // staging allocation. The submission owns staging;
+                // any landing helpers have disjoint ranges.
                 unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(lo - from), self.data.add(lo), hi - lo) };
             }
         } else {
             // SAFETY: bounds checked; source is a disjoint completed readback
-            // and the staging mapping is writable under the submission lock.
+            // and the submission owns this disjoint staging interval.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
         }
     }

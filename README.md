@@ -433,10 +433,18 @@ default available parallelism divided by four, clamped to 1--4).
 The checked readback is read-only through every job, and all jobs
 finish before any mismatch decisions or landing. Small batches and
 one-thread configurations stay serial. Preserve exact result order,
-retry and suspect retirement. Title-memory merges remain serial:
-the current alias/guard semantics do not permit the reference's
-parallel title writes. This reduces CPU hash work on the critical
-thread, not GPU compare coverage or GPU submission waits.
+retry and suspect retirement. The same source ordered/jobs/each
+path also lands completed readback bytes into disjoint private
+card staging mappings in parallel. Validate all destinations,
+split at 64 KiB boundaries and retain exact readback offsets;
+overlapping/invalid ranges or a small/single-thread batch keep
+serial landing. Each call preserves the existing dirty/sent
+exclusions. Batches with any picked relay range still merge in
+the original order: title-memory writes may alias through the
+current guard tracker and are not safe to parallelize here.
+Run the ignored `parallel_staging_landing_preserves_pending_cpu_bytes`
+test with the send-order and landing options. No GPU compare
+coverage or submission waits are removed.
 Experimental `VICTORY_LIST_DETACH=1` adapts the reference's Detached
 list/recording ownership to this branch's segmented Arc-based queues.
 All submitted segments share one owner for uploads and draw state,
